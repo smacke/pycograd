@@ -75,6 +75,29 @@ them with:
 python -m pycograd.examples
 ```
 
+## Shape inference
+
+Because a net is just a numpy function, you can ask what shapes it produces
+*without* training it — for a quick sanity check or a parameter count. `eval_shape`
+runs the function over abstract `(shape, dtype)` values (no data, no allocation, so a
+`100000×100000` matmul is sized instantly), and `summary` tabulates the parameters:
+
+```python
+import numpy as np
+from pycograd import eval_shape, summary, ShapeDtypeStruct as S
+
+# the output shape of a forward, from input shapes alone
+eval_shape(mlp_forward, S((5, 2)), S((2, 16)), S((16,)), S((16, 3)), S((3,)))
+# -> f64[5,3]
+
+summary(mlp_batch_loss, params, (5, 2), (5, 3))   # per-weight table + total params
+```
+
+Shape mismatches raise a `ShapeError` that names the op and the operand shapes
+(`matmul: incompatible shapes (3, 4) and (5, 6)`) instead of an opaque numpy message,
+and a shape that genuinely depends on data values (e.g. boolean-mask indexing) is
+reported as such rather than silently mis-sized.
+
 ## Notebooks / Jupyter
 
 In a Jupyter or IPython session, `%load_ext pycograd` turns on the pycograd DSL —

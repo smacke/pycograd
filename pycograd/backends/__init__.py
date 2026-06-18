@@ -148,7 +148,15 @@ def _make_tf() -> Backend:
     return TFBackend()
 
 
+def _make_abstract() -> Backend:
+    from pycograd.backends.abstract_backend import AbstractBackend
+
+    return AbstractBackend()
+
+
 register_backend("numpy", _make_numpy)
+register_backend("abstract", _make_abstract)
+register_backend("shape", _make_abstract)
 register_backend("jax", _make_jax)
 register_backend("torch", _make_torch)
 register_backend("pytorch", _make_torch)

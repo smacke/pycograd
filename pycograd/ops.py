@@ -162,7 +162,13 @@ def _matmul_grads(a: Array, b: Array, g: Array) -> tuple[Array, Array]:
 
 def _matmul(a: Operand, b: Operand) -> Var:
     a, b = _lift(a), _lift(b)
-    out = Var(a.value @ b.value, _parents=(a, b))
+    try:
+        primal = a.value @ b.value
+    except ValueError as e:
+        from pycograd.shapes import ShapeError, _shape_context
+
+        raise ShapeError(_shape_context("matmul", a.value.shape, b.value.shape)) from e
+    out = Var(primal, _parents=(a, b))
 
     def _backward() -> None:
         da, db = _matmul_grads(a.value, b.value, out.grad)
@@ -265,9 +271,16 @@ def d_min(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
 # ---------------------------------------------------------------------------
 def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
     parts = [_lift(s) for s in seq]
-    out = Var(
-        np.concatenate([p.value for p in parts], axis=axis), _parents=tuple(parts)
-    )
+    try:
+        primal = np.concatenate([p.value for p in parts], axis=axis)
+    except ValueError as e:
+        from pycograd.shapes import ShapeError, _shape_context
+
+        raise ShapeError(
+            _shape_context("concatenate", *(p.value.shape for p in parts))
+            + f" along axis {axis}"
+        ) from e
+    out = Var(primal, _parents=tuple(parts))
 
     def _backward() -> None:
         splits = np.cumsum([p.value.shape[axis] for p in parts])[:-1]
@@ -295,7 +308,16 @@ def d_transpose(x: Operand, axes: tuple[int, ...] | None = None) -> Var:
 def d_reshape(x: Operand, *shape: Shape) -> Var:
     x = _lift(x)
     newshape = shape[0] if len(shape) == 1 else shape
-    out = Var(np.reshape(x.value, newshape), _parents=(x,))
+    try:
+        primal = np.reshape(x.value, newshape)
+    except ValueError as e:
+        from pycograd.shapes import ShapeError
+
+        raise ShapeError(
+            f"reshape: cannot reshape array of shape {x.value.shape} "
+            f"(size {x.value.size}) into {newshape}"
+        ) from e
+    out = Var(primal, _parents=(x,))
 
     def _backward() -> None:
         x.grad = x.grad + out.grad.reshape(x.value.shape)

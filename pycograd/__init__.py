@@ -70,6 +70,15 @@ from pycograd.params import (
     register_pipescript_params_macro,
     tied,
 )
+from pycograd.shapes import (
+    ShapedArray,
+    ShapeDtypeStruct,
+    ShapeError,
+    Summary,
+    eval_shape,
+    infer_shapes,
+    summary,
+)
 from pycograd.tensor import Var, detach
 from pycograd.tracer import AutodiffTracer, resolve_call
 from pycograd.transforms import grad, gradient_descent, value_and_grad
@@ -107,6 +116,14 @@ __all__ = [
     "grad",
     "gradient_descent",
     "sgd_update",
+    # shape inference
+    "eval_shape",
+    "infer_shapes",
+    "summary",
+    "Summary",
+    "ShapeDtypeStruct",
+    "ShapedArray",
+    "ShapeError",
     # compile to other frameworks (torch / tf / jax)
     "compile_to",
     "get_backend",
