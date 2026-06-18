@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Differentiable primitives (vector-Jacobian-product rules).
 
-Each ``d_*`` computes the primal with numpy on ``.value`` and wires the local
-derivative. ``_RULES`` maps each primitive to the numpy/math callables that should
+Each ``d_*`` computes the primal on ``.value`` with the *active* array module
+(``xp = _xp()`` -- numpy by default, cupy under ``device("cupy")``) and wires the local
+derivative; only host-side metadata (shape counts, split sizes, axis ``argsort``) stays
+on numpy. ``_RULES`` maps each primitive to the numpy/math callables that should
 route to it; ``_INTERCEPT`` is the flat lookup the tracer (and the ``Weight``
 proxy's numpy-protocol handlers) use to swap a numpy/math function for its
 differentiable version.
@@ -20,83 +22,83 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 
 from pycograd._typing import Array, Axis, Operand, Shape
-from pycograd.tensor import Var, _lift, _unbroadcast
+from pycograd.tensor import Var, _lift, _unbroadcast, _xp
 
 
 # ---------------------------------------------------------------------------
 # Elementwise unary.
 # ---------------------------------------------------------------------------
 def d_exp(x: Operand) -> Var:
-    x = _lift(x)
-    v = np.exp(x.value)
+    x, xp = _lift(x), _xp()
+    v = xp.exp(x.value)
     return x._unary(v, lambda a, g: g * v)
 
 
 def d_log(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.log(x.value), lambda a, g: g / a)
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.log(x.value), lambda a, g: g / a)
 
 
 def d_sin(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.sin(x.value), lambda a, g: g * np.cos(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.sin(x.value), lambda a, g: g * xp.cos(a))
 
 
 def d_cos(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.cos(x.value), lambda a, g: -g * np.sin(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.cos(x.value), lambda a, g: -g * xp.sin(a))
 
 
 def d_tanh(x: Operand) -> Var:
-    x = _lift(x)
-    v = np.tanh(x.value)
+    x, xp = _lift(x), _xp()
+    v = xp.tanh(x.value)
     return x._unary(v, lambda a, g: g * (1 - v * v))
 
 
 def d_sqrt(x: Operand) -> Var:
-    x = _lift(x)
-    v = np.sqrt(x.value)
+    x, xp = _lift(x), _xp()
+    v = xp.sqrt(x.value)
     return x._unary(v, lambda a, g: g / (2 * v))
 
 
 def d_abs(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.abs(x.value), lambda a, g: g * np.sign(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.abs(x.value), lambda a, g: g * xp.sign(a))
 
 
 def d_square(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.square(x.value), lambda a, g: g * 2 * a)
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.square(x.value), lambda a, g: g * 2 * a)
 
 
 def d_sinh(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.sinh(x.value), lambda a, g: g * np.cosh(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.sinh(x.value), lambda a, g: g * xp.cosh(a))
 
 
 def d_cosh(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.cosh(x.value), lambda a, g: g * np.sinh(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.cosh(x.value), lambda a, g: g * xp.sinh(a))
 
 
 def d_arctan(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.arctan(x.value), lambda a, g: g / (1 + a * a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arctan(x.value), lambda a, g: g / (1 + a * a))
 
 
 def d_log1p(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.log1p(x.value), lambda a, g: g / (1 + a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.log1p(x.value), lambda a, g: g / (1 + a))
 
 
 def d_expm1(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.expm1(x.value), lambda a, g: g * np.exp(a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.expm1(x.value), lambda a, g: g * xp.exp(a))
 
 
 def d_reciprocal(x: Operand) -> Var:
-    x = _lift(x)
-    return x._unary(np.reciprocal(x.value), lambda a, g: -g / (a * a))
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.reciprocal(x.value), lambda a, g: -g / (a * a))
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +118,11 @@ def _elementwise_max(a: Operand, b: Operand, pick_a: Callable[..., Array]) -> Va
 
 
 def d_maximum(a: Operand, b: Operand) -> Var:
-    return _elementwise_max(a, b, np.maximum)
+    return _elementwise_max(a, b, _xp().maximum)
 
 
 def d_minimum(a: Operand, b: Operand) -> Var:
-    return _elementwise_max(a, b, np.minimum)
+    return _elementwise_max(a, b, _xp().minimum)
 
 
 def d_clip(
@@ -135,13 +137,13 @@ def d_clip(
 
 
 def d_where(cond: Array, a: Operand, b: Operand) -> Var:
-    a, b = _lift(a), _lift(b)
-    cond = np.asarray(cond)
-    out = Var(np.where(cond, a.value, b.value), _parents=(a, b))
+    a, b, xp = _lift(a), _lift(b), _xp()
+    cond = xp.asarray(cond)
+    out = Var(xp.where(cond, a.value, b.value), _parents=(a, b))
 
     def _backward() -> None:
-        a.grad = a.grad + _unbroadcast(np.where(cond, out.grad, 0.0), a.value.shape)
-        b.grad = b.grad + _unbroadcast(np.where(cond, 0.0, out.grad), b.value.shape)
+        a.grad = a.grad + _unbroadcast(xp.where(cond, out.grad, 0.0), a.value.shape)
+        b.grad = b.grad + _unbroadcast(xp.where(cond, 0.0, out.grad), b.value.shape)
 
     out._backward = _backward
     return out
@@ -151,12 +153,13 @@ def d_where(cond: Array, a: Operand, b: Operand) -> Var:
 # Linear algebra.
 # ---------------------------------------------------------------------------
 def _matmul_grads(a: Array, b: Array, g: Array) -> tuple[Array, Array]:
+    xp = _xp()
     if a.ndim == 1 and b.ndim == 1:
         return g * b, g * a
     if a.ndim == 2 and b.ndim == 1:
-        return np.outer(g, b), a.T @ g
+        return xp.outer(g, b), a.T @ g
     if a.ndim == 1 and b.ndim == 2:
-        return b @ g, np.outer(a, g)
+        return b @ g, xp.outer(a, g)
     return g @ b.swapaxes(-1, -2), a.swapaxes(-1, -2) @ g
 
 
@@ -183,14 +186,14 @@ def _matmul(a: Operand, b: Operand) -> Var:
 # Reductions.
 # ---------------------------------------------------------------------------
 def d_sum(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
-    x = _lift(x)
+    x, xp = _lift(x), _xp()
     out = Var(x.value.sum(axis=axis, keepdims=keepdims), _parents=(x,))
 
     def _backward() -> None:
         g = out.grad
         if axis is not None and not keepdims:
-            g = np.expand_dims(g, axis)
-        x.grad = x.grad + np.broadcast_to(g, x.value.shape)
+            g = xp.expand_dims(g, axis)
+        x.grad = x.grad + xp.broadcast_to(g, x.value.shape)
 
     out._backward = _backward
     return out
@@ -242,14 +245,14 @@ def _reduce_select(
     x: Operand, axis: Axis, keepdims: bool, reducer: Callable[..., Array]
 ) -> Var:
     # max/min: the gradient flows only to the selected element(s), split on ties.
-    x = _lift(x)
+    x, xp = _lift(x), _xp()
     kept = reducer(x.value, axis=axis, keepdims=True)
     out = Var(reducer(x.value, axis=axis, keepdims=keepdims), _parents=(x,))
 
     def _backward() -> None:
         g = out.grad
         if axis is not None and not keepdims:
-            g = np.expand_dims(g, axis)
+            g = xp.expand_dims(g, axis)
         mask = (x.value == kept).astype(float)
         mask /= mask.sum(axis=axis, keepdims=True)
         x.grad = x.grad + mask * g
@@ -259,20 +262,20 @@ def _reduce_select(
 
 
 def d_max(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
-    return _reduce_select(x, axis, keepdims, np.max)
+    return _reduce_select(x, axis, keepdims, _xp().max)
 
 
 def d_min(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
-    return _reduce_select(x, axis, keepdims, np.min)
+    return _reduce_select(x, axis, keepdims, _xp().min)
 
 
 # ---------------------------------------------------------------------------
 # Shape / structure.
 # ---------------------------------------------------------------------------
 def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
-    parts = [_lift(s) for s in seq]
+    parts, xp = [_lift(s) for s in seq], _xp()
     try:
-        primal = np.concatenate([p.value for p in parts], axis=axis)
+        primal = xp.concatenate([p.value for p in parts], axis=axis)
     except ValueError as e:
         from pycograd.shapes import ShapeError, _shape_context
 
@@ -283,8 +286,10 @@ def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
     out = Var(primal, _parents=tuple(parts))
 
     def _backward() -> None:
+        # split sizes are host-side ints (shapes), so np.cumsum stays on numpy; the
+        # split itself slices the device-resident gradient and uses the active module.
         splits = np.cumsum([p.value.shape[axis] for p in parts])[:-1]
-        for part, gpart in zip(parts, np.split(out.grad, splits, axis=axis)):
+        for part, gpart in zip(parts, xp.split(out.grad, splits.tolist(), axis=axis)):
             part.grad = part.grad + gpart
 
     out._backward = _backward
@@ -292,24 +297,25 @@ def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
 
 
 def d_transpose(x: Operand, axes: tuple[int, ...] | None = None) -> Var:
-    x = _lift(x)
-    out = Var(np.transpose(x.value, axes), _parents=(x,))
+    x, xp = _lift(x), _xp()
+    out = Var(xp.transpose(x.value, axes), _parents=(x,))
 
     def _backward() -> None:
         if axes is None:
-            x.grad = x.grad + np.transpose(out.grad)
+            x.grad = x.grad + xp.transpose(out.grad)
         else:
-            x.grad = x.grad + np.transpose(out.grad, np.argsort(axes))
+            # np.argsort over the (host-side) axes tuple; the transpose runs on device.
+            x.grad = x.grad + xp.transpose(out.grad, tuple(np.argsort(axes)))
 
     out._backward = _backward
     return out
 
 
 def d_reshape(x: Operand, *shape: Shape) -> Var:
-    x = _lift(x)
+    x, xp = _lift(x), _xp()
     newshape = shape[0] if len(shape) == 1 else shape
     try:
-        primal = np.reshape(x.value, newshape)
+        primal = xp.reshape(x.value, newshape)
     except ValueError as e:
         from pycograd.shapes import ShapeError
 

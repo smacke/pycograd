@@ -98,6 +98,27 @@ Shape mismatches raise a `ShapeError` that names the op and the operand shapes
 and a shape that genuinely depends on data values (e.g. boolean-mask indexing) is
 reported as such rather than silently mis-sized.
 
+## Devices / backends
+
+The tape runs on a pluggable **array backend** (NumPy by default). A `device(...)`
+block swaps the array library the primitives, the tape, and the optimizers compute
+with — so the same net trains on a GPU with no code changes, gradients and optimizer
+state living on-device:
+
+```python
+import numpy as np
+from pycograd import device, value_and_grad, Adam
+
+with device("cupy"):               # requires a CUDA GPU + cupy (`pip install pycograd[cupy]`)
+    value, (g,) = value_and_grad(loss)(w)   # tape + grads on the GPU
+    w = Adam(lr=1e-3).step(w, g)             # Adam moments on the GPU too
+```
+
+CuPy mirrors NumPy's API, so the same `np.exp` / `@` / `np.sum` code you already wrote
+"just works"; pycograd keeps its own reverse-mode tape and only swaps the array library
+underneath. (This is distinct from `compile_to(fn, "torch"|"jax"|"tf")`, which instead
+hands the net to *another framework's* autodiff.)
+
 ## Notebooks / Jupyter
 
 In a Jupyter or IPython session, `%load_ext pycograd` turns on the pycograd DSL —

@@ -71,10 +71,11 @@ it is gated by the foundation.
   `__array_function__` so `np.*` on a `Tensor` dispatches to our VJPs natively;
   drop the `__array_ufunc__ = None` fail-loud stance. Crucial: foundational.
   Feasibility: medium (the protocols are fiddly but well-documented).
-- **dtype & a device seam.** Stop forcing `float64`; track dtype, default
-  `float32`, support `bf16`/`float16`. Introduce a thin array-backend seam
-  (NumPy now, room for CuPy/others later). Crucial: high (memory + speed + the
-  GPU on-ramp). Feasibility: medium.
+- **dtype & a device seam.** The array-backend seam is **done**: `device("cupy")`
+  swaps the array library the tape, primitives, and optimizers compute with (NumPy
+  default, CuPy for GPU), so a net trains on-device unchanged. Still open: dtype —
+  stop forcing `float64`, track dtype, default `float32`, support `bf16`/`float16`.
+  Crucial: high (memory + speed + the GPU on-ramp). Feasibility: medium.
 - **Keep pyccolo as optional transparent mode** (math.* routing, helper
   instrumentation, pipescript `|>`), gated behind an extra. Crucial: low.
   Feasibility: high (already built).

@@ -9,7 +9,7 @@ function to return gradients with the same pytree structure as its arguments.
 from importlib.metadata import PackageNotFoundError, version
 
 from pycograd._typing import Operand, Tensor
-from pycograd.backends import get_backend
+from pycograd.backends import activate, device, get_backend
 from pycograd.compile import compile_to
 from pycograd.data import DataLoader, batches
 from pycograd.export import export_onnx, export_torchscript, to_torch_module
@@ -127,6 +127,9 @@ __all__ = [
     # compile to other frameworks (torch / tf / jax)
     "compile_to",
     "get_backend",
+    # device / array backend seam (numpy default, cupy for GPU)
+    "device",
+    "activate",
     # static export (standalone artifacts)
     "to_torch_module",
     "export_torchscript",

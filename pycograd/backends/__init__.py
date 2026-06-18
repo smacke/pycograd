@@ -30,12 +30,31 @@ class Backend:
     * ``lift(array)`` / ``to_numpy(tensor)`` -- leaf conversion to/from the framework.
     * ``grad_and_value(scalar_fn, leaves)`` -- run ``scalar_fn(lifted_leaves) -> scalar``
       under the framework's autodiff and return ``(value, [grad per leaf])`` as numpy.
+
+    Backends come in two flavors. A *tape* backend (numpy, cupy) runs pycograd's own
+    ``Var`` tape over an array library; it additionally sets ``array_module`` (the ``xp``
+    the primitives compute with) and implements ``scatter_add``. A *delegate* backend
+    (jax/torch/tf) swaps the intercept table for a foreign framework's ops and lets that
+    framework differentiate, so it never invokes a ``d_*`` primitive and leaves
+    ``array_module`` / ``scatter_add`` unused.
     """
 
     name: str = "?"
 
+    # Tape backends only: the array module (``numpy``/``cupy``) the ``d_*`` primitives
+    # compute with. ``None`` on the base and on delegate backends, which never read it.
+    array_module: object = None
+
     @property
     def intercept(self) -> Mapping[object, Callable[..., object]]:
+        raise NotImplementedError
+
+    def scatter_add(self, out: object, key: object, vals: object) -> None:
+        """Scatter-add ``vals`` into ``out`` at ``key`` (tape backends only).
+
+        Backs the indexing VJP (``Var.__getitem__``'s backward) where repeated indices
+        must accumulate. numpy uses ``np.add.at``; cupy uses ``cupyx.scatter_add``.
+        """
         raise NotImplementedError
 
     def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
@@ -90,6 +109,23 @@ def activate(backend: Backend) -> Iterator[Backend]:
         yield backend
     finally:
         _active.reset(token)
+
+
+@contextlib.contextmanager
+def device(name: "str | Backend") -> Iterator[Backend]:
+    """Run the enclosed tape on a named array backend (``"numpy"``, ``"cupy"``, ...).
+
+    A thin, friendly wrapper over :func:`activate` / :func:`get_backend` for the device
+    seam: inside the block, ``value_and_grad``/``grad`` and the optimizers compute on that
+    backend's array library (so e.g. ``device("cupy")`` keeps the tape, optimizer state,
+    and gradients on the GPU)::
+
+        with device("cupy"):
+            value, (g,) = value_and_grad(loss)(w)
+            w = opt.step(w, g)
+    """
+    with activate(get_backend(name)) as be:
+        yield be
 
 
 # --- lazy registry ---------------------------------------------------------
@@ -154,6 +190,12 @@ def _make_abstract() -> Backend:
     return AbstractBackend()
 
 
+def _make_cupy() -> Backend:
+    from pycograd.backends.cupy_backend import CupyBackend
+
+    return CupyBackend()
+
+
 register_backend("numpy", _make_numpy)
 register_backend("abstract", _make_abstract)
 register_backend("shape", _make_abstract)
@@ -162,3 +204,6 @@ register_backend("torch", _make_torch)
 register_backend("pytorch", _make_torch)
 register_backend("tf", _make_tf)
 register_backend("tensorflow", _make_tf)
+register_backend("cupy", _make_cupy)
+register_backend("gpu", _make_cupy)
+register_backend("cuda", _make_cupy)

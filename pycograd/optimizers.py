@@ -33,11 +33,9 @@ import math
 from dataclasses import replace
 from typing import Any, Callable, Union
 
-import numpy as np
-
 from pycograd._typing import Array
 from pycograd.params import Param
-from pycograd.tensor import _is_numeric
+from pycograd.tensor import _is_numeric, _xp
 from pycograd.tree import (
     Leaf,
     PyTree,
@@ -54,9 +52,13 @@ State = Any
 
 
 def _leaf_value(leaf: Leaf) -> Array:
-    """The numeric value array of a parameter leaf (unwrapping a ``Param``)."""
+    """The numeric value array of a parameter leaf (unwrapping a ``Param``).
+
+    Coerced with the active array module so optimizer state created from these values
+    (momentum / Adam moment buffers) lives on the same device as the parameters.
+    """
     value = leaf.value if isinstance(leaf, Param) else leaf
-    return np.asarray(value, dtype=float)
+    return _xp().asarray(value, dtype=float)
 
 
 class Optimizer:
@@ -93,7 +95,7 @@ class Optimizer:
         if not self._trainable(leaf, grad):
             return leaf  # frozen / no gradient / non-numeric: held fixed
         new_value = self._update_leaf(
-            _leaf_value(leaf), np.asarray(grad, dtype=float), state, lr
+            _leaf_value(leaf), _xp().asarray(grad, dtype=float), state, lr
         )
         if isinstance(leaf, Param):
             return replace(leaf, value=new_value)
@@ -152,7 +154,7 @@ class SGD(Optimizer):
         self.nesterov = nesterov
 
     def _init_state(self, value: Array) -> State:
-        return np.zeros_like(value) if self.momentum else None
+        return _xp().zeros_like(value) if self.momentum else None
 
     def _update_leaf(self, value: Array, grad: Array, state: State, lr: float) -> Array:
         g = grad
@@ -190,7 +192,8 @@ class Adam(Optimizer):
         self.weight_decay = weight_decay
 
     def _init_state(self, value: Array) -> State:
-        return [np.zeros_like(value), np.zeros_like(value)]  # [m, v]
+        xp = _xp()
+        return [xp.zeros_like(value), xp.zeros_like(value)]  # [m, v]
 
     def _update_leaf(self, value: Array, grad: Array, state: State, lr: float) -> Array:
         b1, b2 = self.betas
@@ -205,7 +208,7 @@ class Adam(Optimizer):
         v_hat = v / (1 - b2**self.t)
         if wd and self._decoupled:  # AdamW: decay the weight directly
             value = value - lr * wd * value
-        return value - lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        return value - lr * m_hat / (_xp().sqrt(v_hat) + self.eps)
 
 
 class AdamW(Adam):
@@ -228,9 +231,10 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
     The norm is taken over all leaves jointly (``None`` leaves -- frozen params --
     are skipped). Below the threshold the tree is returned unchanged.
     """
+    xp = _xp()
     total = math.sqrt(
         sum(
-            float(np.sum(np.asarray(g, dtype=float) ** 2))
+            float(xp.sum(xp.asarray(g, dtype=float) ** 2))
             for g in tree_leaves(grads)
             if g is not None
         )
@@ -239,7 +243,7 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
         return grads
     scale = max_norm / total
     return tree_map(
-        lambda g: None if g is None else np.asarray(g, dtype=float) * scale, grads
+        lambda g: None if g is None else xp.asarray(g, dtype=float) * scale, grads
     )
 
 

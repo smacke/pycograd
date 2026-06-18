@@ -11,11 +11,26 @@ dependency on ``ops`` (which imports ``Var`` from here).
 from __future__ import annotations
 
 import functools
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Index, Operand
+from pycograd.backends import current_backend
+
+
+# ---------------------------------------------------------------------------
+# The array-module seam: data is computed with the *active* backend's array
+# library (numpy by default, cupy under ``device("cupy")``), so the same tape and
+# the same VJP rules run on whatever device that backend lives on.
+# ---------------------------------------------------------------------------
+def _xp() -> Any:
+    """The active backend's array module -- ``numpy`` unless a device is activated.
+
+    Typed ``Any`` because the module is chosen at runtime (numpy / cupy / ...); the
+    surface pycograd uses is the shared array-API subset both provide.
+    """
+    return current_backend().array_module
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +38,7 @@ from pycograd._typing import Array, ArrayLike, Index, Operand
 # ---------------------------------------------------------------------------
 def _unbroadcast(grad: Array, shape: tuple[int, ...]) -> Array:
     """Sum ``grad`` over axes that were broadcast, so it matches ``shape``."""
-    grad = np.asarray(grad, dtype=float)
+    grad = _xp().asarray(grad, dtype=float)
     while grad.ndim > len(shape):
         grad = grad.sum(axis=0)
     for axis, size in enumerate(shape):
@@ -45,10 +60,16 @@ def _value(x: Operand) -> ArrayLike:
     return x.value if isinstance(x, Var) else x
 
 
+def _is_array(x: object) -> bool:
+    """True for a numpy array or the active backend's array type (e.g. a cupy array)."""
+    if isinstance(x, np.ndarray):
+        return True
+    ndarray = getattr(_xp(), "ndarray", None)
+    return ndarray is not None and isinstance(x, ndarray)
+
+
 def _is_numeric(x: object) -> bool:
-    return (isinstance(x, (int, float)) and not isinstance(x, bool)) or isinstance(
-        x, np.ndarray
-    )
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)) or _is_array(x)
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +81,9 @@ class Var:
     __array_ufunc__ = None
 
     def __init__(self, value: ArrayLike, _parents: tuple[Var, ...] = ()) -> None:
-        self.value: Array = np.asarray(value, dtype=float)
-        self.grad: Array = np.zeros_like(self.value)
+        xp = _xp()
+        self.value: Array = xp.asarray(value, dtype=float)
+        self.grad: Array = xp.zeros_like(self.value)
         self._parents = _parents
         self._backward: Callable[[], None] = lambda: None
 
@@ -173,8 +195,9 @@ class Var:
         out = Var(self.value[key], _parents=(self,))
 
         def _backward() -> None:
-            grad = np.zeros_like(self.value)
-            np.add.at(grad, key, out.grad)  # scatter-add handles repeated indices
+            grad = _xp().zeros_like(self.value)
+            # scatter-add (np.add.at / cupyx.scatter_add) handles repeated indices
+            current_backend().scatter_add(grad, key, out.grad)
             self.grad = self.grad + grad
 
         out._backward = _backward
@@ -243,9 +266,10 @@ class Var:
             topo.append(v)
 
         build(self)
+        xp = _xp()
         for v in topo:
-            v.grad = np.zeros_like(v.value)
-        self.grad = np.ones_like(self.value)
+            v.grad = xp.zeros_like(v.value)
+        self.grad = xp.ones_like(self.value)
         for v in reversed(topo):
             v._backward()
 

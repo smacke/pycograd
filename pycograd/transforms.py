@@ -11,11 +11,9 @@ from __future__ import annotations
 
 from typing import Callable, cast
 
-import numpy as np
-
 from pycograd._typing import Array, ArrayLike, Operand
 from pycograd.params import Param, _TieRef
-from pycograd.tensor import Var, _is_numeric
+from pycograd.tensor import Var, _is_array, _is_numeric, _xp
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
     Leaf,
@@ -142,7 +140,7 @@ def value_and_grad(
             out.backward()  # otherwise each leaf's grad stays at its init zeros
             value: Array = out.value
         else:
-            value = np.asarray(out, dtype=float)
+            value = _xp().asarray(out, dtype=float)
 
         grads = tuple(
             tree_unflatten(
@@ -158,7 +156,9 @@ def value_and_grad(
 
 def _match_arg(orig: Leaf, grad: Array) -> Operand:
     value = orig.value if isinstance(orig, Param) else orig
-    return grad if isinstance(value, np.ndarray) else float(grad)
+    # Array-valued argument -> array gradient (on the active backend); a bare Python
+    # scalar -> a Python float (``float`` of a device scalar pulls it back to host).
+    return grad if _is_array(value) else float(grad)
 
 
 def grad(f: Callable[..., object]) -> Callable[..., tuple[PyTree, ...]]:

@@ -22,6 +22,7 @@ from typing import Iterator, Optional, Union
 import numpy as np
 
 from pycograd._typing import Array
+from pycograd.tensor import _xp
 
 Batch = Union[Array, tuple[Array, ...]]
 
@@ -61,11 +62,18 @@ def batches(
         order = gen.permutation(n)
     else:
         order = np.arange(n)
+    # The permutation/index math is host-side (numpy); the gather uses the active array
+    # module so on-device arrays (e.g. cupy under ``device("cupy")``) are sliced without
+    # a host round-trip, while plain numpy arrays behave exactly as before.
+    xp = _xp()
     for start in range(0, n, batch_size):
         idx = order[start : start + batch_size]
         if drop_last and len(idx) < batch_size:
             break
-        slices = tuple(np.asarray(a)[idx] for a in arrays)
+        # ``xp.asarray(idx)`` keeps the (host) index on the same device as the data so
+        # cupy's fancy indexing applies; for numpy it is a no-op and behavior is unchanged.
+        dev_idx = xp.asarray(idx)
+        slices = tuple(xp.asarray(a)[dev_idx] for a in arrays)
         yield slices[0] if len(slices) == 1 else slices
 
 
