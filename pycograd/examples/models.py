@@ -152,6 +152,14 @@ def _init_mlp_tree(
     }
 
 
+# A minibatch-friendly loss: instead of closing over the whole training set, it
+# takes the batch explicitly, so an optimizer can step on ``batches(_Xc, _Yoh)``.
+def mlp_batch_loss(params: MLPParams, xb: Tensor, yb: Tensor) -> Operand:
+    h, o = params["hidden"], params["out"]
+    probs = mlp_forward(xb, h["w"], h["b"], o["w"], o["b"])
+    return cross_entropy(probs, yb)
+
+
 def _mlp_tree_accuracy(params: PyTree) -> float:
     p = cast(dict[str, dict[str, Array]], params)
     h, o = p["hidden"], p["out"]

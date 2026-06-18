@@ -9,6 +9,7 @@ function to return gradients with the same pytree structure as its arguments.
 from importlib.metadata import PackageNotFoundError, version
 
 from pycograd._typing import Operand, Tensor
+from pycograd.data import DataLoader, batches
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
 from pycograd.ops import (
     AutodiffWarning,
@@ -45,6 +46,16 @@ from pycograd.ops import (
     d_var,
     d_vstack,
     d_where,
+)
+from pycograd.optimizers import (
+    SGD,
+    Adam,
+    AdamW,
+    Optimizer,
+    clip_grad_norm,
+    constant_lr,
+    cosine_decay,
+    step_decay,
 )
 from pycograd.params import (
     Param,
@@ -93,6 +104,18 @@ __all__ = [
     "grad",
     "gradient_descent",
     "sgd_update",
+    # optimizers
+    "Optimizer",
+    "SGD",
+    "Adam",
+    "AdamW",
+    "clip_grad_norm",
+    "constant_lr",
+    "step_decay",
+    "cosine_decay",
+    # data / batching
+    "batches",
+    "DataLoader",
     # pytrees
     "tree_flatten",
     "tree_unflatten",

@@ -14,8 +14,11 @@ from typing import cast
 import numpy as np
 
 from pycograd import (
+    SGD,
+    Adam,
     Param,
     ParamDict,
+    batches,
     frozen,
     gradient_descent,
     params,
@@ -33,9 +36,12 @@ from pycograd.examples.models import (
     _mlp_accuracy,
     _mlp_tree_accuracy,
     _transformer_accuracy,
+    _Xc,
+    _Yoh,
     deep_loss,
     logistic_loss,
     logistic_param_loss,
+    mlp_batch_loss,
     mlp_loss,
     mlp_tree_loss,
     sin_sq,
@@ -101,6 +107,33 @@ def main() -> None:
         len(tree_hist),
     )
     logger.info("  train accuracy: %.3f", _mlp_tree_accuracy(tree_params))
+
+    # Same MLP trained by *minibatch* SGD+momentum vs Adam: each epoch streams the
+    # data through batches() (shuffled with a seeded rng) and the optimizer carries
+    # its state (momentum buffers / Adam moments) across steps.
+    for name, opt in (
+        ("minibatch SGD+momentum", SGD(lr=0.3, momentum=0.9)),
+        ("minibatch Adam", Adam(lr=0.05)),
+    ):
+        rng = np.random.default_rng(0)
+        p = _init_mlp_tree(np.random.default_rng(1))
+        first = last = 0.0
+        for epoch in range(40):
+            for xb, yb in batches(_Xc, _Yoh, batch_size=16, shuffle=True, rng=rng):
+                # value_and_grad differentiates every positional arg; we only want
+                # the gradient w.r.t. the params, so the batch grads are discarded.
+                loss, (g, _gx, _gy) = value_and_grad(mlp_batch_loss)(p, xb, yb)
+                p = opt.step(p, g)
+                last = float(loss)
+                if epoch == 0 and first == 0.0:
+                    first = last
+        logger.info(
+            "%s (40 epochs, batch=16): batch loss %.4f -> %.4f, acc %.3f",
+            name,
+            first,
+            last,
+            _mlp_tree_accuracy(p),
+        )
 
     deep_params = _init_deep(np.random.default_rng(2))
     deep_params, deep_hist = gradient_descent(deep_loss, deep_params, lr=0.3, steps=400)
