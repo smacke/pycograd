@@ -1,0 +1,2 @@
+include README.md docs/HISTORY.rst docs/LICENSE.txt
+recursive-exclude test *

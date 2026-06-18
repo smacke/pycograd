@@ -1,0 +1,55 @@
+# -*- coding: utf-8 -*-
+.PHONY: clean build bump deploy_only deploy black blackcheck imports lint typecheck check_no_typing check test tests coverage xmlcov check_ci devdeps
+
+clean:
+	rm -rf __pycache__ build/ dist/ *.egg-info/ .coverage htmlcov
+
+build: clean
+	python -m build
+
+bump:
+	./scripts/bump-version.py
+
+deploy_only:
+	./scripts/deploy.sh
+
+deploy: build deploy_only
+
+black:
+	isort .
+	./scripts/blacken.sh
+
+blackcheck:
+	isort . --check-only
+	./scripts/blacken.sh --check
+
+imports:
+	pycln .
+	isort .
+
+lint:
+	ruff check
+
+typecheck:
+	mypy pycograd
+
+check_no_typing:
+	rm -f .coverage
+	rm -rf htmlcov
+	pytest --cov-config=pyproject.toml --cov=pycograd
+
+check: blackcheck lint typecheck check_no_typing
+
+test: check
+tests: check
+
+coverage: check_no_typing
+	coverage html
+
+xmlcov: check_no_typing
+	coverage xml
+
+check_ci: typecheck xmlcov
+
+devdeps:
+	pip install -e .[dev]
