@@ -80,8 +80,9 @@ class AutodiffTracer(pyc.BaseTracer):
     # tape is built per call via ``instrumented(func)``, so we never need the cache.
     bytecode_caching_allowed = False
 
-    # ``instrumented`` rebinds ``__code__`` and is not idempotent, so each helper
-    # is instrumented exactly once and reused.
+    # ``instrumented`` recompiles a helper from source into a fresh function, so
+    # cache each helper's instrumented version and reuse it rather than recompiling
+    # on every call.
     _helpers: dict[Callable[..., object], Callable[..., object]] = {}
 
     def _instrument_helper(self, func: Callable[..., object]) -> Callable[..., object]:
@@ -139,8 +140,8 @@ class AutodiffTracer(pyc.BaseTracer):
         return current_backend().coerce_operand(ret)
 
 
-# ``tracer.instrumented`` rebinds ``f.__code__`` (and is not idempotent -- a second
-# call re-reads the now-relocated source), so build each function's runner once.
+# ``tracer.instrumented`` recompiles ``f`` from source into a fresh function, so
+# build each function's runner once and reuse it rather than recompiling per call.
 _INSTRUMENTED: dict[Callable[..., object], Callable[..., object]] = {}
 
 

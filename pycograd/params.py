@@ -359,7 +359,7 @@ class ParamDict(dict):
                 grad_vars[key] = None
         runner = _INSTRUMENTED.get(objective)
         if runner is None:
-            runner = _make_runner(objective)  # cache: instrumented() is not idempotent
+            runner = _make_runner(objective)  # cache: avoid recompiling per call
             _INSTRUMENTED[objective] = runner
         prev = getattr(self, "_live", None)
         self._live = live
