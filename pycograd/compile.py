@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""Compile a pycograd net onto another framework (PyTorch / TensorFlow / JAX).
+
+A pycograd net is an ordinary numpy function over pytrees of arrays. Because every
+forward pass runs through one call-interception seam (:mod:`pycograd.tracer`), we can
+swap the seam's target for another framework's functions and let *that* framework
+execute -- and differentiate -- the net.
+
+* :func:`compile_to` returns a forward callable that runs ``fn`` on a backend's tensors
+  (pass that backend's tensors in, get one out, autograd-ready if the inputs are).
+* :func:`value_and_grad` mirrors :func:`pycograd.transforms.value_and_grad` but lifts
+  leaves onto the backend and reads gradients from the backend's own autodiff. The
+  ``frozen`` / ``tied`` parameter semantics carry over: frozen leaves become non-grad
+  constants, tied leaves share one tensor (so their gradient accumulates once).
+
+No framework is imported until ``backend=`` selects it.
+"""
+from __future__ import annotations
+
+from typing import Callable, cast
+
+import numpy as np
+
+from pycograd.backends import Backend, activate, get_backend
+from pycograd.params import Param, _TieRef
+from pycograd.tensor import _is_numeric
+from pycograd.tracer import _INSTRUMENTED, _make_runner
+from pycograd.transforms import _check_param_ownership, _match_arg
+from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
+
+
+def _runner_for(f: Callable[..., object]) -> Callable[..., object]:
+    """The instrumented version of ``f`` (cached, shared with the numpy path)."""
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+    return runner
+
+
+def compile_to(
+    fn: Callable[..., object], backend: "str | Backend"
+) -> Callable[..., object]:
+    """Return a forward callable running ``fn`` with ``backend`` as the swap target.
+
+    Selecting a non-numpy backend imports its framework here (and nowhere earlier).
+    The returned callable expects that backend's tensors and returns one; gradients
+    are the framework's job (e.g. wrap params with ``requires_grad`` for torch, or
+    ``jax.grad`` the result). For an all-in-one gradient driver, use
+    :func:`value_and_grad`.
+    """
+    be = get_backend(backend)
+    runner = _runner_for(fn)
+
+    def forward(*args: object, **kwargs: object) -> object:
+        with activate(be):
+            return runner(*args, **kwargs)
+
+    return forward
+
+
+# A leaf "slot" records how to fill one argument-leaf position during the forward, and
+# how to report its gradient afterwards. One of:
+#   ("train", idx, orig)  -- differentiated; tensor/grad live at index ``idx``
+#   ("const", value)      -- frozen Param; a non-grad constant; gradient is None
+#   ("none", leaf)        -- non-numeric; passed through; gradient is None
+_Slot = tuple
+
+
+def _plan_leaf(leaf: Leaf, trainable: list, tie_slot: dict) -> _Slot:
+    """Classify one leaf and, if trainable, record its raw value in ``trainable``."""
+    if isinstance(leaf, _TieRef):
+        raise ValueError(
+            "compile: tied[...] is only meaningful inside params(...), where it "
+            "references a sibling parameter; it reached value_and_grad unresolved"
+        )
+    if isinstance(leaf, Param):
+        if not leaf.trainable:
+            return ("const", leaf.value)
+        if leaf.tie is not None:
+            idx = tie_slot.get(leaf.tie)
+            if idx is None:
+                idx = len(trainable)
+                trainable.append(np.asarray(leaf.value, dtype=float))
+                tie_slot[leaf.tie] = idx
+            return ("train", idx, leaf)
+        idx = len(trainable)
+        trainable.append(np.asarray(leaf.value, dtype=float))
+        return ("train", idx, leaf)
+    if _is_numeric(leaf):
+        idx = len(trainable)
+        trainable.append(np.asarray(leaf, dtype=float))
+        return ("train", idx, leaf)
+    return ("none", leaf)
+
+
+def _fill(slot: _Slot, tensors: list, be: Backend) -> object:
+    if slot[0] == "train":
+        return tensors[slot[1]]
+    if slot[0] == "const":
+        return be.const(slot[1])
+    return slot[1]
+
+
+def _grad_for(slot: _Slot, grads: list, be: Backend) -> object:
+    if slot[0] == "train":
+        return _match_arg(slot[2], np.asarray(be.to_numpy(grads[slot[1]])))
+    return None
+
+
+def value_and_grad(
+    fn: Callable[..., object], *, backend: "str | Backend" = "numpy"
+) -> Callable[..., tuple[object, tuple[PyTree, ...]]]:
+    """Wrap ``fn`` so calling it returns ``(value, grads)`` computed on ``backend``.
+
+    Same contract as :func:`pycograd.transforms.value_and_grad`: ``grads`` is a tuple
+    with one matching pytree per positional argument (``None`` at frozen / non-numeric
+    leaves). The gradients come from the target framework's autodiff -- which, on the
+    finite-difference-checked example models, agrees with pycograd's own numpy tape.
+    """
+    be = get_backend(backend)
+    runner = _runner_for(fn)
+
+    def wrapped(*args: PyTree) -> tuple[object, tuple[PyTree, ...]]:
+        _check_param_ownership(args)
+        trainable: list = []
+        tie_slot: dict = {}
+        per_arg: list = []  # (treedef, [slot])
+        for a in args:
+            leaves, treedef = tree_flatten(a)
+            slots = [_plan_leaf(leaf, trainable, tie_slot) for leaf in leaves]
+            per_arg.append((treedef, slots))
+
+        def scalar_fn(tensors: list) -> object:
+            with activate(be):
+                call_args = [
+                    tree_unflatten(
+                        treedef,
+                        cast("list[Leaf]", [_fill(s, tensors, be) for s in slots]),
+                    )
+                    for treedef, slots in per_arg
+                ]
+                return runner(*call_args)
+
+        value, grad_leaves = be.grad_and_value(scalar_fn, trainable)
+
+        grads = tuple(
+            tree_unflatten(
+                treedef,
+                cast("list[Leaf]", [_grad_for(s, grad_leaves, be) for s in slots]),
+            )
+            for treedef, slots in per_arg
+        )
+        return value, grads
+
+    return wrapped
+
+
+def grad(
+    fn: Callable[..., object], *, backend: "str | Backend" = "numpy"
+) -> Callable[..., tuple[PyTree, ...]]:
+    """Like :func:`value_and_grad` but returns only the gradient tuple."""
+    vg = value_and_grad(fn, backend=backend)
+    return lambda *args: vg(*args)[1]

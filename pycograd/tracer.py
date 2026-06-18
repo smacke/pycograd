@@ -19,7 +19,8 @@ from typing import Callable
 
 import pyccolo as pyc
 
-from pycograd.ops import _INTERCEPT, _is_mathy, _warn_wrapper
+from pycograd.backends import current_backend
+from pycograd.ops import _is_mathy
 
 # Directories holding stdlib / installed packages -- functions defined here are
 # treated as "library" code and left alone (only *your* code is instrumented).
@@ -104,14 +105,21 @@ class AutodiffTracer(pyc.BaseTracer):
         wrap an un-ruled numpy/math function so it warns if a Var flows in. This is
         the logic ``before_call`` applies; it is exposed so other call mechanisms
         (e.g. pipescript's ``|>`` via its application hooks) can participate too.
+
+        The swap target is the *active backend* (numpy by default): its ``intercept``
+        table and un-mapped fallback. With the numpy backend this is exactly the old
+        ``_INTERCEPT`` / ``_warn_wrapper`` behavior; a compile backend swaps the same
+        calls for another framework's functions instead. Only the swap target varies --
+        the user-helper instrumentation and the mathy predicate are backend-agnostic.
         """
-        replacement = _INTERCEPT.get(func)
+        backend = current_backend()
+        replacement = backend.intercept.get(func)
         if replacement is not None:
             return replacement
         if _is_user_function(func):
             return self._instrument_helper(func)
         if _is_mathy(func):
-            return _warn_wrapper(func)
+            return backend.on_unmapped(func)
         return func  # builtins, methods, etc. pass through
 
     @pyc.register_handler(pyc.before_call)
@@ -119,6 +127,16 @@ class AutodiffTracer(pyc.BaseTracer):
         self, func: Callable[..., object], node: object, *_: object, **__: object
     ) -> Callable[..., object]:
         return self.resolve_call(func)
+
+    @pyc.register_handler(pyc.after_left_binop_arg)
+    def handle_left_binop_arg(self, ret: object, *_: object, **__: object) -> object:
+        # Let the active backend promote a binop operand (e.g. a numpy data global
+        # meeting a torch/tf tensor). numpy/jax leave it unchanged.
+        return current_backend().coerce_operand(ret)
+
+    @pyc.register_handler(pyc.after_right_binop_arg)
+    def handle_right_binop_arg(self, ret: object, *_: object, **__: object) -> object:
+        return current_backend().coerce_operand(ret)
 
 
 # ``tracer.instrumented`` rebinds ``f.__code__`` (and is not idempotent -- a second

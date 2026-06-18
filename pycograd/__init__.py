@@ -9,7 +9,10 @@ function to return gradients with the same pytree structure as its arguments.
 from importlib.metadata import PackageNotFoundError, version
 
 from pycograd._typing import Operand, Tensor
+from pycograd.backends import get_backend
+from pycograd.compile import compile_to
 from pycograd.data import DataLoader, batches
+from pycograd.export import export_onnx, export_torchscript, to_torch_module
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
 from pycograd.ops import (
     AutodiffWarning,
@@ -104,6 +107,13 @@ __all__ = [
     "grad",
     "gradient_descent",
     "sgd_update",
+    # compile to other frameworks (torch / tf / jax)
+    "compile_to",
+    "get_backend",
+    # static export (standalone artifacts)
+    "to_torch_module",
+    "export_torchscript",
+    "export_onnx",
     # optimizers
     "Optimizer",
     "SGD",
