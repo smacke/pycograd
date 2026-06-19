@@ -202,3 +202,93 @@ def test_autodiff_pipe_through_user_helper_in_cell():
         print("OK")
         """
     )
+
+
+def test_autodiff_pipe_helper_with_pipescript_body():
+    # A helper whose *own body* uses pipescript syntax. The helper is woven by
+    # pipescript at cell-compile time, so its linecache source is the lowered ``|``
+    # form; re-instrumenting that source would degrade the pipes to bitwise-or. The
+    # fix re-instruments from the retained *augmented* AST, so the pipes survive and
+    # the gradient flows through ``z |> np.exp |> np.sum``.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import Var")
+        ip.run_cell("def stage(z):\\n    return z |> np.exp |> np.sum")
+        ip.run_cell("x = Var(np.array([1.0, 2.0, 3.0]))")
+        r = ip.run_cell("loss = (x |> stage)")
+        assert r.error_in_exec is None, r.error_in_exec
+        ip.run_cell("loss.backward()")
+        g = ip.user_ns["x"].grad
+        assert np.allclose(g, np.exp([1.0, 2.0, 3.0])), g
+        print("OK")
+        """
+    )
+
+
+def test_autodiff_pipe_helper_with_placeholder_macro_body():
+    # Same path, but the woven body uses a pipescript placeholder lambda (``$``)
+    # rather than a bare function reference -- exercises augmentation preservation for
+    # a macro node, not just a plain pipe.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import Var")
+        ip.run_cell("def scale_sum(z):\\n    return z |> ($ * 2.0) |> np.sum")
+        ip.run_cell("x = Var(np.array([1.0, 2.0, 3.0]))")
+        r = ip.run_cell("loss = (x |> scale_sum)")
+        assert r.error_in_exec is None, r.error_in_exec
+        ip.run_cell("loss.backward()")
+        g = ip.user_ns["x"].grad
+        assert np.allclose(g, [2.0, 2.0, 2.0]), g
+        print("OK")
+        """
+    )
+
+
+def test_autodiff_woven_helper_calls_nested_plain_helper():
+    # Regression for the notebook's Transformer block: a woven helper (``outer``, whose
+    # body uses ``|>``) calls a *nested plain* helper (``inner``, a bare-numpy reduction)
+    # and is reached through an objective (``f``) that is instrumented first. Recompiling
+    # ``f`` rebuilds its cell's per-file bookkeeping, so ``outer`` must be recovered from
+    # the global node table -- otherwise it runs un-instrumented, ``inner`` is never
+    # intercepted, and ``np.max`` on a Var blows up (``d_max() got an unexpected kwarg``).
+    # All three defs share one cell (one co_filename); the call happens in a later cell.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import Var, value_and_grad")
+        ip.run_cell(
+            "def inner(z):\\n    return z - np.max(z)\\n"
+            "def outer(z):\\n    return inner(z) |> np.sum\\n"
+            "def f(z):\\n    return outer(z)"
+        )
+        r = ip.run_cell("v, (g,) = value_and_grad(f)(np.array([1.0, 2.0, 3.0]))")
+        assert r.error_in_exec is None, r.error_in_exec
+        v, g = ip.user_ns["v"], ip.user_ns["g"]
+        assert np.isclose(v, -3.0), v               # sum(z - max(z))
+        assert np.allclose(g, [1.0, 1.0, -2.0]), g  # 1 - n*[i == argmax], so inner ran
+        print("OK")
+        """
+    )
+
+
+def test_autodiff_pipe_helper_mixes_pipe_and_plain_numpy():
+    # The hard case: a woven helper mixing an *un-piped* numpy call on a Var with a
+    # pipe in the same body. The un-piped ``np.exp(z)`` needs before_call woven in,
+    # while the pipe needs its augmentation preserved -- re-instrumenting from the
+    # retained augmented AST satisfies both at once.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import Var")
+        ip.run_cell("def stage(z):\\n    a = np.exp(z)\\n    return a |> np.sum")
+        ip.run_cell("x = Var(np.array([1.0, 2.0, 3.0]))")
+        r = ip.run_cell("loss = (x |> stage)")
+        assert r.error_in_exec is None, r.error_in_exec
+        ip.run_cell("loss.backward()")
+        g = ip.user_ns["x"].grad
+        assert np.allclose(g, np.exp([1.0, 2.0, 3.0])), g
+        print("OK")
+        """
+    )

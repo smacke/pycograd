@@ -89,14 +89,14 @@ class AutodiffTracer(pyc.BaseTracer):
         cached = self._helpers.get(func)
         if cached is not None:
             return cached
-        try:
-            instrumented = self.instrumented(func)
-        except (OSError, TypeError, SyntaxError):
-            # No retrievable/parseable source (e.g. a closure over free vars, a
-            # C-accelerated shim): leave it alone rather than fail.
-            instrumented = func
-        self._helpers[func] = instrumented
-        return instrumented
+        # Same instrument-or-run-directly decision as the top-level differentiated
+        # function (``_make_runner``); cache the result so each helper is built once.
+        # ``instrumented`` recompiles a *plain* helper from source and a *pipescript*
+        # helper from its retained augmented AST, so a helper whose body uses ``|>``
+        # differentiates through the pipe just like one written with bare ``np.*`` calls.
+        runner = _make_runner(func)
+        self._helpers[func] = runner
+        return runner
 
     def resolve_call(self, func: Callable[..., object]) -> Callable[..., object]:
         """Map a callable to its autodiff-aware version.
@@ -163,12 +163,16 @@ def _make_runner(f: Callable[..., object]) -> Callable[..., object]:
 
     A function that isn't yet woven (an ordinary ``def`` or a plain ``lambda``,
     including one defined in a notebook cell) is instrumented so its calls emit
-    before_call. One that's *already* woven -- a pipescript ``|>`` pipe lambda, or
-    anything with no recompilable source -- is run directly instead, with the autodiff
-    tracer enabled so the tape is built as it executes.
+    before_call. A function whose body uses pipescript syntax *is* woven, but
+    ``instrumented`` re-instruments it from its retained augmented AST -- preserving
+    the pipe/macro markings while still weaving before_call -- so it differentiates
+    too. Only a function that's already woven yet has *no* retained augmented
+    definition (e.g. a pipescript ``|>`` pipe lambda, or anything with no recompilable
+    source) is run directly instead, with the autodiff tracer enabled so the tape is
+    built as it executes; recompiling its lowered source would corrupt it.
     """
     tracer = AutodiffTracer.instance()
-    if not _is_already_woven(f):
+    if not (_is_already_woven(f) and tracer._augmented_definition_for(f) is None):
         try:
             return tracer.instrumented(f)
         except Exception:
