@@ -19,24 +19,30 @@ from __future__ import annotations
 
 from typing import Callable, Sequence, cast
 
-import numpy as np
-
 from pycograd.compile import compile_to
+from pycograd.dtypes import _maybe_dtype
 from pycograd.params import Param
 from pycograd.tree import PyTree, tree_flatten, tree_unflatten
 
 
-def to_torch_module(fn: Callable[..., object], params: PyTree) -> object:
+def to_torch_module(
+    fn: Callable[..., object], params: PyTree, *, dtype: object = None
+) -> object:
     """Wrap a net ``fn(params, *inputs)`` as a ``torch.nn.Module``.
 
     The returned module holds ``params``' leaves as trainable ``Parameter``s (frozen
     ``Param`` leaves become non-trainable buffers). Calling ``module(*inputs)`` runs the
     compiled-to-torch forward, reconstructing the original param pytree from the live
     tensors -- so weight structure (nested dicts/lists) is preserved.
+
+    ``dtype`` selects the precision (``"float32"``, ``"bf16"``, ...) the weights and the
+    compiled forward use; ``None`` (the default) keeps float64.
     """
     import torch
 
-    run = compile_to(fn, "torch")
+    from pycograd.backends.torch_backend import _as_torch
+
+    run = compile_to(fn, "torch", dtype=dtype)
     leaves, treedef = tree_flatten(params)
 
     class PycogradModule(torch.nn.Module):
@@ -47,7 +53,8 @@ def to_torch_module(fn: Callable[..., object], params: PyTree) -> object:
             self._weights = torch.nn.ParameterList()
             for i, leaf in enumerate(leaves):
                 value = leaf.value if isinstance(leaf, Param) else leaf
-                tensor = torch.as_tensor(np.asarray(value, dtype=np.float64))
+                with _maybe_dtype(dtype):
+                    tensor = _as_torch(torch, value)
                 frozen = isinstance(leaf, Param) and not leaf.trainable
                 if frozen:
                     name = f"_frozen_{i}"

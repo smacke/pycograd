@@ -4,8 +4,11 @@
 TF diverges from numpy more than torch/jax do: math functions are split across ``tf``
 and ``tf.math``, reductions are ``reduce_*`` (with ``axis``/``keepdims``), ``matmul``
 needs explicit handling for vector operands, and clip is ``clip_by_value``. Those
-adapters live here. Gradients come from ``tf.GradientTape`` over float64 ``tf.Variable``
-leaves, so results match pycograd's float64 tape.
+adapters live here. Gradients come from ``tf.GradientTape`` over ``tf.Variable`` leaves in
+the active working dtype (:func:`~pycograd.dtypes.current_dtype`), defaulting to float64 so
+results match pycograd's float64 tape; ``dtype("float32")`` / ``dtype("bf16")`` compile the
+forward in that precision instead. bfloat16 needs a float32 bridge in and out, since TF
+cannot read or write an ``ml_dtypes.bfloat16`` numpy buffer.
 
 Two TF *operator* limitations are inherent (not pycograd's): ``tensor.T`` does not exist
 on a ``tf.Tensor`` (use ``np.transpose``), and the ``@`` operator requires rank >= 2 on
@@ -19,14 +22,35 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from pycograd.backends import Backend
+from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
+
+
+def _as_tf(tf: "Any", x: "Any") -> "Any":
+    """Convert ``x`` to a tf tensor in the active working dtype (bf16 via float32)."""
+    if tf.is_tensor(x) or isinstance(x, tf.Variable):
+        return x
+    dt = current_dtype()
+    if dt.name == "bfloat16":
+        # TF can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
+        return tf.cast(tf.constant(np.asarray(x, dtype=np.float32)), tf.bfloat16)
+    return tf.constant(np.asarray(x, dtype=dt))
+
+
+def _tf_to_numpy(tf: "Any", t: "Any") -> "Any":
+    """A tf tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
+    if tf.is_tensor(t) or isinstance(t, tf.Variable):
+        if t.dtype == tf.bfloat16:
+            import ml_dtypes
+
+            return np.asarray(tf.cast(t, tf.float32)).astype(ml_dtypes.bfloat16)
+        return np.asarray(t)
+    return np.asarray(t)
 
 
 def _make_adapters(tf: "Any") -> dict:
     def as_t(x: Any) -> Any:
-        if tf.is_tensor(x) or isinstance(x, tf.Variable):
-            return x
-        return tf.constant(np.asarray(x, dtype=np.float64))
+        return _as_tf(tf, x)
 
     def unary(fn: Callable[..., object]) -> Callable[..., object]:
         return lambda x: fn(as_t(x))
@@ -193,10 +217,7 @@ class TFBackend(Backend):
         return tf.is_tensor(x) or isinstance(x, tf.Variable)
 
     def _as_tensor(self, x: Any) -> Any:
-        tf = self._tf
-        if self._is_tensor(x):
-            return x
-        return tf.constant(np.asarray(x, dtype=np.float64))
+        return _as_tf(self._tf, x)
 
     @property
     def intercept(self) -> Mapping[object, Callable[..., object]]:
@@ -206,26 +227,26 @@ class TFBackend(Backend):
         return _unmapped(func, self._is_tensor)
 
     def lift(self, array: object) -> object:
-        return self._tf.constant(np.asarray(array, dtype=np.float64))
+        return _as_tf(self._tf, array)
 
     def const(self, array: object) -> object:
-        return self._tf.constant(np.asarray(array, dtype=np.float64))
+        return _as_tf(self._tf, array)
 
     def coerce_operand(self, value: object) -> object:
         if isinstance(value, (np.ndarray, np.generic)):
-            return self._tf.constant(np.asarray(value, dtype=np.float64))
+            return _as_tf(self._tf, value)
         return value
 
     def to_numpy(self, tensor: object) -> object:
-        return np.asarray(tensor)
+        return _tf_to_numpy(self._tf, tensor)
 
     def grad_and_value(
         self, scalar_fn: Callable[[list], object], leaves: list
     ) -> tuple[object, list]:
         tf = self._tf
-        ts = [tf.Variable(np.asarray(leaf, dtype=np.float64)) for leaf in leaves]
+        ts = [tf.Variable(_as_tf(tf, leaf)) for leaf in leaves]
         with tf.GradientTape() as tape:
             out = self._as_tensor(scalar_fn(ts))
         grads = tape.gradient(out, ts) if ts else []
         grads = [g if g is not None else tf.zeros_like(t) for g, t in zip(grads, ts)]
-        return np.asarray(out), [np.asarray(g) for g in grads]
+        return _tf_to_numpy(tf, out), [_tf_to_numpy(tf, g) for g in grads]

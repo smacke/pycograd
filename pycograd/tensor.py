@@ -17,6 +17,7 @@ import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Index, Operand
 from pycograd.backends import current_backend
+from pycograd.dtypes import current_dtype, resolve_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ def _xp() -> Any:
 # ---------------------------------------------------------------------------
 def _unbroadcast(grad: Array, shape: tuple[int, ...]) -> Array:
     """Sum ``grad`` over axes that were broadcast, so it matches ``shape``."""
-    grad = _xp().asarray(grad, dtype=float)
+    grad = _xp().asarray(grad, dtype=current_dtype())
     while grad.ndim > len(shape):
         grad = grad.sum(axis=0)
     for axis, size in enumerate(shape):
@@ -80,9 +81,16 @@ class Var:
     # reflected methods, and to fail loudly on un-intercepted ufuncs.
     __array_ufunc__ = None
 
-    def __init__(self, value: ArrayLike, _parents: tuple[Var, ...] = ()) -> None:
+    def __init__(
+        self,
+        value: ArrayLike,
+        _parents: tuple[Var, ...] = (),
+        *,
+        dtype: object = None,
+    ) -> None:
         xp = _xp()
-        self.value: Array = xp.asarray(value, dtype=float)
+        dt = current_dtype() if dtype is None else resolve_dtype(dtype)
+        self.value: Array = xp.asarray(value, dtype=dt)
         self.grad: Array = xp.zeros_like(self.value)
         self._parents = _parents
         self._backward: Callable[[], None] = lambda: None

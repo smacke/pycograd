@@ -32,7 +32,14 @@ from pycograd.tensor import Var, _is_numeric
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
 
 # A short numpy-dtype tag for ``__repr__`` ("f64", "i32", ...).
-_DTYPE_TAG = {"float64": "f64", "float32": "f32", "int64": "i64", "int32": "i32"}
+_DTYPE_TAG = {
+    "float64": "f64",
+    "float32": "f32",
+    "float16": "f16",
+    "bfloat16": "bf16",
+    "int64": "i64",
+    "int32": "i32",
+}
 
 
 # ---------------------------------------------------------------------------

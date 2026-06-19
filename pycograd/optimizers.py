@@ -34,6 +34,7 @@ from dataclasses import replace
 from typing import Any, Callable, Union
 
 from pycograd._typing import Array
+from pycograd.dtypes import current_dtype
 from pycograd.params import Param
 from pycograd.tensor import _is_numeric, _xp
 from pycograd.tree import (
@@ -55,10 +56,15 @@ def _leaf_value(leaf: Leaf) -> Array:
     """The numeric value array of a parameter leaf (unwrapping a ``Param``).
 
     Coerced with the active array module so optimizer state created from these values
-    (momentum / Adam moment buffers) lives on the same device as the parameters.
+    (momentum / Adam moment buffers) lives on the same device as the parameters. The
+    leaf's own dtype is preserved -- a float32/bfloat16 parameter keeps its precision
+    through the step, and its moment buffers (``zeros_like(value)``) match it.
     """
     value = leaf.value if isinstance(leaf, Param) else leaf
-    return _xp().asarray(value, dtype=float)
+    arr = _xp().asarray(value)
+    # Keep an existing float precision (f64/f32/f16/bf16); promote a non-float leaf
+    # (a bare int) to the working dtype so the update stays real-valued.
+    return arr if arr.dtype.kind == "f" else arr.astype(current_dtype())
 
 
 class Optimizer:
@@ -94,8 +100,10 @@ class Optimizer:
     def _apply(self, leaf: Leaf, grad: Leaf, state: State, lr: float) -> Leaf:
         if not self._trainable(leaf, grad):
             return leaf  # frozen / no gradient / non-numeric: held fixed
+        value = _leaf_value(leaf)
+        # Match the gradient to the parameter's dtype so the update stays in precision.
         new_value = self._update_leaf(
-            _leaf_value(leaf), _xp().asarray(grad, dtype=float), state, lr
+            value, _xp().asarray(grad, dtype=value.dtype), state, lr
         )
         if isinstance(leaf, Param):
             return replace(leaf, value=new_value)
@@ -232,6 +240,7 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
     are skipped). Below the threshold the tree is returned unchanged.
     """
     xp = _xp()
+    # The norm is accumulated in float64 for stability regardless of the grads' dtype...
     total = math.sqrt(
         sum(
             float(xp.sum(xp.asarray(g, dtype=float) ** 2))
@@ -242,9 +251,9 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
     if total <= max_norm or total == 0.0:
         return grads
     scale = max_norm / total
-    return tree_map(
-        lambda g: None if g is None else xp.asarray(g, dtype=float) * scale, grads
-    )
+    # ...but the rescaled grads preserve each leaf's own precision: multiplying an array
+    # by the Python scalar ``scale`` keeps the array's (float) dtype.
+    return tree_map(lambda g: None if g is None else xp.asarray(g) * scale, grads)
 
 
 # ---------------------------------------------------------------------------

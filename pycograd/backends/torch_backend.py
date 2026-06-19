@@ -8,8 +8,12 @@ thin adapter: torch spells the reduction axis ``dim`` (not ``axis``) and ``keepd
 ``maximum``/``minimum``/``where``. Those adapters live here; everything else maps to the
 same-named ``torch`` function. Gradients come from ``torch.autograd.grad``.
 
-Tensors are float64 to match pycograd's float64 tape (torch otherwise defaults float32),
-so gradients agree with pycograd's to tight tolerance.
+Tensors are created in the active working dtype (:func:`~pycograd.dtypes.current_dtype`),
+which defaults to float64 to match pycograd's float64 tape (torch otherwise defaults
+float32) so gradients agree to tight tolerance; under ``dtype("float32")`` /
+``dtype("bf16")`` the compiled forward runs in that precision instead. bfloat16 needs a
+detour: torch cannot read or write an ``ml_dtypes.bfloat16`` numpy buffer, so bf16 leaves
+are routed in through float32 and bf16 results back out through float32.
 """
 from __future__ import annotations
 
@@ -18,16 +22,43 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from pycograd.backends import Backend
+from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
+
+
+def _torch_dtype(torch: "Any", np_dtype: "np.dtype") -> "Any":
+    """The ``torch`` dtype matching a numpy dtype (names line up: float32, bfloat16, ...)."""
+    return getattr(torch, np_dtype.name)
+
+
+def _as_torch(torch: "Any", x: "Any") -> "Any":
+    """Convert ``x`` to a torch tensor in the active working dtype (bf16 via float32)."""
+    if isinstance(x, torch.Tensor):
+        return x
+    dt = current_dtype()
+    if dt.name == "bfloat16":
+        # torch can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
+        return torch.as_tensor(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
+    return torch.as_tensor(np.asarray(x, dtype=dt))
+
+
+def _torch_to_numpy(torch: "Any", t: "Any") -> "Any":
+    """A torch tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
+    if isinstance(t, torch.Tensor):
+        t = t.detach().cpu()
+        if t.dtype == torch.bfloat16:
+            import ml_dtypes
+
+            return t.to(torch.float32).numpy().astype(ml_dtypes.bfloat16)
+        return t.numpy()
+    return np.asarray(t)
 
 
 def _make_adapters(torch: "Any") -> dict:
     """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set."""
 
     def as_t(x: Any) -> Any:
-        if isinstance(x, torch.Tensor):
-            return x
-        return torch.as_tensor(np.asarray(x, dtype=np.float64))
+        return _as_torch(torch, x)
 
     def unary(name: str) -> Callable[..., object]:
         fn = getattr(torch, name)
@@ -191,10 +222,7 @@ class TorchBackend(Backend):
         }
 
     def _as_tensor(self, x: Any) -> Any:
-        torch = self._torch
-        if isinstance(x, torch.Tensor):
-            return x
-        return torch.as_tensor(np.asarray(x, dtype=np.float64))
+        return _as_torch(self._torch, x)
 
     @property
     def intercept(self) -> Mapping[object, Callable[..., object]]:
@@ -204,31 +232,26 @@ class TorchBackend(Backend):
         return _unmapped(func, lambda x: isinstance(x, self._torch.Tensor))
 
     def lift(self, array: object) -> object:
-        return self._torch.as_tensor(np.asarray(array, dtype=np.float64))
+        return _as_torch(self._torch, array)
 
     def const(self, array: object) -> object:
-        return self._torch.as_tensor(np.asarray(array, dtype=np.float64))
+        return _as_torch(self._torch, array)
 
     def coerce_operand(self, value: object) -> object:
         # Promote a numpy constant (e.g. a data global) so it can share an operator
         # with a torch tensor; leave python scalars and existing tensors untouched.
         if isinstance(value, (np.ndarray, np.generic)):
-            return self._torch.as_tensor(np.asarray(value, dtype=np.float64))
+            return _as_torch(self._torch, value)
         return value
 
     def to_numpy(self, tensor: object) -> object:
-        if isinstance(tensor, self._torch.Tensor):
-            return tensor.detach().cpu().numpy()
-        return np.asarray(tensor)
+        return _torch_to_numpy(self._torch, tensor)
 
     def grad_and_value(
         self, scalar_fn: Callable[[list], object], leaves: list
     ) -> tuple[object, list]:
         torch = self._torch
-        ts = [
-            torch.as_tensor(np.asarray(leaf, dtype=np.float64)).requires_grad_(True)
-            for leaf in leaves
-        ]
+        ts = [_as_torch(torch, leaf).requires_grad_(True) for leaf in leaves]
         out = self._as_tensor(scalar_fn(ts)).reshape(())
         if ts:
             grads = torch.autograd.grad(out, ts, allow_unused=True)
@@ -237,4 +260,4 @@ class TorchBackend(Backend):
             ]
         else:
             grads = []
-        return out.detach().cpu().numpy(), [g.detach().cpu().numpy() for g in grads]
+        return _torch_to_numpy(torch, out), [_torch_to_numpy(torch, g) for g in grads]

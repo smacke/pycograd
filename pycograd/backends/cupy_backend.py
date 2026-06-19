@@ -10,6 +10,11 @@ genuinely differs on a GPU: leaf conversion (host<->device) and scatter-add.
 
 Importing this module imports cupy (and cupyx), so it is reached only through the lazy
 ``get_backend("cupy")`` factory -- never at ``import pycograd`` time.
+
+The working-dtype seam (``with dtype(...)``) applies here too: leaves are created in the
+active :func:`~pycograd.dtypes.current_dtype`. float16/float32/float64 are native on the
+GPU; bfloat16 (a numpy dtype from ``ml_dtypes``) is generally *not* supported by cupy, so
+combine ``device("cupy")`` with f16/f32/f64 rather than bf16.
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import cupy
 import cupyx
 
 from pycograd.backends.numpy_backend import NumpyBackend
+from pycograd.dtypes import current_dtype
 from pycograd.tensor import Var
 
 
@@ -29,10 +35,10 @@ class CupyBackend(NumpyBackend):
         cupyx.scatter_add(out, key, vals)
 
     def lift(self, array: object) -> Var:
-        return Var(cupy.asarray(array, dtype=float))  # host -> device
+        return Var(cupy.asarray(array, dtype=current_dtype()))  # host -> device
 
     def const(self, array: object) -> object:
-        return cupy.asarray(array, dtype=float)
+        return cupy.asarray(array, dtype=current_dtype())
 
     def to_numpy(self, tensor: object) -> object:
         value = tensor.value if isinstance(tensor, Var) else tensor

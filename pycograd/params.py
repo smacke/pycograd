@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, cast
 import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Index, Operand
+from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, _warn_wrapper
 from pycograd.tensor import Var, _is_numeric, _value
 
@@ -50,7 +51,7 @@ class Param:
     origin: object = None
 
     def __post_init__(self) -> None:
-        self.value = np.asarray(self.value, dtype=float)
+        self.value = np.asarray(self.value, dtype=current_dtype())
 
 
 class _Frozen:
@@ -58,7 +59,7 @@ class _Frozen:
     ``frozen[v]`` (the bracket form reads naturally inside a ``params{...}`` block)."""
 
     def __call__(self, value: ArrayLike) -> Param:
-        return Param(np.asarray(value, dtype=float), trainable=False)
+        return Param(np.asarray(value, dtype=current_dtype()), trainable=False)
 
     def __getitem__(self, value: ArrayLike) -> Param:
         return self(value)
@@ -83,7 +84,7 @@ class _Tied:
     by reference -- just the name, with no restatement of its initializer."""
 
     def __call__(self, key: object, value: ArrayLike) -> Param:
-        return Param(np.asarray(value, dtype=float), tie=key)
+        return Param(np.asarray(value, dtype=current_dtype()), tie=key)
 
     def __getitem__(self, ref: object) -> "_TieRef":
         return _TieRef(ref)
@@ -371,7 +372,7 @@ class ParamDict(dict):
             out.backward()
             value: Array = out.value
         else:
-            value = np.asarray(out, dtype=float)
+            value = np.asarray(out, dtype=current_dtype())
         grads = ParamDict(
             {
                 key: (gv.grad if gv is not None else None)
@@ -431,7 +432,7 @@ def params(spec: dict[str, PyTree] | None = None, **named: PyTree) -> ParamDict:
                     "autodiff: tied[...] must reference another parameter declared "
                     "in the same params(...) call (by name)"
                 )
-            p = Param(np.asarray(cast(ArrayLike, arr), dtype=float))
+            p = Param(np.asarray(cast(ArrayLike, arr), dtype=current_dtype()))
             p.tie = tie_keys.setdefault(target, object())
             p.origin = token
             return p
@@ -446,7 +447,7 @@ def params(spec: dict[str, PyTree] | None = None, **named: PyTree) -> ParamDict:
         if isinstance(v, tuple):
             return tuple(wrap(child) for child in v)
         if _is_numeric(v):
-            p = Param(np.asarray(cast(ArrayLike, v), dtype=float))
+            p = Param(np.asarray(cast(ArrayLike, v), dtype=current_dtype()))
             p.origin = token
             return p
         return v  # non-numeric leaf (e.g. a label): left alone, no gradient

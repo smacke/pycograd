@@ -14,6 +14,7 @@ import numpy as np
 
 from pycograd._typing import Operand
 from pycograd.backends import Backend, activate
+from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, _warn_wrapper
 from pycograd.tensor import Var, _lift
 
@@ -34,17 +35,17 @@ class NumpyBackend(Backend):
         np.add.at(cast(Any, out), cast(Any, key), cast(Any, vals))
 
     def lift(self, array: object) -> Var:
-        return Var(np.asarray(array, dtype=float))
+        return Var(np.asarray(array, dtype=current_dtype()))
 
     def const(self, array: object) -> object:
         # A raw numpy value: Var's operators auto-lift it when it meets a tape node,
         # so it participates in the forward without ever getting a gradient slot.
-        return np.asarray(array, dtype=float)
+        return np.asarray(array, dtype=current_dtype())
 
     def to_numpy(self, tensor: object) -> object:
-        return (
-            tensor.value if isinstance(tensor, Var) else np.asarray(tensor, dtype=float)
-        )
+        # Preserve the tensor's dtype (a float32/bfloat16 tape stays in its precision)
+        # rather than upcasting back to float64.
+        return tensor.value if isinstance(tensor, Var) else np.asarray(tensor)
 
     def grad_and_value(
         self, scalar_fn: Callable[[list], object], leaves: list

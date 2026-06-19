@@ -12,6 +12,7 @@ from pycograd._typing import Operand, Tensor
 from pycograd.backends import activate, device, get_backend
 from pycograd.compile import compile_to
 from pycograd.data import DataLoader, batches
+from pycograd.dtypes import current_dtype, dtype, resolve_dtype
 from pycograd.export import export_onnx, export_torchscript, to_torch_module
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
 from pycograd.ops import (
@@ -130,6 +131,10 @@ __all__ = [
     # device / array backend seam (numpy default, cupy for GPU)
     "device",
     "activate",
+    # working-dtype seam (float64 default; float32 / float16 / bfloat16)
+    "dtype",
+    "current_dtype",
+    "resolve_dtype",
     # static export (standalone artifacts)
     "to_torch_module",
     "export_torchscript",

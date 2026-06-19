@@ -22,6 +22,7 @@ from typing import Callable, cast
 import numpy as np
 
 from pycograd.backends import Backend, activate, get_backend
+from pycograd.dtypes import _maybe_dtype, current_dtype
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import _is_numeric
 from pycograd.tracer import _INSTRUMENTED, _make_runner
@@ -39,7 +40,7 @@ def _runner_for(f: Callable[..., object]) -> Callable[..., object]:
 
 
 def compile_to(
-    fn: Callable[..., object], backend: "str | Backend"
+    fn: Callable[..., object], backend: "str | Backend", *, dtype: object = None
 ) -> Callable[..., object]:
     """Return a forward callable running ``fn`` with ``backend`` as the swap target.
 
@@ -48,12 +49,16 @@ def compile_to(
     are the framework's job (e.g. wrap params with ``requires_grad`` for torch, or
     ``jax.grad`` the result). For an all-in-one gradient driver, use
     :func:`value_and_grad`.
+
+    ``dtype`` selects the working precision (``"float32"``, ``"bf16"``, ...) the backend
+    lifts constants in; ``None`` (the default) inherits any enclosing ``dtype(...)`` block
+    or float64.
     """
     be = get_backend(backend)
     runner = _runner_for(fn)
 
     def forward(*args: object, **kwargs: object) -> object:
-        with activate(be):
+        with _maybe_dtype(dtype), activate(be):
             return runner(*args, **kwargs)
 
     return forward
@@ -81,7 +86,7 @@ def _plan_leaf(leaf: Leaf, trainable: list, tie_slot: dict) -> _Slot:
             idx = tie_slot.get(leaf.tie)
             if idx is None:
                 idx = len(trainable)
-                trainable.append(np.asarray(leaf.value, dtype=float))
+                trainable.append(np.asarray(leaf.value, dtype=current_dtype()))
                 tie_slot[leaf.tie] = idx
             return ("train", idx, leaf)
         idx = len(trainable)
@@ -89,7 +94,7 @@ def _plan_leaf(leaf: Leaf, trainable: list, tie_slot: dict) -> _Slot:
         return ("train", idx, leaf)
     if _is_numeric(leaf):
         idx = len(trainable)
-        trainable.append(np.asarray(leaf, dtype=float))
+        trainable.append(np.asarray(leaf, dtype=current_dtype()))
         return ("train", idx, leaf)
     return ("none", leaf)
 
@@ -109,7 +114,10 @@ def _grad_for(slot: _Slot, grads: list, be: Backend) -> object:
 
 
 def value_and_grad(
-    fn: Callable[..., object], *, backend: "str | Backend" = "numpy"
+    fn: Callable[..., object],
+    *,
+    backend: "str | Backend" = "numpy",
+    dtype: object = None,
 ) -> Callable[..., tuple[object, tuple[PyTree, ...]]]:
     """Wrap ``fn`` so calling it returns ``(value, grads)`` computed on ``backend``.
 
@@ -117,48 +125,56 @@ def value_and_grad(
     with one matching pytree per positional argument (``None`` at frozen / non-numeric
     leaves). The gradients come from the target framework's autodiff -- which, on the
     finite-difference-checked example models, agrees with pycograd's own numpy tape.
+
+    ``dtype`` selects the working precision (``"float32"``, ``"bf16"``, ...) leaves are
+    lifted onto the backend in; ``None`` (the default) inherits any enclosing
+    ``dtype(...)`` block, else float64.
     """
     be = get_backend(backend)
     runner = _runner_for(fn)
 
     def wrapped(*args: PyTree) -> tuple[object, tuple[PyTree, ...]]:
-        _check_param_ownership(args)
-        trainable: list = []
-        tie_slot: dict = {}
-        per_arg: list = []  # (treedef, [slot])
-        for a in args:
-            leaves, treedef = tree_flatten(a)
-            slots = [_plan_leaf(leaf, trainable, tie_slot) for leaf in leaves]
-            per_arg.append((treedef, slots))
+        with _maybe_dtype(dtype):
+            _check_param_ownership(args)
+            trainable: list = []
+            tie_slot: dict = {}
+            per_arg: list = []  # (treedef, [slot])
+            for a in args:
+                leaves, treedef = tree_flatten(a)
+                slots = [_plan_leaf(leaf, trainable, tie_slot) for leaf in leaves]
+                per_arg.append((treedef, slots))
 
-        def scalar_fn(tensors: list) -> object:
-            with activate(be):
-                call_args = [
-                    tree_unflatten(
-                        treedef,
-                        cast("list[Leaf]", [_fill(s, tensors, be) for s in slots]),
-                    )
-                    for treedef, slots in per_arg
-                ]
-                return runner(*call_args)
+            def scalar_fn(tensors: list) -> object:
+                with activate(be):
+                    call_args = [
+                        tree_unflatten(
+                            treedef,
+                            cast("list[Leaf]", [_fill(s, tensors, be) for s in slots]),
+                        )
+                        for treedef, slots in per_arg
+                    ]
+                    return runner(*call_args)
 
-        value, grad_leaves = be.grad_and_value(scalar_fn, trainable)
+            value, grad_leaves = be.grad_and_value(scalar_fn, trainable)
 
-        grads = tuple(
-            tree_unflatten(
-                treedef,
-                cast("list[Leaf]", [_grad_for(s, grad_leaves, be) for s in slots]),
+            grads = tuple(
+                tree_unflatten(
+                    treedef,
+                    cast("list[Leaf]", [_grad_for(s, grad_leaves, be) for s in slots]),
+                )
+                for treedef, slots in per_arg
             )
-            for treedef, slots in per_arg
-        )
-        return value, grads
+            return value, grads
 
     return wrapped
 
 
 def grad(
-    fn: Callable[..., object], *, backend: "str | Backend" = "numpy"
+    fn: Callable[..., object],
+    *,
+    backend: "str | Backend" = "numpy",
+    dtype: object = None,
 ) -> Callable[..., tuple[PyTree, ...]]:
     """Like :func:`value_and_grad` but returns only the gradient tuple."""
-    vg = value_and_grad(fn, backend=backend)
+    vg = value_and_grad(fn, backend=backend, dtype=dtype)
     return lambda *args: vg(*args)[1]

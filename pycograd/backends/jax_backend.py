@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from pycograd.backends import Backend
+from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
 
 # math.* names that don't exist verbatim on jnp.
@@ -77,19 +78,20 @@ class JaxBackend(Backend):
         return _unmapped(func, self._is_tensor)
 
     def lift(self, array: object) -> object:
-        return self._jnp.asarray(np.asarray(array, dtype=np.float64))
+        return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
     def const(self, array: object) -> object:
-        return self._jnp.asarray(np.asarray(array, dtype=np.float64))
+        return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
     def to_numpy(self, tensor: object) -> object:
+        # Preserves dtype, including bfloat16 (jax's bf16 is the ml_dtypes numpy dtype).
         return np.asarray(tensor)
 
     def grad_and_value(
         self, scalar_fn: Callable[[list], object], leaves: list
     ) -> tuple[object, list]:
         jax, jnp = self._jax, self._jnp
-        arrs = [jnp.asarray(np.asarray(leaf, dtype=np.float64)) for leaf in leaves]
+        arrs = [jnp.asarray(np.asarray(leaf, dtype=current_dtype())) for leaf in leaves]
 
         def f(ts: list) -> object:
             return jnp.asarray(scalar_fn(ts)).reshape(())
