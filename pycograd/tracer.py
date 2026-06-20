@@ -28,6 +28,7 @@ from pycograd.trace import (
     _BINOP_PRIM,
     _COMPARE_PRIM,
     _UNARYOP_PRIM,
+    Tracer,
     _SubscriptProxy,
     bind,
     num_transform_levels,
@@ -72,6 +73,32 @@ def _is_user_function(func: Callable[..., object]) -> bool:
     if not filename or filename.startswith("<"):  # <stdin>, <string>, ...
         return False
     return not any(filename.startswith(d) for d in _LIB_DIRS)
+
+
+def _unmapped_mathy(
+    func: Callable[..., object], fallback: Callable[..., object]
+) -> Callable[..., object]:
+    """Wrap an un-ruled numpy/math call. If a trace-stack :class:`Tracer`
+    (a ``ShapedArray`` under ``eval_shape``, a ``BatchTracer`` under ``vmap``, a
+    ``JVPTracer`` under ``jvp``) flows in, the active transform has no rule for ``func``,
+    so raise a clear error instead of letting numpy fail obscurely on the abstract value.
+    Otherwise defer to the backend's fallback (e.g. the numpy backend's warn-if-a-``Var``
+    path, which still runs the call -- a non-differentiable op on a ``Var`` is allowed).
+    """
+    name = getattr(func, "__name__", repr(func))
+
+    def _wrapped(*args: object, **kwargs: object) -> object:
+        if any(isinstance(a, Tracer) for a in args) or any(
+            isinstance(v, Tracer) for v in kwargs.values()
+        ):
+            raise NotImplementedError(
+                f"pycograd has no rule for {name!r}, so the active transform "
+                "(eval_shape / vmap / jvp) can't trace it. Rewrite using an op pycograd "
+                "supports, or add a rule for it."
+            )
+        return fallback(*args, **kwargs)
+
+    return _wrapped
 
 
 class AutodiffTracer(pyc.BaseTracer):
@@ -140,7 +167,7 @@ class AutodiffTracer(pyc.BaseTracer):
         if _is_user_function(func):
             return self._instrument_helper(func)
         if _is_mathy(func):
-            return backend.on_unmapped(func)
+            return _unmapped_mathy(func, backend.on_unmapped(func))
         return func  # builtins, methods, etc. pass through
 
     @pyc.register_handler(pyc.before_call)
