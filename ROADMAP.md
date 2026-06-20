@@ -128,10 +128,16 @@ it is gated by the foundation.
   research-high. Feasibility: medium-hard.
 - **Forward-mode / `jvp`.** Jacobians, some second-order methods. Crucial:
   medium. Feasibility: medium.
-- **`vmap` (auto-batching) / per-sample gradients.** Big efficiency + many
-  methods. Crucial: high for research. Feasibility: **low** — the eager tape
-  makes auto-batching genuinely hard; this is where a trace-and-transform model
-  (cf. JAX) earns its keep, and may force a design rethink.
+- **`vmap` (auto-batching) / per-sample gradients.** *Largely landed*
+  (`pycograd/batching.py`): a `BatchedArray` materializes the batch axis on a `Var`
+  and a per-primitive batching-rule table (built from `ops._RULES`, like the abstract
+  backend) vectorizes the forward; because the batch axis is a real axis, the existing
+  tape differentiates it, so `grad(vmap(f))` and `per_example_grad` work for free. The
+  *remaining* hard part is exactly the ROADMAP's original worry — simultaneously-live
+  transforms (`vmap(vmap(f))`, per-sample grads of a *shared* parameter, batched index
+  keys) need a trace-level interpreter stack (multiple live levels + per-value level
+  tags, à la JAX); they currently raise `NotImplementedError`. That stack is the v2
+  increment, and the same machinery underlies the trace-and-compile work below.
 
 ### Phase 4 — Scale (the hard ceiling)
 

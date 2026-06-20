@@ -11,9 +11,14 @@ from __future__ import annotations
 
 from typing import Callable, cast
 
+import numpy as np
+
+from pycograd import ops
 from pycograd._typing import Array, ArrayLike, Operand
+from pycograd.backends import activate, current_backend, get_backend
+from pycograd.batching import BatchedArray
 from pycograd.params import Param, _TieRef
-from pycograd.tensor import Var, _is_array, _is_numeric, _xp
+from pycograd.tensor import Var, _is_array, _is_numeric, _lift, _value, _xp
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
     Leaf,
@@ -166,6 +171,139 @@ def grad(f: Callable[..., object]) -> Callable[..., tuple[PyTree, ...]]:
     argument; each matches that argument's pytree structure)."""
     vg = value_and_grad(f)
     return lambda *args: vg(*args)[1]
+
+
+def _moveaxis_perm(src: int, dst: int, ndim: int) -> tuple:
+    order = list(range(ndim))
+    order.insert(dst, order.pop(src))
+    return tuple(order)
+
+
+def _to_front(v: object, ax: int) -> object:
+    """Move axis ``ax`` to 0, staying on the tape for a ``Var`` (grad-aware)."""
+    if ax == 0:
+        return v
+    if isinstance(v, Var):
+        return ops.d_transpose(v, _moveaxis_perm(ax, 0, v.value.ndim))
+    return np.moveaxis(np.asarray(v), ax, 0)
+
+
+def _finish_vmap_leaf(leaf: object, batch: int, out_axis: int, nested: bool) -> object:
+    """Produce one vmap output leaf. *Nested* under another transform (inputs were tape
+    ``Var``s) -> keep the result on the tape (return a ``Var``). *Top level* -> return a
+    materialized array, broadcasting an unbatched (batch-independent) output."""
+    if nested:
+        if isinstance(leaf, BatchedArray):
+            v = leaf.inner
+            if out_axis != 0 and isinstance(v, Var):
+                v = ops.d_transpose(v, _moveaxis_perm(0, out_axis, v.value.ndim))
+            return v
+        return leaf  # batch-independent: pass through unchanged
+    if isinstance(leaf, BatchedArray):
+        arr = np.asarray(_value(cast(Operand, leaf.inner)))
+        return np.moveaxis(arr, 0, out_axis)
+    arr = np.asarray(_value(cast(Operand, leaf)))
+    arr = np.broadcast_to(arr, (batch,) + arr.shape)
+    return np.moveaxis(arr, 0, out_axis)
+
+
+def vmap(
+    f: Callable[..., object], in_axes: object = 0, out_axes: int = 0
+) -> Callable[..., object]:
+    """Vectorize ``f`` over a batch axis: ``vmap(f)(xs)`` applies ``f`` to each slice of
+    ``xs`` along ``in_axes`` and stacks the results along ``out_axes`` -- but vectorized
+    (one batched pass), not looped.
+
+    ``in_axes`` is an int (the mapped axis of every argument), ``None`` (an argument
+    shared across the batch -- e.g. a weight), or a tuple with one such entry per
+    positional argument. Non-array arguments pass through unbatched.
+
+    Composes with :func:`grad`/:func:`value_and_grad` (``grad(vmap(f))``); for per-sample
+    gradients of the *data* argument see :func:`per_example_grad`. Not yet supported
+    (raise ``NotImplementedError``): nesting ``vmap(vmap(...))`` and per-sample gradients
+    of a *shared* parameter -- both need a trace-level interpreter stack.
+    """
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+
+    def wrapped(*args: PyTree) -> object:
+        # A batch backend already active means we are inside another vmap; nesting needs
+        # a trace-level stack we don't have yet. (Checked first, using only module-level
+        # names, so it survives the closure-unaware re-instrumentation of this wrapper.)
+        if current_backend().name == "batch":
+            raise NotImplementedError(
+                "vmap: nested vmap(vmap(...)) is not supported yet"
+            )
+        axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * len(args)
+        call_args: list[PyTree] = []
+        batch = -1
+        nested = False
+        for a, ax in zip(args, cast("tuple", axes)):
+            leaves, treedef = tree_flatten(a)
+            new_leaves: list[Leaf] = []
+            for leaf in leaves:
+                if isinstance(leaf, BatchedArray):
+                    raise NotImplementedError(
+                        "vmap: nested vmap(vmap(...)) is not supported yet"
+                    )
+                if ax is None or not (_is_array(leaf) or isinstance(leaf, Var)):
+                    new_leaves.append(leaf)  # shared / non-array: unbatched
+                    continue
+                if isinstance(leaf, Var):
+                    nested = (
+                        True  # already on a tape (we're inside grad/value_and_grad)
+                    )
+                    v: object = _to_front(leaf, cast(int, ax))
+                    batch = cast(Var, v).value.shape[0]
+                else:
+                    arr = np.moveaxis(np.asarray(leaf), cast(int, ax), 0)
+                    batch = arr.shape[0]
+                    v = Var(arr)
+                new_leaves.append(cast(Leaf, BatchedArray(v)))
+            call_args.append(tree_unflatten(treedef, new_leaves))
+        if batch < 0:
+            raise ValueError("vmap: no batched (array) argument to map over")
+
+        with activate(get_backend("batch")):
+            out = runner(*call_args)
+
+        out_leaves, out_def = tree_flatten(cast(PyTree, out))
+        finished = [
+            _finish_vmap_leaf(leaf, batch, out_axes, nested) for leaf in out_leaves
+        ]
+        return tree_unflatten(out_def, cast("list[Leaf]", finished))
+
+    return wrapped
+
+
+def per_example_grad(
+    f: Callable[..., object], in_axes: int = 0
+) -> Callable[..., object]:
+    """Per-sample gradients of a per-example scalar ``f`` w.r.t. its batched input.
+
+    ``f`` maps one example to a scalar; ``per_example_grad(f)(xs)`` returns one gradient
+    per example, stacked. Implemented via the sum-of-losses identity (the examples are
+    independent, so ``d sum_i f(x_i) / d x = [d f(x_i)/d x_i]``) -- a single batched
+    forward and one backward, no Python loop.
+    """
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+
+    def wrapped(x: PyTree) -> object:
+        arr = np.moveaxis(np.asarray(_value(cast(Operand, x))), in_axes, 0)
+        xv = Var(arr)
+        with activate(get_backend("batch")):
+            out = runner(BatchedArray(xv))
+        inner = out.inner if isinstance(out, BatchedArray) else out
+        total = ops.d_sum(_lift(cast(Operand, inner)))
+        total.backward()
+        return np.moveaxis(xv.grad, 0, in_axes)
+
+    return wrapped
 
 
 def gradient_descent(
