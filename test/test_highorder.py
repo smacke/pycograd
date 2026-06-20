@@ -249,3 +249,15 @@ def test_top_level_grad_unchanged():
     xm = _rng(8).standard_normal(3)
     gm = np.asarray(grad(mlp_loss)(xm)[0])
     assert np.allclose(gm, np.asarray(jacfwd(mlp_loss)(xm)), atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# grad requires a scalar output: nesting grad without scalarizing the inner
+# gradient is ill-posed (as in JAX) and must report a clear error, not an obscure
+# "Var has no array conversion".
+# ---------------------------------------------------------------------------
+def test_grad_of_nonscalar_raises_clear_error():
+    import pytest
+
+    with pytest.raises(TypeError, match="returning a single scalar"):
+        grad(grad(sin_sum))(_rng(0).standard_normal(3))

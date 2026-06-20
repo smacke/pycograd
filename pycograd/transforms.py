@@ -185,6 +185,19 @@ def value_and_grad(
                 # otherwise each leaf's grad stays at its init zeros
                 root.backward(differentiable=higher)
                 value: Array = out.value if isinstance(out, Var) else root.value
+            elif isinstance(out, (tuple, list, dict)) and any(
+                isinstance(leaf, (Var, Tracer)) for leaf in tree_leaves(out)
+            ):
+                # The differentiated function returned a *container* of tape values rather
+                # than a single scalar -- almost always a nested ``grad`` whose inner
+                # gradient wasn't scalarized.
+                raise TypeError(
+                    "grad/value_and_grad differentiates a function returning a single "
+                    f"scalar, but it returned a {type(out).__name__} of differentiable "
+                    "values. For a Hessian use jacfwd(grad(f)) or jacrev(grad(f)); to nest "
+                    "grad, scalarize the inner gradient first, e.g. "
+                    "grad(lambda x: np.sum(grad(f)(x)[0]))."
+                )
             else:
                 value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
 
