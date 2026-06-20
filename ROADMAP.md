@@ -130,10 +130,14 @@ it is gated by the foundation.
   (gated by `trace.num_transform_levels()`). This gives Hessians/HVPs via
   forward-over-reverse (`jvp(grad(f))`, `jacfwd(grad(f))`) and literal reverse-over-reverse
   (`grad` of a scalarized inner `grad`, `jacrev(grad(f))`) — reverse and forward Hessians
-  agree and match finite differences; gradient-penalty losses work. Cut for now:
-  `vmap`-composed higher-order (per-sample Hessians) — the differentiable `_unbroadcast`
-  and the `vmap(grad)` `_KEEP_BATCH_AXES` path share state. (`grad` requires scalar output,
-  as in JAX; `grad(grad(f))` on a non-scalar inner is ill-posed.)
+  agree and match finite differences; gradient-penalty losses work. **Per-sample
+  Hessians/HVPs also compose with `vmap`** — `vmap(jacfwd(grad(f)))`/`vmap(jacrev(grad(f)))`
+  and batched `jvp(grad(f))` give per-example `(B,n,n)`/`(B,n)` results (realized as
+  reverse-over-reverse over one batched forward, sidestepping the
+  `_unbroadcast`/`_KEEP_BATCH_AXES` seam). Constraints, as in JAX: the per-example `f` is
+  scalar-output and single-array (multi-arg/shared-param per-sample Hessians not yet
+  wired); `grad` requires scalar output (`grad(grad(f))` on a non-scalar inner is ill-posed
+  and raises a clear error).
 - **Forward-mode / `jvp`.** *Landed* (`pycograd/forward.py`): `jvp(f, primals, tangents)`
   + `jacfwd` as a `JVPTrace` level riding `bind`; composes with `vmap` both ways and
   with itself (`jvp(jvp(f))`, second-order forward).
@@ -164,10 +168,11 @@ it is gated by the foundation.
   different execution model from the eager tape and likely a separate engine.
   Crucial: highest for throughput. Feasibility: **low** (research-grade). The
   abstract-shape engine (`shapes.py`) is a down payment: its per-primitive
-  `abstract_eval` rules already size every node without data, and now carry
-  *symbolic* dims (`_dims.Dim`) for data-dependent shapes — so a capture tracer can
-  subclass `ShapedArray` and reuse the rules unchanged, with `vmap`'s batch axis as
-  one more dim in the same algebra.
+  `abstract_eval` rules already size every node without data, carry *symbolic* dims
+  (`_dims.Dim`) for data-dependent shapes, and now run as a first-class **`AbstractTrace`
+  level** on the same stack (`ShapedArray` is a `Tracer`) — so a capture tracer is just
+  another `Trace`/`Tracer` reusing these rules, with `vmap`'s batch axis one more dim in
+  the same algebra.
 - **Distributed / multi-device.** Data / model / pipeline parallelism,
   collectives. Crucial: only for truly large scale. Feasibility: **very low**;
   pointless before the above.

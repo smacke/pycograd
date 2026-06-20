@@ -17,7 +17,7 @@ Functions/constants are at MODULE level so pyccolo can re-instrument them from s
 """
 import numpy as np
 
-from pycograd import grad, jacfwd, jacrev, jvp
+from pycograd import grad, jacfwd, jacrev, jvp, vmap
 
 
 def _rng(seed=0):
@@ -261,3 +261,108 @@ def test_grad_of_nonscalar_raises_clear_error():
 
     with pytest.raises(TypeError, match="returning a single scalar"):
         grad(grad(sin_sum))(_rng(0).standard_normal(3))
+
+
+# ===========================================================================
+# vmap-composed higher-order AD: per-sample Hessians / batched HVPs.
+#
+# ``vmap(jacfwd(grad(f)))(X)`` / ``vmap(jacrev(grad(f)))(X)`` give a per-example Hessian
+# for each row of ``X``; ``vmap(lambda x: jvp(grad(f), (x,), (v,))[1])(X)`` a per-example
+# HVP. Realized as reverse-over-reverse over a single batched forward (one ``BatchTrace``
+# level for per-example semantics, then the established ``grad(grad)`` outer pass); the
+# result matches a Python loop and per-example finite differences.
+# ===========================================================================
+_HW = _rng(50).standard_normal((4, 3))
+
+
+def per_sample_tanh(x):
+    # per-example scalar: x:(4,) -> scalar; shared _HW; coupled so the Hessian is dense
+    return np.sum(np.tanh(x @ _HW))
+
+
+def _loop_hessian(f, X):
+    n = X.shape[1]
+    return np.stack(
+        [np.asarray(jacfwd(grad(f))(X[i])).reshape(n, n) for i in range(X.shape[0])]
+    )
+
+
+def _per_example_hessian_fd(f, X, eps=1e-5):
+    return np.stack([_hessian_fd(f, X[i], eps=eps) for i in range(X.shape[0])])
+
+
+def test_vmap_jacfwd_grad_per_sample_hessian():
+    X = _rng(51).standard_normal((6, 4))
+    H = np.asarray(vmap(jacfwd(grad(per_sample_tanh)))(X)).reshape(6, 4, 4)
+    loop = _loop_hessian(per_sample_tanh, X)
+    fd = _per_example_hessian_fd(per_sample_tanh, X)
+    assert H.shape == (6, 4, 4)
+    assert np.allclose(H, loop, atol=1e-6)
+    assert np.allclose(H, fd, atol=1e-4)
+    assert np.allclose(H, np.transpose(H, (0, 2, 1)), atol=1e-6)  # symmetric per sample
+
+
+def test_vmap_jacrev_grad_per_sample_hessian():
+    X = _rng(52).standard_normal((5, 4))
+    Hrev = np.asarray(vmap(jacrev(grad(per_sample_tanh)))(X)).reshape(5, 4, 4)
+    Hfwd = np.asarray(vmap(jacfwd(grad(per_sample_tanh)))(X)).reshape(5, 4, 4)
+    loop = _loop_hessian(per_sample_tanh, X)
+    assert np.allclose(Hrev, loop, atol=1e-6)
+    assert np.allclose(Hrev, Hfwd, atol=1e-6)  # reverse == forward per sample
+
+
+# A *dense, non-separable* per-example f (mean + product) -- exercises that the per-example
+# semantics come from a real BatchTrace forward, not a sum-of-losses separability shortcut.
+def per_sample_dense(x):
+    h = np.tanh(x @ _HW)
+    return np.sum(h) * np.mean(x)
+
+
+def test_vmap_per_sample_hessian_dense_nonseparable():
+    X = _rng(53).standard_normal((4, 4))
+    H = np.asarray(vmap(jacfwd(grad(per_sample_dense)))(X)).reshape(4, 4, 4)
+    loop = _loop_hessian(per_sample_dense, X)
+    fd = _per_example_hessian_fd(per_sample_dense, X)
+    assert np.allclose(H, loop, atol=1e-6)
+    assert np.allclose(H, fd, atol=1e-4)
+    assert np.allclose(H, np.transpose(H, (0, 2, 1)), atol=1e-6)
+
+
+_HV = _rng(54).standard_normal(4)
+
+
+def test_vmap_per_sample_hvp_matches_loop():
+    X = _rng(55).standard_normal((6, 4))
+    batched = np.asarray(
+        vmap(lambda x: jvp(grad(per_sample_tanh), (x,), (_HV,))[1][0])(X)
+    )
+    loop = np.stack(
+        [
+            np.asarray(jvp(grad(per_sample_tanh), (X[i],), (_HV,))[1][0])
+            for i in range(6)
+        ]
+    )
+    assert batched.shape == (6, 4)
+    assert np.allclose(batched, loop, atol=1e-6)
+    # the per-sample HVP is H_i @ v
+    H = _loop_hessian(per_sample_tanh, X)
+    assert np.allclose(batched, np.einsum("bij,j->bi", H, _HV), atol=1e-6)
+
+
+def test_vmap_per_sample_hessian_in_axes_1():
+    X = _rng(56).standard_normal((6, 4))
+    Xt = np.moveaxis(X, 0, 1).copy()  # batch on axis 1
+    H = np.asarray(vmap(jacfwd(grad(per_sample_tanh)), in_axes=1)(Xt))
+    loop = _loop_hessian(per_sample_tanh, X)
+    assert np.allclose(np.moveaxis(H, 1, 0), loop, atol=1e-6)
+
+
+def test_vmap_grad_per_sample_and_nonvmap_hessian_unchanged():
+    # Re-confirm vmap(grad(f)) per-sample first-order grads ...
+    X = _rng(57).standard_normal((5, 4))
+    g = np.asarray(vmap(grad(per_sample_tanh))(X))
+    loop_g = np.stack([np.asarray(grad(per_sample_tanh)(X[i])[0]) for i in range(5)])
+    assert np.allclose(g, loop_g, atol=1e-8)
+    # ... and that a non-vmap Hessian is numerically unchanged by the vmap plumbing.
+    H1 = np.asarray(jacfwd(grad(per_sample_tanh))(X[0])).reshape(4, 4)
+    assert np.allclose(H1, _hessian_fd(per_sample_tanh, X[0]), atol=1e-4)

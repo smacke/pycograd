@@ -323,6 +323,12 @@ def vmap(
     instead of being summed over the batch. (For just the data argument's per-sample
     gradient of a per-example scalar, :func:`per_example_grad` is the lighter entry point.)
     """
+    # ``vmap(jacfwd(grad(g)))`` / ``vmap(jacrev(grad(g)))``: a per-sample Hessian for each
+    # row of the batched input (a single batched forward + one jvp basis sweep per column;
+    # see ``_per_sample_hessian``).
+    hessian_of = getattr(f, "_pycograd_hessian_of", None)
+    if hessian_of is not None:
+        return _vmap_of_hessian(hessian_of, in_axes)
     # ``vmap(grad(g))`` / ``vmap(value_and_grad(g))``: a single batched forward plus one
     # batched-cotangent backward yields per-sample gradients (incl. of shared params).
     grad_of = getattr(f, "_pycograd_grad_of", None)
@@ -571,6 +577,103 @@ def per_example_grad(
     return wrapped
 
 
+# ---------------------------------------------------------------------------
+# vmap-composed higher-order AD: per-sample Hessians / batched HVPs.
+#
+# A per-sample second derivative ``vmap(jacfwd(grad(f)))(X)`` / ``vmap(jvp(grad(f), ...))``
+# is realized as *reverse-over-reverse over a single batched forward*, NOT by nesting a
+# ``vmap`` (``BatchTrace``) level inside ``grad``/``jvp``. The latter would put the
+# differentiable reverse pass (which walks a level-0 ``Var`` tape) below the batch level
+# whose tangents live one level up, and the two cannot be reconciled cleanly (the cotangent
+# arithmetic would re-batch).
+#
+# Instead, the inner per-example gradient is computed exactly as :func:`per_example_grad`
+# does -- one batched forward of ``f`` under a single ``BatchTrace`` (so reductions are
+# per-example), summed over the batch (examples are independent, so
+# ``d sum_i f(x_i)/dx = [d f(x_i)/dx_i]``), and a *differentiable* inner backward -- yielding
+# the stacked per-example gradient ``g`` as a level-connected ``Var`` graph over the batched
+# input ``Var``. A second derivative is then a plain reverse-over-reverse on that graph:
+# ``<g, e_j>`` summed to a scalar, whose (ordinary, raw) backward is one Hessian *column*
+# per example (or, with the user's direction, the per-example HVP). The basis sweep stacks
+# the full per-example Hessian ``(B, *x, *x)``. Because the inner forward runs under
+# ``BatchTrace`` the per-example semantics are exact (no sum-of-losses-separability
+# assumption beyond the one ``per_example_grad`` already makes), and because the outer pass
+# is the established ``grad(grad)`` reverse-over-reverse path it needs no new machinery.
+# ---------------------------------------------------------------------------
+def _per_example_grad_var(runner: Callable[..., object], xv: Var) -> object:
+    """The stacked per-example gradient of a per-example scalar ``f`` (its ``runner``) w.r.t.
+    the batched input ``xv`` ``(B, *x)``, as a level-connected ``Var`` graph (a *differentiable*
+    inner backward so an enclosing reverse pass can differentiate it again).
+
+    One batched forward under a single ``BatchTrace`` (per-example reductions), summed over
+    the batch (independent examples), then a differentiable backward -- ``xv.grad`` is the
+    per-example gradient stack chained back to ``xv``."""
+    with new_main(BatchTrace) as main:
+        out = runner(BatchTracer(BatchTrace(main), xv, 0))
+    inner = out.value if isinstance(out, BatchTracer) else out
+    total = ops.d_sum(_lift(cast(Operand, inner)))
+    total.backward(differentiable=True)
+    return xv.grad
+
+
+def _per_sample_hvp(f: Callable[..., object], X: Array, D: Array) -> Array:
+    """Per-example Hessian-vector products of per-example scalar ``f``: ``H_i v_i`` stacked.
+
+    ``X`` is the batched input ``(B, *x)`` (batch at axis 0); ``D`` the batched directions
+    ``(B, *x)``. Returns ``(B, *x)``. Reverse-over-reverse: the inner differentiable
+    per-example gradient ``g`` (see :func:`_per_example_grad_var`), contracted with ``D`` to a
+    scalar, whose backward is the per-example HVP.
+    """
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+    xv = Var(X)
+    with new_main(ReverseTrace):  # marker so the inner backward runs differentiably
+        g = _per_example_grad_var(runner, xv)
+        scalar = ops.d_sum(_lift(cast(Operand, g)) * Var(D))
+        scalar.backward(differentiable=False)  # outer raw pass over the inner cot graph
+    return np.asarray(xv.grad)
+
+
+def _per_sample_hessian(f: Callable[..., object], X: Array) -> Array:
+    """Per-example Hessian of per-example scalar ``f``: ``(B, *x, *x)`` stacked over the batch.
+
+    Sweeps the ``n`` one-hot basis directions (each broadcast over the batch) through
+    :func:`_per_sample_hvp`; each gives one Hessian *column* per example. The Hessian is
+    symmetric, so the ``jacfwd`` (column-stacked) and ``jacrev`` (row-stacked) layouts agree.
+    """
+    B = X.shape[0]
+    x_shape = X.shape[1:]
+    n = int(np.prod(x_shape, dtype=np.int64)) if x_shape else 1
+    basis = np.eye(n, dtype=X.dtype)
+    cols = [
+        _per_sample_hvp(
+            f, X, np.broadcast_to(basis[j].reshape(x_shape), X.shape).copy()
+        ).reshape(B, n)
+        for j in range(n)
+    ]
+    stacked = np.stack(cols, axis=-1)  # (B, n, n): column j is H[:, :, j]
+    return stacked.reshape((B,) + x_shape + x_shape)
+
+
+def _vmap_of_hessian(
+    f: Callable[..., object], in_axes: object
+) -> Callable[..., object]:
+    """``vmap(jacfwd(grad(f)))`` / ``vmap(jacrev(grad(f)))``: a per-example Hessian for each
+    row of the batched input, shape ``(B, *x, *x)`` -- see the module note above."""
+
+    def wrapped(*args: PyTree) -> object:
+        axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * len(args)
+        ax = next((a for a in cast("tuple", axes) if a is not None), 0)
+        X = np.moveaxis(np.asarray(_value(cast(Operand, args[0]))), cast(int, ax), 0)
+        H = _per_sample_hessian(f, X)
+        return np.moveaxis(H, 0, cast(int, ax)) if ax != 0 else H
+
+    wrapped._pycograd_run_directly = True  # type: ignore[attr-defined]
+    return wrapped
+
+
 def jvp(
     f: Callable[..., object],
     primals: tuple[PyTree, ...],
@@ -593,6 +696,17 @@ def jvp(
     """
     if len(primals) != len(tangents):
         raise ValueError("jvp: primals and tangents must have the same length")
+
+    # ``vmap(lambda x: jvp(grad(g), (x,), (v,))[1])``: a per-example HVP. The primal is a
+    # ``BatchTracer`` (an enclosing ``vmap`` is live) and ``f`` is ``grad(g)``. Forward mode
+    # over an enclosing batch level cannot reach the per-example reverse cleanly, so take the
+    # dedicated per-sample-HVP path: it carries the batch as a plain leading axis (see the
+    # ``_per_sample_hvp`` note) and re-wraps the result as a batched value the enclosing
+    # ``vmap`` finishes.
+    hvp = _maybe_per_sample_hvp(f, primals, tangents)
+    if hvp is not None:
+        return hvp
+
     runner = _INSTRUMENTED.get(f)
     if runner is None:
         runner = _make_runner(f)
@@ -605,6 +719,68 @@ def jvp(
         return _run_jvp(f, runner, primals, tangents)
     finally:
         _HOF_TRACER_FOR.reset(hof_token)
+
+
+def _maybe_per_sample_hvp(
+    f: Callable[..., object],
+    primals: tuple[PyTree, ...],
+    tangents: tuple[PyTree, ...],
+) -> tuple[object, object] | None:
+    """If this is ``jvp(grad(g), (x,), (v,))`` with ``x`` batched by an enclosing ``vmap``,
+    return ``(primal_out, tangent_out)`` per example via :func:`_per_sample_hvp`; else
+    ``None`` (the ordinary :func:`jvp` path runs).
+
+    The primal output is the per-example gradient and the tangent output the per-example HVP
+    (``H_i v``); both are re-wrapped as batched (``bdim=0``) values the enclosing ``vmap``
+    finishes -- so ``vmap(lambda x: jvp(grad(g), (x,), (v,))[1])`` returns the HVP stacked
+    over the batch."""
+    grad_of = getattr(f, "_pycograd_grad_of", None)
+    if grad_of is None or len(primals) != 1:
+        return None
+    p_leaves, _ = tree_flatten(primals[0])
+    t_leaves, _ = tree_flatten(tangents[0])
+    if len(p_leaves) != 1 or not isinstance(p_leaves[0], BatchTracer):
+        return None
+    bt = cast(BatchTracer, p_leaves[0])
+    bdim = bt.bdim if bt.bdim is not None else 0
+    # Peel the batched primal/tangent to physical arrays with the batch axis leading.
+    X = np.moveaxis(_phys_array(bt), bdim, 0)
+    tl = t_leaves[0]
+    tphys = np.asarray(_phys_array(tl) if isinstance(tl, Tracer) else np.asarray(tl))
+    if isinstance(tl, BatchTracer):
+        tphys = np.moveaxis(tphys, tl.bdim if tl.bdim is not None else 0, 0)
+    D = np.broadcast_to(tphys, X.shape).copy()
+    hvp = _per_sample_hvp(grad_of, X, D)  # (B, *x) the per-example HVP
+    pg = _per_example_grad_stack(
+        grad_of, X
+    )  # (B, *x) the per-example gradient (primal)
+    trace = cast(Any, bt._trace)
+    primal_out = (BatchTracer(trace, Var(pg), 0),)
+    tangent_out = (BatchTracer(trace, Var(hvp), 0),)
+    return primal_out, tangent_out
+
+
+def _phys_array(v: object) -> Array:
+    """The physical numpy array under a ``Var``/``BatchTracer`` (peeling nesting)."""
+    cur = v
+    while isinstance(cur, BatchTracer):
+        cur = cur.value
+    return np.asarray(_value(cast(Operand, cur)))
+
+
+def _per_example_grad_stack(f: Callable[..., object], X: Array) -> Array:
+    """The per-example gradient of per-example scalar ``f`` over a batched ``X`` (batch
+    leading), stacked ``(B, *x)`` -- the primal companion to :func:`_per_sample_hvp`."""
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+    xv = Var(X)
+    with new_main(BatchTrace) as main:
+        out = runner(BatchTracer(BatchTrace(main), xv, 0))
+    inner = out.value if isinstance(out, BatchTracer) else out
+    ops.d_sum(_lift(cast(Operand, inner))).backward(differentiable=False)
+    return np.asarray(xv.grad)
 
 
 def _run_jvp(
@@ -778,6 +954,11 @@ def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
         jac = np.moveaxis(stacked, 0, -1)
         return jac.reshape(out_shape + x_arr.shape)
 
+    # ``jacfwd(grad(f))`` is a Hessian; carry the inner ``f`` (and ``argnum==0``) so
+    # ``vmap`` can recognize ``vmap(jacfwd(grad(f)))`` and take the per-sample-Hessian path.
+    grad_of = getattr(f, "_pycograd_grad_of", None)
+    if grad_of is not None and argnum == 0:
+        jacobian._pycograd_hessian_of = grad_of  # type: ignore[attr-defined]
     return jacobian
 
 
@@ -831,6 +1012,12 @@ def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
         jac = stacked.reshape(out_shape + x_arr.shape)
         return jac
 
+    # ``jacrev(grad(f))`` is a Hessian; carry the inner ``f`` so ``vmap`` can recognize
+    # ``vmap(jacrev(grad(f)))`` and take the per-sample-Hessian path (which agrees with the
+    # forward-mode ``jacfwd(grad(f))`` Hessian -- the Hessian is symmetric).
+    grad_of = getattr(f, "_pycograd_grad_of", None)
+    if grad_of is not None and argnum == 0:
+        jacobian._pycograd_hessian_of = grad_of  # type: ignore[attr-defined]
     return jacobian
 
 
