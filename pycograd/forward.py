@@ -20,6 +20,7 @@ computation recurse into the batch level, and nesting a ``JVPTrace`` under ``gra
 """
 from __future__ import annotations
 
+import contextvars
 from typing import Any, Callable, NoReturn, Sequence, cast
 
 import numpy as np
@@ -27,6 +28,31 @@ import numpy as np
 from pycograd import ops
 from pycograd.tensor import Var, _value, _xp
 from pycograd.trace import Trace, Tracer, bind, full_raise
+
+# ---------------------------------------------------------------------------
+# Higher-order bridge: map a *primal* ``Var`` (a forward-tape node) to the ``JVPTracer``
+# that wraps it, so the differentiable reverse pass (``Var.backward`` under a live ``jvp``)
+# can route each VJP through the tangent-carrying tracer rather than the bare primal --
+# i.e. forward-over-reverse (Hessians / HVPs). Populated as the ``jvp`` forward runs and
+# read by ``tensor._backward_differentiable``; an empty map (no live ``jvp``) means the
+# reverse pass simply uses the primal ``Var``s, which is the plain ``grad`` behavior.
+# ---------------------------------------------------------------------------
+_HOF_TRACER_FOR: contextvars.ContextVar[dict[int, object]] = contextvars.ContextVar(
+    "pycograd_hof_tracer_for", default={}
+)
+
+
+def _hof_tracer_for() -> dict[int, object]:
+    return _HOF_TRACER_FOR.get()
+
+
+def _hof_register(tracer: "JVPTracer") -> None:
+    """Record ``id(tracer.primal) -> tracer`` so the reverse pass can recover the
+    tangent-carrying tracer for a primal ``Var``. Only the primal is keyed; the tracer it
+    maps to carries the tangent the higher-order reverse pass needs."""
+    p = tracer.primal
+    if isinstance(p, Var):
+        _HOF_TRACER_FOR.get()[id(p)] = tracer
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +146,20 @@ class JVPTrace(Trace):
         rule = _JVP_FOR.get(prim)
         if rule is None:
             _process_unknown(prim)
-        return rule(self, *args, **params)
+        out = rule(self, *args, **params)
+        # Bridge for higher-order reverse: remember the (primal ``Var`` -> this tracer)
+        # link, plus the same link for each raised operand, so a later differentiable
+        # ``backward`` routes its VJPs through the tangent-carrying tracers.
+        if isinstance(out, JVPTracer):
+            _hof_register(out)
+        for a in args:
+            if isinstance(a, JVPTracer):
+                _hof_register(a)
+            elif isinstance(a, (list, tuple)):
+                for el in a:
+                    if isinstance(el, JVPTracer):
+                        _hof_register(el)
+        return out
 
     def _raise(self, val: object) -> "JVPTracer":
         return cast(JVPTracer, full_raise(self, val))
@@ -168,6 +207,23 @@ def _linear_for(prim: Callable) -> Callable:
         tracers = [trace._raise(o) for o in operands]
         primal_out = bind(prim, *_primals(tracers), **kwargs)
         tangent_out = bind(prim, *_tangents(tracers), **kwargs)
+        return _result(trace, primal_out, tangent_out)
+
+    return rule
+
+
+def _linear_struct_for(prim: Callable) -> Callable:
+    """Like :func:`_linear_for`, but the primitive's *trailing* arguments are static
+    structural metadata (a reshape target, an ``expand_dims`` axis, a ``broadcast_to``
+    shape) -- not differentiable operands. Only the first operand is raised; the rest pass
+    through unraised so they are not (wrongly) turned into zero-tangent tracers."""
+
+    def rule(
+        trace: JVPTrace, x: object, *static: object, **kwargs: object
+    ) -> JVPTracer:
+        t = trace._raise(x)
+        primal_out = bind(prim, t.primal, *static, **kwargs)
+        tangent_out = bind(prim, t.tangent, *static, **kwargs)
         return _result(trace, primal_out, tangent_out)
 
     return rule
@@ -605,9 +661,10 @@ def _build_jvp_for() -> dict[object, Callable]:
             ops.d_max: _reduce_select_for(ops.d_max),
             ops.d_min: _reduce_select_for(ops.d_min),
             # shape / structure: all linear.
-            ops.d_transpose: _linear_for(ops.d_transpose),
-            ops.d_reshape: _linear_for(ops.d_reshape),
-            ops.d_expand_dims: _linear_for(ops.d_expand_dims),
+            ops.d_transpose: _linear_struct_for(ops.d_transpose),
+            ops.d_reshape: _linear_struct_for(ops.d_reshape),
+            ops.d_broadcast_to: _linear_struct_for(ops.d_broadcast_to),
+            ops.d_expand_dims: _linear_struct_for(ops.d_expand_dims),
             ops.d_concatenate: _linear_seq_for(ops.d_concatenate),
             ops.d_stack: _linear_seq_for(ops.d_stack),
             ops.d_vstack: _linear_seq_for(ops.d_vstack),
@@ -624,6 +681,10 @@ def _build_jvp_for() -> dict[object, Callable]:
 # coverage-parity test (``set(_JVP) == set(ops._INTERCEPT)``) holds, exactly like
 # ``batching._BATCH``.
 _JVP_FOR: dict[object, Callable] = _build_jvp_for()
+# The internal reverse-pass scatter primitive (``ops._scatter``) is not in ``_RULES`` (no
+# numpy callable maps to it), so it adds no ``_JVP`` coverage key; it gets a jvp rule here
+# directly so the differentiable gather VJP composes with a live ``jvp``.
+_JVP_FOR[ops._scatter] = ops._jvp_scatter
 _JVP: dict[object, Callable] = {
     fn: _JVP_FOR[prim] for prim, fns in ops._RULES.items() for fn in fns
 }

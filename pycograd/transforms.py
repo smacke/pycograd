@@ -19,7 +19,7 @@ from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import Var, _is_array, _is_numeric, _lift, _value, _xp
-from pycograd.trace import Tracer, bind, new_main
+from pycograd.trace import Tracer, _get_stack, bind, new_main
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
     Leaf,
@@ -100,6 +100,16 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[object, Var]) -> tuple[Var | None, Lea
             return shared, shared
         v = Var(leaf.value)
         return v, v
+    if isinstance(leaf, Tracer):
+        # ``grad`` is running under a live higher level (``jvp(grad(f))``): the leaf is a
+        # ``JVPTracer`` pairing a primal ``Var`` with its tangent. Keep the tracer as the
+        # call value so ``f``'s forward runs at that level; the *primal* ``Var`` is the tape
+        # node whose ``.grad`` the differentiable backward fills with a level-connected
+        # cotangent (the second-order information rides the tracer).
+        primal = getattr(leaf, "primal", None)
+        if isinstance(primal, Var):
+            return primal, leaf
+        return None, leaf
     if _is_numeric(leaf):
         v = Var(cast(ArrayLike, leaf))
         return v, v
@@ -142,16 +152,33 @@ def value_and_grad(
             per_arg.append((treedef, info))
 
         out = runner(*call_args)
+        # Under a live higher trace level (``jvp(grad(f))``) the differentiable backward
+        # produces level-connected cotangents (``Var``/``Tracer``) on each leaf's ``.grad``;
+        # return those as-is so the enclosing transform keeps differentiating. At top level
+        # behave exactly as before: materialize the value and ``_match_arg`` the gradients.
+        higher = len(_get_stack()) > 1
         if isinstance(out, Var):
-            out.backward()  # otherwise each leaf's grad stays at its init zeros
-            value: Array = out.value
+            root: Var = out
+        elif isinstance(out, Tracer) and isinstance(getattr(out, "primal", None), Var):
+            root = cast(Var, getattr(out, "primal"))
         else:
-            value = _xp().asarray(out, dtype=float)
+            root = cast(Var, None)
+
+        if root is not None:
+            root.backward()  # otherwise each leaf's grad stays at its init zeros
+            value: Array = out.value if isinstance(out, Var) else root.value
+        else:
+            value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
+
+        def _grad_leaf(orig: Leaf, v: Var | None) -> object:
+            if v is None:
+                return None
+            return v.grad if higher else _match_arg(orig, v.grad)
 
         grads = tuple(
             tree_unflatten(
                 treedef,
-                [None if v is None else _match_arg(orig, v.grad) for orig, v in info],
+                cast("list[Leaf]", [_grad_leaf(orig, v) for orig, v in info]),
             )
             for treedef, info in per_arg
         )
@@ -540,6 +567,21 @@ def jvp(
         runner = _make_runner(f)
         _INSTRUMENTED[f] = runner
 
+    from pycograd.forward import _HOF_TRACER_FOR
+
+    hof_token = _HOF_TRACER_FOR.set({})
+    try:
+        return _run_jvp(f, runner, primals, tangents)
+    finally:
+        _HOF_TRACER_FOR.reset(hof_token)
+
+
+def _run_jvp(
+    f: Callable[..., object],
+    runner: Callable[..., object],
+    primals: tuple[PyTree, ...],
+    tangents: tuple[PyTree, ...],
+) -> tuple[object, object]:
     with new_main(JVPTrace) as main:
         trace = JVPTrace(main)
         level = main.level
@@ -568,9 +610,22 @@ def jvp(
         primal_leaves = [_jvp_primal(leaf, level) for leaf in out_leaves]
         tangent_leaves = [_jvp_tangent(leaf, level) for leaf in out_leaves]
 
+    # Outside the ``with`` block the ``jvp`` level is popped. If no *other* level remains
+    # live (this ``jvp`` was outermost), coerce any ``Var`` that rode out -- e.g. a reverse
+    # cotangent's propagated tangent under ``jvp(grad(f))`` -- to a concrete array. If a
+    # higher level is still live (``vmap``/``grad`` around this ``jvp``), keep it flowing.
+    if len(_get_stack()) == 1:
+        primal_leaves = [_coerce_top(v) for v in primal_leaves]
+        tangent_leaves = [_coerce_top(v) for v in tangent_leaves]
     primal_out = tree_unflatten(out_def, cast("list[Leaf]", primal_leaves))
     tangent_out = tree_unflatten(out_def, cast("list[Leaf]", tangent_leaves))
     return primal_out, tangent_out
+
+
+def _coerce_top(v: object) -> object:
+    if isinstance(v, Var):
+        return np.asarray(_value(cast(Operand, v)))
+    return v
 
 
 def _jvp_inputs(pl: object, tl: object) -> tuple[object | None, object]:
@@ -598,9 +653,18 @@ def _jvp_inputs(pl: object, tl: object) -> tuple[object | None, object]:
 
 def _jvp_materialize(v: object) -> object:
     """Pull one output value to a concrete array (top level) or hand it down unchanged
-    when it is still on an enclosing tape/level (``Var``/``BatchTracer`` under
-    ``grad``/``vmap``), so nesting keeps flowing."""
+    when it is still on an enclosing tape/level, so nesting keeps flowing.
+
+    A :class:`Tracer` (``vmap``/``jvp``) is handed down as-is. A :class:`Var` is also
+    passed through (not coerced to an array): under ``jvp(grad(f))`` the propagated
+    tangent of a reverse cotangent is a ``Var`` on the (enclosing ``grad``'s) tape, and it
+    must ride out of the ``jvp`` so the surrounding transform keeps differentiating it.
+    """
     if isinstance(v, Tracer):  # still on an enclosing level (vmap/jvp) -> keep flowing
+        return v
+    if isinstance(
+        v, Var
+    ):  # a reverse cotangent on an enclosing grad tape -> keep flowing
         return v
     return np.asarray(_value(cast(Operand, v)))
 

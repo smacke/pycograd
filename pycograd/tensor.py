@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import numpy as np
 
@@ -90,6 +90,44 @@ def _unbroadcast(
     return grad.reshape(out_shape)
 
 
+def _logical_shape(x: object) -> tuple[int, ...]:
+    """The shape of a cotangent that may be a ``Var`` (``.value.shape``) or a level
+    tracer (``.shape``)."""
+    if isinstance(x, Var):
+        return x.value.shape
+    return tuple(getattr(x, "shape"))  # a Tracer exposes a logical shape
+
+
+def _d_unbroadcast(grad: object, shape: tuple[int, ...]) -> object:
+    """A *differentiable* ``_unbroadcast``: sum a cotangent ``Var`` over broadcast axes so
+    it matches ``shape``, built from ``d_sum`` + ``d_reshape`` (which themselves ride
+    ``bind``), so the cotangent graph stays differentiable.
+
+    Mirrors the raw :func:`_unbroadcast` for the historical (base-level) path, but operates
+    on the tape: extra leading axes are summed away, then each axis broadcast from size 1
+    is summed with ``keepdims`` and the result reshaped to ``shape``. The per-example
+    ``keep_axes`` logic of the raw variant is intentionally absent -- ``vmap``-composed
+    higher-order AD is out of scope.
+    """
+    from pycograd import ops
+    from pycograd.trace import bind
+
+    g = grad
+    gshape = _logical_shape(g)
+    # Drop extra leading axes that broadcasting added (rank grew).
+    while len(gshape) > len(shape):
+        g = bind(ops.d_sum, g, axis=0)
+        gshape = _logical_shape(g)
+    sum_axes = tuple(
+        axis for axis, size in enumerate(shape) if size == 1 and gshape[axis] != 1
+    )
+    if sum_axes:
+        g = bind(ops.d_sum, g, axis=sum_axes, keepdims=True)
+    if _logical_shape(g) != tuple(shape):
+        g = bind(ops.d_reshape, g, tuple(shape))
+    return g
+
+
 def _unwrap_weight(x: Operand) -> Var | ArrayLike:
     """Resolve a ``Weight`` proxy to its current value; leave anything else."""
     # Deferred import: params imports Var/_lift/_unbroadcast from this module.
@@ -136,9 +174,23 @@ class Var:
         self.grad: Array = xp.zeros_like(self.value)
         self._parents = _parents
         self._backward: Callable[[], None] = lambda: None
+        # Optional differentiable-VJP record, set by primitives that want the higher-order
+        # reverse path (``backward`` under a live higher trace level). ``_vjp_prim`` is the
+        # producing primitive; ``_vjp_operands`` are the *primal* operand ``Var``s aligned
+        # with ``_parents``; ``_vjp_params`` are its static keyword args. When present, the
+        # differentiable backward looks up ``ops._VJP_FOR[_vjp_prim]`` to build each
+        # operand's cotangent as a tape-connected ``Var`` (rather than mutating ``.grad``).
+        self._vjp_prim: object = None
+        self._vjp_operands: tuple[Var, ...] = ()
+        self._vjp_params: dict[str, Any] = {}
 
     # -- construction helpers ------------------------------------------------
-    def _unary(self, value: ArrayLike, grad_fn: Callable[[Array, Array], Array]) -> Var:
+    def _unary(
+        self,
+        value: ArrayLike,
+        grad_fn: Callable[[Array, Array], Array],
+        prim: object = None,
+    ) -> Var:
         out = Var(value, _parents=(self,))
 
         def _backward() -> None:
@@ -147,6 +199,8 @@ class Var:
             )
 
         out._backward = _backward
+        if prim is not None:
+            _record_vjp(out, prim, (self,))
         return out
 
     def _binary(
@@ -154,6 +208,7 @@ class Var:
         other: Operand,
         value_fn: Callable[[Array, Array], Array],
         grad_fn: Callable[[Array, Array, Array], tuple[Array, Array]],
+        prim: object = None,
     ) -> Var:
         other = _lift(other)
         out = Var(value_fn(self.value, other.value), _parents=(self, other))
@@ -164,37 +219,68 @@ class Var:
             other.grad = other.grad + _unbroadcast(gb, other.value.shape)
 
         out._backward = _backward
+        if prim is not None:
+            _record_vjp(out, prim, (self, other))
         return out
 
     # -- arithmetic ----------------------------------------------------------
+    # The operator dunders pass their differentiable primitive to ``_binary``/``_unary`` so
+    # the higher-order reverse path (``backward`` under a live higher level) can look up the
+    # matching ``_VJP_FOR`` rule. ``prim`` is read only on that path; the base path is
+    # unaffected. ``ops`` is imported lazily (it imports ``Var`` from here).
     def __add__(self, o: Operand) -> Var:
-        return self._binary(o, lambda a, b: a + b, lambda a, b, g: (g, g))
+        from pycograd import ops
+
+        return self._binary(o, lambda a, b: a + b, lambda a, b, g: (g, g), ops.d_add)
 
     __radd__ = __add__  # addition is commutative
 
     def __mul__(self, o: Operand) -> Var:
-        return self._binary(o, lambda a, b: a * b, lambda a, b, g: (g * b, g * a))
+        from pycograd import ops
+
+        return self._binary(
+            o, lambda a, b: a * b, lambda a, b, g: (g * b, g * a), ops.d_mul
+        )
 
     __rmul__ = __mul__  # multiplication is commutative
 
     def __sub__(self, o: Operand) -> Var:
-        return self._binary(o, lambda a, b: a - b, lambda a, b, g: (g, -g))
+        from pycograd import ops
+
+        return self._binary(o, lambda a, b: a - b, lambda a, b, g: (g, -g), ops.d_sub)
 
     def __rsub__(self, o: Operand) -> Var:
-        return self._binary(o, lambda a, b: b - a, lambda a, b, g: (-g, g))
+        # ``o - self``; record as the canonical ``d_sub(o, self)`` (operands in the order
+        # ``_VJP_FOR[d_sub]`` expects: ``value = operands[0] - operands[1]``).
+        from pycograd import ops
+
+        return _lift(o)._binary(
+            self, lambda a, b: a - b, lambda a, b, g: (g, -g), ops.d_sub
+        )
 
     def __truediv__(self, o: Operand) -> Var:
+        from pycograd import ops
+
         return self._binary(
-            o, lambda a, b: a / b, lambda a, b, g: (g / b, -g * a / (b * b))
+            o, lambda a, b: a / b, lambda a, b, g: (g / b, -g * a / (b * b)), ops.d_div
         )
 
     def __rtruediv__(self, o: Operand) -> Var:
-        return self._binary(
-            o, lambda a, b: b / a, lambda a, b, g: (-g * b / (a * a), g / a)
+        # ``o / self``; record as the canonical ``d_div(o, self)`` so the operand order
+        # matches ``_VJP_FOR[d_div]`` (``value = operands[0] / operands[1]``).
+        from pycograd import ops
+
+        return _lift(o)._binary(
+            self,
+            lambda a, b: a / b,
+            lambda a, b, g: (g / b, -g * a / (b * b)),
+            ops.d_div,
         )
 
     def __neg__(self) -> Var:
-        return self._unary(-self.value, lambda a, g: -g)
+        from pycograd import ops
+
+        return self._unary(-self.value, lambda a, g: -g, ops.d_neg)
 
     def __pow__(self, p: Operand) -> Var:
         from pycograd import ops
@@ -202,7 +288,12 @@ class Var:
         if isinstance(p, Var):
             # general x ** y == exp(y * log x)
             return ops.d_exp(p * ops.d_log(self))
-        return self._unary(self.value**p, lambda a, g: g * p * a ** (p - 1))
+        # Record the *constant* exponent as a second operand so ``_VJP_FOR[d_pow]`` can read
+        # it; ``_lift(p)`` makes it a leaf ``Var`` aligned with ``_parents`` (its gradient is
+        # unused -- the exponent is constant on this path).
+        return self._binary(
+            p, lambda a, b: a**b, lambda a, b, g: (g * b * a ** (b - 1), g), ops.d_pow
+        )
 
     def __abs__(self) -> Var:
         from pycograd import ops
@@ -251,6 +342,9 @@ class Var:
             self.grad = self.grad + grad
 
         out._backward = _backward
+        from pycograd import ops
+
+        _record_vjp(out, ops.d_getitem, (self,), {"key": key})
         return out
 
     # -- numpy-style methods -------------------------------------------------
@@ -334,6 +428,17 @@ class Var:
             topo.append(v)
 
         build(self)
+        # A higher trace level is live (``jvp(grad(f))`` / ``jacfwd(grad(f))``): run the
+        # *differentiable* cotangent path so the gradient graph is itself recorded on the
+        # enclosing level. The base-level fast path below is otherwise byte-for-byte
+        # unchanged. (``keep_batch_axis`` -- the ``vmap(grad)`` per-sample path -- shares
+        # state with the differentiable ``_unbroadcast`` and is explicitly out of scope, so
+        # it always takes the raw path.)
+        from pycograd.trace import _get_stack
+
+        if keep_batch_axis is None and len(_get_stack()) > 1:
+            self._backward_differentiable(topo, cotangent)
+            return
         xp = _xp()
         for v in topo:
             v.grad = xp.zeros_like(v.value)
@@ -348,6 +453,77 @@ class Var:
                 v._backward()
         finally:
             _KEEP_BATCH_AXES.reset(token)
+
+    def _backward_differentiable(
+        self, topo: "list[Var]", cotangent: Array | None
+    ) -> None:
+        """Reverse pass that accumulates each node's cotangent as a tape/level-connected
+        ``Var`` in a local ``dict[id(node) -> Var]`` instead of mutating numpy ``.grad``.
+
+        Walks the same ``_parents`` toposort in reverse; each node's VJP is computed via
+        ``ops._VJP_FOR`` with ``bind``-riding ops, so the cotangent graph differentiates
+        under an enclosing ``jvp``/``grad``. The leaves' cotangents are written back to
+        ``.grad`` (as ``Var``s the higher level can read) so the existing
+        ``value_and_grad`` plumbing -- which reads ``leaf_var.grad`` -- carries them out.
+        """
+        from pycograd import ops
+        from pycograd.forward import _hof_tracer_for
+        from pycograd.trace import bind
+
+        # Map a primal ``Var`` (a forward-tape node) to the *level tracer* that wraps it
+        # (e.g. a ``JVPTracer`` carrying its tangent), so each VJP rides the enclosing
+        # level and the cotangent graph carries second-order information.
+        tracer_for = _hof_tracer_for()
+
+        def _connected(node: Var) -> object:
+            return tracer_for.get(id(node), node)
+
+        cot: dict[int, object] = {}
+        # The seed cotangent is a constant (zero tangent at the enclosing level), so a
+        # plain ``Var`` suffices; ``bind``-riding VJP ops lift it as needed.
+        seed: object = _lift(
+            _xp().ones_like(self.value) if cotangent is None else cotangent
+        )
+        cot[id(self)] = seed
+        for v in reversed(topo):
+            g = cot.get(id(v))
+            if g is None or not v._parents:
+                continue
+            operands = tuple(_connected(o) for o in v._vjp_operands)
+            contribs = ops._vjp_contributions(v, g, operands)
+            for parent, contrib in zip(v._parents, contribs):
+                if contrib is None:
+                    continue
+                if _logical_shape(contrib) != parent.value.shape:
+                    contrib = _d_unbroadcast(contrib, parent.value.shape)
+                prev = cot.get(id(parent))
+                cot[id(parent)] = (
+                    contrib if prev is None else bind(ops.d_add, prev, contrib)
+                )
+        # Expose each node's cotangent (a level-connected ``Var``/``Tracer``) on ``.grad``
+        # so the higher transform reads it out of each leaf. On this path ``.grad`` carries
+        # a tape/level value rather than a raw array (cast for the type-checker).
+        for v in topo:
+            g = cot.get(id(v))
+            v.grad = cast(
+                Array, g if g is not None else _lift(_xp().zeros_like(v.value))
+            )
+
+
+def _record_vjp(
+    out: Var,
+    prim: object,
+    operands: tuple[Var, ...],
+    params: dict[str, Any] | None = None,
+) -> Var:
+    """Tag ``out`` with the data the differentiable backward needs: the producing
+    primitive, its primal operand ``Var``s (aligned with ``out._parents``), and its static
+    keyword params. Returns ``out`` for call-site chaining. A no-op on the fast path
+    (read only when a higher trace level is live)."""
+    out._vjp_prim = prim
+    out._vjp_operands = operands
+    out._vjp_params = params or {}
+    return out
 
 
 def _lift(x: Operand) -> Var:

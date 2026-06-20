@@ -461,6 +461,12 @@ def abstract_reshape(x: object, *shape: object) -> ShapedArray:
     return ShapedArray(newshape, a.dtype)
 
 
+def abstract_broadcast_to(x: object, shape: object) -> ShapedArray:
+    a = _aval(x)
+    target = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+    return ShapedArray(tuple(int(d) for d in target), a.dtype)
+
+
 def abstract_expand_dims(x: object, axis: int) -> ShapedArray:
     a = _aval(x)
     pos = axis if axis >= 0 else axis + a.ndim + 1
@@ -729,6 +735,7 @@ def _build_abstract_table() -> (
             ops._matmul: abstract_matmul,
             ops.d_transpose: abstract_transpose,
             ops.d_reshape: abstract_reshape,
+            ops.d_broadcast_to: abstract_broadcast_to,
             ops.d_expand_dims: abstract_expand_dims,
             ops.d_concatenate: abstract_concatenate,
             ops.d_stack: abstract_stack,

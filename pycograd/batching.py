@@ -291,6 +291,17 @@ def _reshape_rule(trace: BatchTrace, x: object, *shape: object) -> BatchTracer:
     )
 
 
+# -- broadcast_to -----------------------------------------------------------
+def _broadcast_to_rule(trace: BatchTrace, x: object, shape: object) -> BatchTracer:
+    t = trace._raise(x)
+    target = tuple(shape) if isinstance(shape, (tuple, list)) else (cast(int, shape),)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_broadcast_to, t.value, target), None)
+    v = _move_bdim_to_front(t)
+    b = _phys_shape(v)[0]
+    return _result(trace, bind(ops.d_broadcast_to, v, (b,) + tuple(target)), 0)
+
+
 # -- matmul -----------------------------------------------------------------
 def _matmul_rule(trace: BatchTrace, a: object, b: object) -> BatchTracer:
     ta, tb = trace._raise(a), trace._raise(b)
@@ -516,6 +527,7 @@ def _build_rule_for() -> dict[object, Callable]:
             ops._matmul: _matmul_rule,
             ops.d_transpose: _transpose_rule,
             ops.d_reshape: _reshape_rule,
+            ops.d_broadcast_to: _broadcast_to_rule,
             ops.d_expand_dims: _expand_dims_rule,
             ops.d_concatenate: _join_for(ops.d_concatenate, new_axis=False),
             ops.d_stack: _join_for(ops.d_stack, new_axis=True),
