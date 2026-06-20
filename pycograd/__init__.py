@@ -85,7 +85,14 @@ from pycograd.shapes import (
 )
 from pycograd.tensor import Var, detach
 from pycograd.tracer import AutodiffTracer, resolve_call
-from pycograd.transforms import grad, gradient_descent, value_and_grad, vmap
+from pycograd.transforms import (
+    grad,
+    gradient_descent,
+    jacfwd,
+    jvp,
+    value_and_grad,
+    vmap,
+)
 from pycograd.tree import (
     sgd_update,
     tree_flatten,
@@ -119,6 +126,8 @@ __all__ = [
     "value_and_grad",
     "grad",
     "vmap",
+    "jvp",
+    "jacfwd",
     "gradient_descent",
     "sgd_update",
     # shape inference

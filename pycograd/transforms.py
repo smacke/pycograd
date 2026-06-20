@@ -16,9 +16,10 @@ import numpy as np
 from pycograd import ops
 from pycograd._typing import Array, ArrayLike, Operand
 from pycograd.batching import BatchTrace, BatchTracer
+from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import Var, _is_array, _is_numeric, _lift, _value, _xp
-from pycograd.trace import bind, new_main
+from pycograd.trace import Tracer, bind, new_main
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
     Leaf,
@@ -510,6 +511,179 @@ def per_example_grad(
         return np.moveaxis(xv.grad, 0, in_axes)
 
     return wrapped
+
+
+def jvp(
+    f: Callable[..., object],
+    primals: tuple[PyTree, ...],
+    tangents: tuple[PyTree, ...],
+) -> tuple[object, object]:
+    """Forward-mode AD: ``(f(*primals), df(*primals) . tangents)`` in one pass.
+
+    JAX-style: ``primals`` and ``tangents`` are tuples with one entry per positional
+    argument of ``f``; corresponding leaves must match in shape. Returns
+    ``(primal_out, tangent_out)`` -- the primal output of ``f`` and its directional
+    derivative along ``tangents`` -- both as pytrees matching ``f``'s output.
+
+    Realized as one level of the trace-level interpreter stack (a
+    :class:`~pycograd.forward.JVPTrace` pushed via ``new_main``): each argument leaf
+    enters as a :class:`~pycograd.forward.JVPTracer` pairing its primal with its tangent,
+    every primitive computes ``primal_out`` one level down and ``tangent_out`` via its
+    forward-derivative rule, and the result leaves carry the propagated tangent. Because
+    the tangent arithmetic itself flows through ``bind``, ``jvp`` *composes* with
+    :func:`vmap` (``vmap(lambda x: jvp(g, (x,), (v,))[1])``) and nests.
+    """
+    if len(primals) != len(tangents):
+        raise ValueError("jvp: primals and tangents must have the same length")
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(f)
+        _INSTRUMENTED[f] = runner
+
+    with new_main(JVPTrace) as main:
+        trace = JVPTrace(main)
+        level = main.level
+        call_args: list[PyTree] = []
+        for p, t in zip(primals, tangents):
+            p_leaves, p_def = tree_flatten(p)
+            t_leaves, _t_def = tree_flatten(t)
+            if len(p_leaves) != len(t_leaves):
+                raise ValueError(
+                    "jvp: a primal argument and its tangent have different pytree "
+                    "structure"
+                )
+            new_leaves: list[Leaf] = []
+            for pl, tl in zip(p_leaves, t_leaves):
+                primal_inner, tangent_inner = _jvp_inputs(pl, tl)
+                if primal_inner is None:
+                    new_leaves.append(pl)  # non-numeric leaf: pass through, no tangent
+                    continue
+                new_leaves.append(
+                    cast(Leaf, JVPTracer(trace, primal_inner, tangent_inner))
+                )
+            call_args.append(tree_unflatten(p_def, new_leaves))
+
+        out = runner(*call_args)
+        out_leaves, out_def = tree_flatten(cast(PyTree, out))
+        primal_leaves = [_jvp_primal(leaf, level) for leaf in out_leaves]
+        tangent_leaves = [_jvp_tangent(leaf, level) for leaf in out_leaves]
+
+    primal_out = tree_unflatten(out_def, cast("list[Leaf]", primal_leaves))
+    tangent_out = tree_unflatten(out_def, cast("list[Leaf]", tangent_leaves))
+    return primal_out, tangent_out
+
+
+def _jvp_inputs(pl: object, tl: object) -> tuple[object | None, object]:
+    """The (primal, tangent) inner values to seed a ``JVPTracer`` for one argument leaf.
+
+    A bare numeric leaf becomes a fresh ``Var`` primal and ``Var`` tangent. A leaf that is
+    *already* on a tape / an enclosing level (a :class:`~pycograd.tensor.Var` under
+    ``grad``, or a :class:`~pycograd.batching.BatchTracer` under an outer ``vmap``) is kept
+    as the primal so its level keeps flowing; its tangent is lifted to the same level by
+    ``bind`` when used. A non-numeric, non-tracer leaf yields ``(None, _)`` so the caller
+    passes it through untouched (no tangent)."""
+    if isinstance(pl, (Var, Tracer)):
+        return pl, tl
+    if not _is_numeric(pl):
+        return None, tl
+    pv = _value(cast(Operand, pl))
+    if isinstance(tl, (Var, Tracer)):
+        # The tangent is itself on an enclosing level (``vmap`` over the tangent, or
+        # ``jvp`` of ``jvp``); keep the tracer so its level keeps flowing rather than
+        # coercing it to a concrete array.
+        return Var(pv), tl
+    tv = _xp().asarray(_value(cast(Operand, tl)), dtype=np.asarray(pv).dtype)
+    return Var(pv), Var(tv)
+
+
+def _jvp_materialize(v: object) -> object:
+    """Pull one output value to a concrete array (top level) or hand it down unchanged
+    when it is still on an enclosing tape/level (``Var``/``BatchTracer`` under
+    ``grad``/``vmap``), so nesting keeps flowing."""
+    if isinstance(v, Tracer):  # still on an enclosing level (vmap/jvp) -> keep flowing
+        return v
+    return np.asarray(_value(cast(Operand, v)))
+
+
+def _jvp_primal(leaf: object, level: int) -> object:
+    if isinstance(leaf, JVPTracer) and leaf._trace.main.level == level:
+        return _jvp_materialize(leaf.primal)
+    return _jvp_materialize(leaf)
+
+
+def _jvp_tangent(leaf: object, level: int) -> object:
+    """One tangent output leaf. A tracer at this level carries the propagated tangent; an
+    output that does not depend on the input (not a tracer at this level) has a zero
+    tangent shaped like the primal."""
+    if isinstance(leaf, JVPTracer) and leaf._trace.main.level == level:
+        return _jvp_materialize(leaf.tangent)
+    arr = np.asarray(_value(cast(Operand, leaf)))
+    return np.zeros_like(arr)
+
+
+def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
+    """Forward-mode Jacobian of ``f`` w.r.t. its ``argnum``-th argument.
+
+    Builds the Jacobian by pushing one-hot tangent basis vectors through :func:`jvp` --
+    one column per input coordinate -- and stacking the resulting output-tangents. The
+    basis sweep is vectorized with :func:`vmap` over the JVP, demonstrating that forward
+    mode composes with batching: ``vmap`` maps the (flat) one-hot index, ``jvp`` carries
+    each basis tangent forward, and the per-basis output tangents stack into the Jacobian.
+
+    For a scalar-output ``f`` this agrees with reverse-mode :func:`grad` (the gradient is
+    the single Jacobian row); for vector output it returns the full ``(out, in)``
+    Jacobian shaped ``(*out_shape, *in_shape)``.
+    """
+
+    def jacobian(*args: PyTree) -> object:
+        x = args[argnum]
+        flat, treedef = tree_flatten(x)
+        if len(flat) != 1 or not _is_numeric(flat[0]):
+            raise ValueError(
+                "jacfwd: the differentiated argument must be a single array"
+            )
+        x_arr = np.asarray(_value(cast(Operand, flat[0])))
+        n = int(x_arr.size)
+        basis = np.eye(n, dtype=x_arr.dtype).reshape((n,) + x_arr.shape)
+
+        def column(e: object) -> object:
+            tan_args = tuple(
+                tree_unflatten(treedef, [cast(Leaf, e)]) if i == argnum else a
+                for i, a in enumerate(args)
+            )
+            zeros = tuple(
+                tree_unflatten(
+                    tree_flatten(a)[1],
+                    [
+                        (
+                            np.zeros_like(np.asarray(_value(cast(Operand, leaf))))
+                            if _is_numeric(leaf)
+                            else leaf
+                        )
+                        for leaf in tree_flatten(a)[0]
+                    ],
+                )
+                for a in args
+            )
+            primals = tuple(args)
+            tangents = tuple(
+                tan_args[i] if i == argnum else zeros[i] for i in range(len(args))
+            )
+            return jvp(f, primals, tangents)[1]
+
+        try:
+            cols = vmap(column)(basis)
+            stacked = np.asarray(cols)
+        except Exception:
+            # Fall back to a Python loop if the vmap-over-jvp composition trips on a
+            # particular function (kept available so jacfwd is always usable).
+            stacked = np.stack([np.asarray(column(basis[i])) for i in range(n)], axis=0)
+        # ``stacked`` is (n_in, *out_shape); move the input axis last -> (*out, *in).
+        out_shape = stacked.shape[1:]
+        jac = np.moveaxis(stacked, 0, -1)
+        return jac.reshape(out_shape + x_arr.shape)
+
+    return jacobian
 
 
 def gradient_descent(
