@@ -12,15 +12,26 @@ function being differentiated.
 """
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
 import sysconfig
 from typing import Callable
 
+import numpy as np
 import pyccolo as pyc
 
 from pycograd.backends import current_backend
 from pycograd.ops import _is_mathy
+from pycograd.tensor import Var
+from pycograd.trace import (
+    _BINOP_PRIM,
+    _COMPARE_PRIM,
+    _UNARYOP_PRIM,
+    _get_stack,
+    _SubscriptProxy,
+    bind,
+)
 
 # Directories holding stdlib / installed packages -- functions defined here are
 # treated as "library" code and left alone (only *your* code is instrumented).
@@ -116,6 +127,13 @@ class AutodiffTracer(pyc.BaseTracer):
         backend = current_backend()
         replacement = backend.intercept.get(func)
         if replacement is not None:
+            # When a transform level (e.g. ``vmap``'s ``BatchTrace``) is live above the
+            # base, route the intercepted call through the trace-level stack so the top
+            # level processes it -- this is what makes ``vmap`` (and nested ``vmap``)
+            # vectorize ``np.*`` calls. With only the base level active, ``bind`` lands
+            # on ``EvalTrace`` and runs the primitive directly, identical to today.
+            if len(_get_stack()) > 1:
+                return functools.partial(bind, replacement)
             return replacement
         if _is_user_function(func):
             return self._instrument_helper(func)
@@ -138,6 +156,61 @@ class AutodiffTracer(pyc.BaseTracer):
     @pyc.register_handler(pyc.after_right_binop_arg)
     def handle_right_binop_arg(self, ret: object, *_: object, **__: object) -> object:
         return current_backend().coerce_operand(ret)
+
+    # -- operator interception: route ops through the trace-level stack ---------
+    # pyccolo hands each operator handler a default callable (``ret``) implementing the
+    # original op and the op's AST node. For an op pycograd has a primitive for, we
+    # return a callable that routes the operands through ``bind`` -- so a base-level
+    # ``Var``/array runs the ``d_*`` primitive (identical to its dunder today), a
+    # ``BatchTracer`` selects its ``vmap`` level, and an unmanaged value (the abstract
+    # ``ShapedArray``) falls through to its own operator inside ``bind``. An op with no
+    # primitive (e.g. ``%``, ``&``) keeps the original callable, so it is untouched.
+    @pyc.register_handler(
+        pyc.before_binop, when=lambda node: type(node.op) in _BINOP_PRIM
+    )
+    def handle_before_binop(
+        self, ret: Callable[..., object], node: ast.BinOp, *_: object, **__: object
+    ) -> Callable[..., object]:
+        prim, _raw = _BINOP_PRIM[type(node.op)]
+        return lambda x, y: bind(prim, x, y)
+
+    @pyc.register_handler(
+        pyc.before_unaryop, when=lambda node: type(node.op) in _UNARYOP_PRIM
+    )
+    def handle_before_unaryop(
+        self, ret: Callable[..., object], node: ast.UnaryOp, *_: object, **__: object
+    ) -> Callable[..., object]:
+        prim, _raw = _UNARYOP_PRIM[type(node.op)]
+        return lambda x: bind(prim, x)
+
+    @pyc.register_handler(
+        pyc.before_compare,
+        # Only a *single* comparison (``a < b``) maps to a primitive; a chained compare
+        # (``a < b < c``) has multiple ops and Python-level short-circuit semantics, so
+        # leave it to pyccolo's default callable.
+        when=lambda node: len(node.ops) == 1 and type(node.ops[0]) in _COMPARE_PRIM,
+    )
+    def handle_before_compare(
+        self, ret: Callable[..., object], node: ast.Compare, *_: object, **__: object
+    ) -> Callable[..., object]:
+        prim, _raw = _COMPARE_PRIM[type(node.ops[0])]
+        return lambda x, y: bind(prim, x, y)
+
+    @pyc.register_handler(pyc.before_subscript_load)
+    def handle_before_subscript_load(
+        self, ret: object, node: object, *_: object, **__: object
+    ) -> object:
+        # pyccolo replaces the *subscripted object* (then performs ``[key]`` on it), so we
+        # wrap the subscripted object in a proxy whose ``__getitem__`` *may* route through
+        # ``bind``. We wrap a ``Var`` (the base level pycograd manages) and a raw
+        # ``np.ndarray`` (so a shared/unbatched table gathered with a per-example batched
+        # index -- ``table[batched_idx]`` -- reaches ``bind``). The proxy only binds when
+        # the object is a ``Var`` or the key involves a ``Tracer``; otherwise it falls
+        # through to plain ``obj[key]``, so ordinary array indexing by non-tracer keys --
+        # and every dict/list/ParamDict subscript (never wrapped here) -- is unchanged.
+        if isinstance(ret, Var) or isinstance(ret, np.ndarray):
+            return _SubscriptProxy(ret)
+        return ret
 
 
 # ``tracer.instrumented`` recompiles ``f`` from source into a fresh function, so
@@ -172,6 +245,17 @@ def _make_runner(f: Callable[..., object]) -> Callable[..., object]:
     built as it executes; recompiling its lowered source would corrupt it.
     """
     tracer = AutodiffTracer.instance()
+    # A function explicitly tagged to run directly (e.g. ``vmap``'s wrapper, a closure
+    # over its config) manages its own tracing; instrumenting it from source would drop
+    # its closure. Run it under the tracer so any ``np.*`` it makes is still intercepted.
+    if getattr(f, "_pycograd_run_directly", False):
+
+        @functools.wraps(f)
+        def run_tagged(*args: object, **kwargs: object) -> object:
+            with tracer.tracing_enabled():
+                return f(*args, **kwargs)
+
+        return run_tagged
     if not (_is_already_woven(f) and tracer._augmented_definition_for(f) is None):
         try:
             return tracer.instrumented(f)

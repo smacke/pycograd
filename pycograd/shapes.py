@@ -372,6 +372,10 @@ def abstract_binary(a: object, b: object) -> ShapedArray:
     return _ew_binary(a, b)
 
 
+def abstract_compare(a: object, b: object) -> ShapedArray:
+    return ShapedArray(_broadcast_shape("compare", a, b), np.dtype(bool))
+
+
 def abstract_where(cond: object, a: object, b: object) -> ShapedArray:
     return ShapedArray(_broadcast_shape("where", cond, a, b), _result_dtype(a, b))
 
@@ -666,7 +670,9 @@ def _advanced_getitem(a: ShapedArray, keys: tuple) -> ShapedArray:
 # ---------------------------------------------------------------------------
 # The abstract interception table, keyed identically to ``ops._INTERCEPT``.
 # ---------------------------------------------------------------------------
-def _build_abstract_table() -> dict[object, Callable[..., object]]:
+def _build_abstract_table() -> (
+    "tuple[dict[object, Callable[..., object]], dict[object, Callable[..., object]]]"
+):
     """Map every numpy/math callable pycograd differentiates to its shape rule.
 
     Derived from ``ops._RULES`` so coverage is *identical* to ``ops._INTERCEPT`` by
@@ -694,6 +700,22 @@ def _build_abstract_table() -> dict[object, Callable[..., object]]:
     abs_for: dict[object, Callable[..., object]] = {p: abstract_unary for p in unary}
     abs_for.update(
         {
+            # operator primitives: elementwise broadcasts / comparisons. No numpy
+            # callable maps to them, so they only widen ``_ABS_FOR`` for a future
+            # by-primitive ``bind``; they add no key to ``_ABSTRACT``.
+            ops.d_add: abstract_binary,
+            ops.d_sub: abstract_binary,
+            ops.d_mul: abstract_binary,
+            ops.d_div: abstract_binary,
+            ops.d_neg: abstract_unary,
+            ops.d_pow: abstract_binary,
+            ops.d_lt: abstract_compare,
+            ops.d_le: abstract_compare,
+            ops.d_gt: abstract_compare,
+            ops.d_ge: abstract_compare,
+            ops.d_eq: abstract_compare,
+            ops.d_ne: abstract_compare,
+            ops.d_getitem: abstract_getitem,
             ops.d_maximum: abstract_binary,
             ops.d_minimum: abstract_binary,
             ops.d_where: abstract_where,
@@ -716,10 +738,16 @@ def _build_abstract_table() -> dict[object, Callable[..., object]]:
             ops.d_dstack: abstract_dstack,
         }
     )
-    return {fn: abs_for[prim] for prim, fns in ops._RULES.items() for fn in fns}
+    table = {fn: abs_for[prim] for prim, fns in ops._RULES.items() for fn in fns}
+    return table, abs_for
 
 
-_ABSTRACT: dict[object, Callable[..., object]] = _build_abstract_table()
+# ``_ABSTRACT`` is keyed by numpy callable (parity with ``ops._INTERCEPT``); ``_ABS_FOR``
+# is keyed by *primitive* (incl. the operator primitives, which have no numpy callable)
+# for a future by-primitive ``bind`` to consult.
+_ABSTRACT: dict[object, Callable[..., object]]
+_ABS_FOR: dict[object, Callable[..., object]]
+_ABSTRACT, _ABS_FOR = _build_abstract_table()
 
 
 # ---------------------------------------------------------------------------

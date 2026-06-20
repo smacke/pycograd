@@ -7,7 +7,6 @@ vectorized ``vmap(f)`` must equal it; gradients of vmapped functions are checked
 against finite differences.
 """
 import numpy as np
-import pytest
 
 from pycograd import grad, value_and_grad, vmap
 from pycograd.transforms import per_example_grad
@@ -36,6 +35,15 @@ def _loop_vmap(f, in_axes=0):
 def _check(f, args, in_axes=0):
     got = np.asarray(vmap(f, in_axes=in_axes)(*args))
     ref = _loop_vmap(f, in_axes=in_axes)(*args)
+    assert got.shape == ref.shape, f"shape {got.shape} != {ref.shape}"
+    assert np.allclose(got, ref), f"value mismatch\n{got}\n{ref}"
+
+
+def _check_nested(f, args, in_axes=0):
+    """Vectorized ``vmap(vmap(f))`` must equal a double Python loop (the oracle for the
+    inner ``vmap`` composed with the oracle for the outer ``vmap``)."""
+    got = np.asarray(vmap(vmap(f, in_axes=in_axes), in_axes=in_axes)(*args))
+    ref = _loop_vmap(_loop_vmap(f, in_axes=in_axes), in_axes=in_axes)(*args)
     assert got.shape == ref.shape, f"shape {got.shape} != {ref.shape}"
     assert np.allclose(got, ref), f"value mismatch\n{got}\n{ref}"
 
@@ -237,12 +245,135 @@ def test_grad_through_batched_gather():
 
 
 # ---------------------------------------------------------------------------
-# documented v1 limits
+# shared/unbatched-table gather: table[idx] where the *index* is the batched thing
+# and the table is shared across the batch (in_axes=(0, None)). Functions/constants
+# are module-level so pyccolo re-instruments them from source (no closure capture).
 # ---------------------------------------------------------------------------
-def test_nested_vmap_not_supported():
-    X = _rng().standard_normal((3, 4))
-    with pytest.raises(NotImplementedError):
-        vmap(vmap(lambda r: r * 2.0))(X)
+_ETABLE = _rng(3).standard_normal((10, 3))  # shared embedding table
+_TIDS = _rng(4).integers(0, 10, size=8)  # one index per example
+
+
+def shared_gather(i, t):
+    return t[i]
+
+
+def global_gather(i):
+    return _ETABLE[i]
+
+
+def test_vmap_shared_table_gather():
+    # table[batched_index] -> (B, *table.shape[1:]), matching the loop oracle.
+    got = np.asarray(vmap(shared_gather, in_axes=(0, None))(_TIDS, _ETABLE))
+    ref = np.stack([_ETABLE[_TIDS[k]] for k in range(len(_TIDS))])
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref)
+
+
+def test_vmap_shared_table_gather_global():
+    # Same gather, but the shared table is a module global closed over by the mapped fn.
+    got = np.asarray(vmap(global_gather)(_TIDS))
+    ref = np.stack([_ETABLE[_TIDS[k]] for k in range(len(_TIDS))])
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref)
+
+
+def _shared_gather_loss(t):
+    return np.sum(vmap(shared_gather, in_axes=(0, None))(_TIDS, t))
+
+
+def test_grad_through_shared_table_gather():
+    (g,) = grad(_shared_gather_loss)(_ETABLE)
+    # d/dtable of summing the gathered rows = count of how often each row is selected
+    # (scatter-add accumulates 1 per occurrence into that row).
+    expected = np.zeros_like(_ETABLE)
+    for k in range(len(_TIDS)):
+        expected[_TIDS[k]] += 1.0
+    assert g.shape == _ETABLE.shape
+    assert np.allclose(g, expected)
+
+
+# ---------------------------------------------------------------------------
+# nested vmap(vmap(f)) vs a double Python loop
+# (functions are module-level so re-instrumentation from source works -- pyccolo does
+# not preserve enclosing-function closures, so they must close over module globals only)
+# ---------------------------------------------------------------------------
+def scale2(x):
+    return x * 2.0
+
+
+def nested_elementwise(x):
+    return np.exp(x) * 2.0 - 1.0
+
+
+def nested_reduce_last(x):
+    return np.sum(x, axis=-1)
+
+
+def nested_reduce_all(x):
+    return np.sum(x)
+
+
+def nested_dot(x):
+    return x @ x
+
+
+def nested_matvec(x):
+    return x @ np.ones(4)
+
+
+def test_nested_vmap_elementwise_scalar():
+    X = _rng().standard_normal((3, 5))
+    _check_nested(scale2, (X,))
+
+
+def test_nested_vmap_elementwise():
+    X = _rng().standard_normal((3, 5, 4))
+    _check_nested(nested_elementwise, (X,))
+
+
+def test_nested_vmap_reduce_axis():
+    X = _rng().standard_normal((3, 5, 4))
+    _check_nested(nested_reduce_last, (X,))
+
+
+def test_nested_vmap_reduce_all():
+    X = _rng().standard_normal((3, 5, 4))
+    _check_nested(nested_reduce_all, (X,))
+
+
+def test_nested_vmap_dot():
+    X = _rng().standard_normal((3, 5, 4))
+    _check_nested(nested_dot, (X,))
+
+
+def test_nested_vmap_matvec():
+    X = _rng().standard_normal((3, 5, 4))
+    _check_nested(nested_matvec, (X,))
+
+
+def nested_gather(x, idx):
+    return x[idx]
+
+
+def test_nested_vmap_gather():
+    r = _rng()
+    X = r.standard_normal((2, 3, 6))
+    IDX = r.integers(0, 6, size=(2, 3, 4))
+    got = np.asarray(vmap(vmap(nested_gather, in_axes=(0, 0)), in_axes=(0, 0))(X, IDX))
+    ref = _loop_vmap(_loop_vmap(nested_gather, in_axes=(0, 0)), in_axes=(0, 0))(X, IDX)
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref)
+
+
+def _nested_scaled_loss(x):
+    # sum over a doubly-vmapped scale-by-2: loss = sum(2 * x_ij), so d loss / dx = 2.
+    return np.sum(vmap(vmap(scale2))(x))
+
+
+def test_nested_vmap_grad_composes():
+    X = _rng().standard_normal((3, 5))
+    (g,) = grad(_nested_scaled_loss)(X)
+    assert np.allclose(g, 2 * np.ones_like(X))
 
 
 def test_coverage_matches_intercept():
@@ -250,3 +381,170 @@ def test_coverage_matches_intercept():
     from pycograd.ops import _INTERCEPT
 
     assert set(_BATCH) == set(_INTERCEPT)
+
+
+# ---------------------------------------------------------------------------
+# per-sample gradients of a SHARED parameter: vmap(grad(f), in_axes=(0, None))
+# yields d f(x_i, w)/dw stacked to (B, *w.shape), not summed over the batch.
+# Oracle: a Python loop of grad(f) over each example.
+# ---------------------------------------------------------------------------
+def _stack_loop_grad(f, X, *shared, in_axes):
+    """stack([grad(f)(x_i, *shared) for i]) -- the per-sample-grad oracle."""
+    axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * (1 + len(shared))
+    batch = X.shape[axes[0]]
+    per_arg = [[] for _ in range(1 + len(shared))]
+    for i in range(batch):
+        xi = np.take(X, i, axis=axes[0])
+        gs = grad(f)(xi, *shared)
+        for k, g in enumerate(gs):
+            per_arg[k].append(np.asarray(g))
+    return tuple(np.stack(col) for col in per_arg)
+
+
+def mlp_scalar(x, w1, b1, w2):
+    # one example -> scalar; w1/b1/w2 shared across the batch
+    h = np.tanh(x @ w1 + b1)
+    return h @ w2
+
+
+def test_per_sample_grad_shared_weight_vs_loop():
+    r = _rng()
+    B = 6
+    X = r.standard_normal((B, 3))
+    w1, b1 = r.standard_normal((3, 5)), r.standard_normal((5,))
+    w2 = r.standard_normal((5,))
+    in_axes = (0, None, None, None)
+    gx, gw1, gb1, gw2 = vmap(grad(mlp_scalar), in_axes=in_axes)(X, w1, b1, w2)
+    ogx, ogw1, ogb1, ogw2 = _stack_loop_grad(mlp_scalar, X, w1, b1, w2, in_axes=in_axes)
+    assert gx.shape == (B, 3) and gw1.shape == (B, 3, 5)
+    assert gb1.shape == (B, 5) and gw2.shape == (B, 5)
+    assert np.allclose(gx, ogx)
+    assert np.allclose(gw1, ogw1)
+    assert np.allclose(gb1, ogb1)
+    assert np.allclose(gw2, ogw2)
+
+
+def linear_scalar(x, w):
+    return x @ w  # x:(d,), w:(d,) -> scalar; shared w
+
+
+def test_per_sample_grad_shared_weight_fd():
+    r = _rng(3)
+    B = 5
+    X = r.standard_normal((B, 4))
+    w = r.standard_normal((4,))
+    (_gx, gw) = vmap(grad(linear_scalar), in_axes=(0, None))(X, w)
+    # per-sample finite differences of f(x_i, w) w.r.t. w
+    fd = np.stack([_fd(lambda ww, xi=X[i]: float(xi @ ww), w) for i in range(B)])
+    assert gw.shape == (B, 4)
+    assert np.allclose(gw, fd, atol=1e-5)
+
+
+def test_value_and_grad_per_sample_shared_weight():
+    r = _rng(1)
+    B = 4
+    X = r.standard_normal((B, 4))
+    w = r.standard_normal((4,))
+    val, (gx, gw) = vmap(value_and_grad(linear_scalar), in_axes=(0, None))(X, w)
+    assert val.shape == (B,)
+    assert np.allclose(val, X @ w)
+    assert gw.shape == (B, 4) and np.allclose(gw, X)  # d (x.w)/dw = x, per sample
+
+
+# -- per-primitive backward-batch-preservation: a shared-weight grad through each of
+# max / where / matmul / reduction must stay per-sample (shape (B, *w.shape)). --------
+def prim_max(x, w):
+    return np.max(x * w)  # shared w; max over the per-example vector
+
+
+def prim_where(x, w):
+    return np.sum(np.where(x > 0, x * w, w))  # shared w through a select
+
+
+def prim_matmul(x, w):
+    return x @ (w @ x)  # shared matrix w:(d,d), scalar out
+
+
+def prim_reduction(x, w):
+    return np.sum(x * w)  # shared w through a reduction
+
+
+def _check_per_sample_shared(f, X, w, in_axes=(0, None)):
+    (_gx, gw) = vmap(grad(f), in_axes=in_axes)(X, w)
+    (_ogx, ogw) = _stack_loop_grad(f, X, w, in_axes=in_axes)
+    assert gw.shape == ogw.shape == (X.shape[0],) + np.asarray(w).shape
+    assert np.allclose(gw, ogw, atol=1e-6)
+
+
+def test_per_sample_shared_through_max():
+    r = _rng(4)
+    _check_per_sample_shared(
+        prim_max, r.standard_normal((6, 4)), r.standard_normal((4,))
+    )
+
+
+def test_per_sample_shared_through_where():
+    r = _rng(5)
+    _check_per_sample_shared(
+        prim_where, r.standard_normal((6, 4)), r.standard_normal((4,))
+    )
+
+
+def test_per_sample_shared_through_matmul():
+    r = _rng(6)
+    _check_per_sample_shared(
+        prim_matmul, r.standard_normal((5, 3)), r.standard_normal((3, 3))
+    )
+
+
+def test_per_sample_shared_through_reduction():
+    r = _rng(8)
+    _check_per_sample_shared(
+        prim_reduction, r.standard_normal((6, 4)), r.standard_normal((4,))
+    )
+
+
+def test_unbroadcast_keep_axes_preserves_batch():
+    """_unbroadcast(keep_axes=(0,)) keeps a size-1 batch axis instead of summing it."""
+    from pycograd.tensor import _unbroadcast
+
+    g = np.arange(2 * 3 * 4, dtype=float).reshape(2, 3, 4)
+    # default: a size-1 leading target collapses the batch axis
+    assert _unbroadcast(g, (1, 3, 4)).shape == (1, 3, 4)
+    assert np.allclose(_unbroadcast(g, (1, 3, 4)), g.sum(axis=0, keepdims=True))
+    # keep_axes=(0,): the per-example axis survives
+    kept = _unbroadcast(g, (1, 3, 4), keep_axes=(0,))
+    assert kept.shape == (2, 3, 4)
+    assert np.allclose(kept, g)
+
+
+def test_backward_batched_cotangent_keep_batch_axis():
+    """Var.backward(cotangent, keep_batch_axis=0): a batched cotangent over a per-example
+    output, with a size-1-batch shared leaf, yields a per-sample gradient (B, *w.shape).
+    """
+    from pycograd import ops
+    from pycograd.tensor import Var
+
+    B, d = 5, 4
+    x = _rng(2).standard_normal((B, d))
+    w = _rng(9).standard_normal((d,))
+    xv = Var(x)
+    wv = Var(w[np.newaxis, :])  # size-1 batch axis so it broadcasts over the batch
+    out = ops.d_sum(xv * wv, axis=1)  # per-example dot -> shape (B,)
+    out.backward(cotangent=np.ones(B), keep_batch_axis=0)
+    assert wv.grad.shape == (B, d)  # kept per-sample, not summed to (1, d)
+    assert np.allclose(wv.grad, x)  # d (x_i . w)/dw = x_i, per sample
+    # without keep_batch_axis the shared leaf's grad collapses (default behavior)
+    xv2, wv2 = Var(x), Var(w[np.newaxis, :])
+    out2 = ops.d_sum(xv2 * wv2, axis=1)
+    out2.backward(cotangent=np.ones(B))
+    assert wv2.grad.shape == (1, d)
+    assert np.allclose(wv2.grad, x.sum(axis=0, keepdims=True))
+
+
+def test_per_example_grad_still_works():
+    # the existing data-arg per-sample path must keep working unchanged
+    X = _rng().standard_normal((5, 4))
+    g = per_example_grad(per_sample_sq)(X)
+    assert g.shape == X.shape
+    assert np.allclose(g, 2 * X, atol=1e-6)

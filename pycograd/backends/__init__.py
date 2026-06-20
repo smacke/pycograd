@@ -196,16 +196,9 @@ def _make_cupy() -> Backend:
     return CupyBackend()
 
 
-def _make_batch() -> Backend:
-    from pycograd.backends.batching_backend import BatchingBackend
-
-    return BatchingBackend()
-
-
 register_backend("numpy", _make_numpy)
 register_backend("abstract", _make_abstract)
 register_backend("shape", _make_abstract)
-register_backend("batch", _make_batch)
 register_backend("jax", _make_jax)
 register_backend("torch", _make_torch)
 register_backend("pytorch", _make_torch)

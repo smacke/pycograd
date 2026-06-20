@@ -10,6 +10,7 @@ dependency on ``ops`` (which imports ``Var`` from here).
 """
 from __future__ import annotations
 
+import contextvars
 import functools
 from typing import Any, Callable
 
@@ -35,17 +36,58 @@ def _xp() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Per-example backward axes.
+#
+# During a *batched-cotangent* backward (``Var.backward(cotangent, keep_batch_axis=0)``,
+# driven by ``vmap(grad(f))``), the reverse pass carries a leading per-example axis. The
+# VJP closures all reduce a shared operand's gradient with ``_unbroadcast(g, shape)`` and
+# do not know about this axis, so it is threaded out-of-band via this contextvar: when set
+# to ``{0}``, ``_unbroadcast`` keeps a size-1 batch axis instead of summing it, so a
+# shared parameter's gradient comes back ``(B, *param.shape)``. Empty by default, so every
+# ordinary backward is byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+_KEEP_BATCH_AXES: contextvars.ContextVar[tuple[int, ...]] = contextvars.ContextVar(
+    "pycograd_keep_batch_axes", default=()
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
-def _unbroadcast(grad: Array, shape: tuple[int, ...]) -> Array:
-    """Sum ``grad`` over axes that were broadcast, so it matches ``shape``."""
+def _unbroadcast(
+    grad: Array, shape: tuple[int, ...], keep_axes: tuple[int, ...] = ()
+) -> Array:
+    """Sum ``grad`` over axes that were broadcast, so it matches ``shape``.
+
+    ``keep_axes`` names size-1 axes of ``shape`` that should NOT be summed even though
+    ``grad`` is larger there: the gradient keeps a leading *per-example* axis instead of
+    collapsing it. This is how ``vmap(grad(f))`` returns a per-sample gradient of a
+    *shared* parameter -- the parameter enters the batched forward with a size-1 batch
+    axis (so it broadcasts over the batch), and on the way back that axis is kept,
+    yielding shape ``(B, *param.shape)`` rather than the batch-summed ``param.shape``.
+
+    The default (``keep_axes=()``) is exactly the historical behavior: every broadcast
+    axis is summed away, so nothing else regresses.
+    """
     grad = _xp().asarray(grad, dtype=current_dtype())
+    # Extra leading axes (rank grew under broadcasting) are summed unless kept: a kept
+    # leading axis is reshaped into ``shape`` below, preserving the per-example stack.
+    # An empty explicit ``keep_axes`` falls back to the backward-pass-global set (the
+    # per-example axis of a batched-cotangent backward); both empty is the historical
+    # path.
+    keep = set(keep_axes) or set(_KEEP_BATCH_AXES.get())
     while grad.ndim > len(shape):
+        if 0 in keep and grad.shape[0] != 1:
+            break
         grad = grad.sum(axis=0)
+    out_shape = list(shape)
     for axis, size in enumerate(shape):
         if size == 1 and grad.shape[axis] != 1:
+            if axis in keep:
+                out_shape[axis] = grad.shape[axis]  # keep the per-example axis
+                continue
             grad = grad.sum(axis=axis, keepdims=True)
-    return grad.reshape(shape)
+    return grad.reshape(out_shape)
 
 
 def _unwrap_weight(x: Operand) -> Var | ArrayLike:
@@ -261,7 +303,25 @@ class Var:
         return f"Var({self.value!r})"
 
     # -- reverse pass --------------------------------------------------------
-    def backward(self) -> None:
+    def backward(
+        self,
+        cotangent: Array | None = None,
+        keep_batch_axis: int | None = None,
+    ) -> None:
+        """Accumulate gradients into every ancestor leaf's ``.grad``.
+
+        With no arguments this is the ordinary reverse pass: seed ``self.grad`` with ones
+        and walk the tape. ``cotangent`` instead seeds ``self.grad`` with an explicit
+        (possibly *batched*) cotangent -- e.g. ``vmap(grad(f))`` seeds a per-example
+        cotangent over a batched output so each example's gradient flows independently.
+
+        ``keep_batch_axis`` marks an axis of that batched cotangent as the per-example
+        axis: it is threaded through every VJP closure's ``_unbroadcast`` (via the
+        ``_KEEP_BATCH_AXES`` contextvar) so a *shared* parameter -- one entering the
+        batched forward with a size-1 batch axis -- keeps that axis on the way back,
+        yielding a per-sample gradient of shape ``(B, *param.shape)`` instead of the
+        batch-summed ``param.shape``.
+        """
         topo: list[Var] = []
         visited = set()
 
@@ -277,9 +337,17 @@ class Var:
         xp = _xp()
         for v in topo:
             v.grad = xp.zeros_like(v.value)
-        self.grad = xp.ones_like(self.value)
-        for v in reversed(topo):
-            v._backward()
+        self.grad = xp.ones_like(self.value) if cotangent is None else cotangent
+        if keep_batch_axis is None:
+            for v in reversed(topo):
+                v._backward()
+            return
+        token = _KEEP_BATCH_AXES.set((keep_batch_axis,))
+        try:
+            for v in reversed(topo):
+                v._backward()
+        finally:
+            _KEEP_BATCH_AXES.reset(token)
 
 
 def _lift(x: Operand) -> Var:

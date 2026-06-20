@@ -150,6 +150,70 @@ def d_where(cond: Array, a: Operand, b: Operand) -> Var:
 
 
 # ---------------------------------------------------------------------------
+# Operator primitives.
+#
+# The Python operators (`+`, `-`, `*`, `/`, unary `-`, `**`, and the comparisons)
+# already build the tape via ``Var``'s dunders. These thin ``d_*`` wrappers give the
+# trace-level dispatcher (:mod:`pycograd.trace`) a *named primitive* per operator, so
+# ``bind(d_add, a, b)`` on base-level values is identical to ``a + b`` -- they simply
+# call the operator on the (lifted) operands, reusing ``Var``'s existing backward.
+# Registering them in ``_RULES`` with an empty tuple of numpy callables keeps them out
+# of ``_INTERCEPT`` (operators are not numpy functions to swap) while still listing them
+# as primitives, so ``_BATCH`` / ``_ABSTRACT`` can carry matching rules.
+# ---------------------------------------------------------------------------
+def d_add(a: Operand, b: Operand) -> Var:
+    return _lift(a) + b
+
+
+def d_sub(a: Operand, b: Operand) -> Var:
+    return _lift(a) - b
+
+
+def d_mul(a: Operand, b: Operand) -> Var:
+    return _lift(a) * b
+
+
+def d_div(a: Operand, b: Operand) -> Var:
+    return _lift(a) / b
+
+
+def d_neg(a: Operand) -> Var:
+    return -_lift(a)
+
+
+def d_pow(a: Operand, b: Operand) -> Var:
+    return _lift(a) ** b
+
+
+def d_lt(a: Operand, b: Operand) -> Array:
+    return _lift(a) < b
+
+
+def d_le(a: Operand, b: Operand) -> Array:
+    return _lift(a) <= b
+
+
+def d_gt(a: Operand, b: Operand) -> Array:
+    return _lift(a) > b
+
+
+def d_ge(a: Operand, b: Operand) -> Array:
+    return _lift(a) >= b
+
+
+def d_eq(a: Operand, b: Operand) -> Array:
+    return _lift(a) == b
+
+
+def d_ne(a: Operand, b: Operand) -> Array:
+    return _lift(a) != b
+
+
+def d_getitem(x: Operand, key: object) -> Var:
+    return _lift(x)[key]
+
+
+# ---------------------------------------------------------------------------
 # Linear algebra.
 # ---------------------------------------------------------------------------
 def _matmul_grads(a: Array, b: Array, g: Array) -> tuple[Array, Array]:
@@ -407,6 +471,23 @@ def d_dstack(seq: Sequence[Operand]) -> Var:
 # callable that should route to it (e.g. np.exp and math.exp share d_exp); the
 # flat lookup the tracer uses is denormalized from this below.
 _RULES: dict[Callable[..., object], tuple[object, ...]] = {
+    # operator primitives -- no numpy callable swaps to these (operators are not
+    # numpy functions), so their tuples are empty: they contribute no ``_INTERCEPT``
+    # key (coverage parity with the numpy-keyed tables is preserved) but are still
+    # listed as primitives so ``_BATCH`` / ``_ABSTRACT`` can register rules for them.
+    d_add: (),
+    d_sub: (),
+    d_mul: (),
+    d_div: (),
+    d_neg: (),
+    d_pow: (),
+    d_lt: (),
+    d_le: (),
+    d_gt: (),
+    d_ge: (),
+    d_eq: (),
+    d_ne: (),
+    d_getitem: (),
     # elementwise unary
     d_exp: (np.exp, math.exp),
     d_log: (np.log, math.log),

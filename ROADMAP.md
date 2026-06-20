@@ -128,19 +128,20 @@ it is gated by the foundation.
   research-high. Feasibility: medium-hard.
 - **Forward-mode / `jvp`.** Jacobians, some second-order methods. Crucial:
   medium. Feasibility: medium.
-- **`vmap` (auto-batching) / per-sample gradients.** *Largely landed*
-  (`pycograd/batching.py`): a `BatchedArray` materializes the batch axis on a `Var`
-  and a per-primitive batching-rule table (built from `ops._RULES`, like the abstract
-  backend) vectorizes the forward; because the batch axis is a real axis, the existing
-  tape differentiates it, so `grad(vmap(f))` and `per_example_grad` work for free.
-  Per-example *gather* on batched data (`vmap(lambda x, i: x[i])`) also works (it rides
-  `Var`'s scatter-add backward). The *remaining* hard part is exactly the ROADMAP's
-  original worry — simultaneously-live transforms (`vmap(vmap(f))`, per-sample grads of a
-  *shared* parameter, and gather from a *shared* table `vmap(lambda i: E[i])`) need a
-  trace-level interpreter stack (multiple live levels + per-value level tags, à la JAX);
-  they currently raise `NotImplementedError` (or, for the shared-table gather, need
-  subscript interception that the stack brings). That stack is the v2 increment (planned),
-  and the same machinery underlies the trace-and-compile work below.
+- **`vmap` (auto-batching) / per-sample gradients.** *Landed* — including the
+  composable v2. A trace-level interpreter stack (`pycograd/trace.py`: `bind` over a
+  stack of `Trace`/`Tracer` levels, fed by pyccolo's operator/subscript interception)
+  lets transforms be simultaneously live. So beyond single-level `vmap`/`grad(vmap(f))`,
+  these all now work: **`vmap(vmap(f))`** (a `BatchTracer` per level, batch axis
+  materialized and moved-to-front per level), **per-sample gradients of a *shared*
+  parameter** (`vmap(grad(f))` returns `(B, *w.shape)` via a batched-cotangent backward /
+  the shared param tiled per example), and **gather** both from batched data
+  (`vmap(lambda x, i: x[i])`) and from a *shared* table (`vmap(lambda i: E[i])`, riding
+  `Var`'s scatter-add backward). The same `bind`/`Trace` machinery is the substrate for
+  the trace-and-compile work below; the one piece deliberately left on the old path is
+  `ShapedArray`/`eval_shape` (it still rides the backend swap — reframing it as a
+  `Tracer` is a natural, separate follow-up). Forward-mode `jvp` + higher-order grad
+  (next bullet) would slot in as another `Trace` level.
 
 ### Phase 4 — Scale (the hard ceiling)
 
