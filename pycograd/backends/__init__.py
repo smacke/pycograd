@@ -90,7 +90,7 @@ class Backend:
 # The active backend the tracer reads, per execution context. ``None`` means "use the
 # default numpy backend" -- resolved lazily so merely importing pycograd never forces a
 # NumpyBackend construction before it is needed.
-_active: contextvars.ContextVar["Backend | None"] = contextvars.ContextVar(
+_active: contextvars.ContextVar[Backend | None] = contextvars.ContextVar(
     "pycograd_active_backend", default=None
 )
 
@@ -112,7 +112,7 @@ def activate(backend: Backend) -> Iterator[Backend]:
 
 
 @contextlib.contextmanager
-def device(name: "str | Backend") -> Iterator[Backend]:
+def device(name: str | Backend) -> Iterator[Backend]:
     """Run the enclosed tape on a named array backend (``"numpy"``, ``"cupy"``, ...).
 
     A thin, friendly wrapper over :func:`activate` / :func:`get_backend` for the device
@@ -139,7 +139,7 @@ def register_backend(name: str, factory: Callable[[], Backend]) -> None:
     _FACTORIES[name] = factory
 
 
-def get_backend(name: "str | Backend") -> Backend:
+def get_backend(name: str | Backend) -> Backend:
     """Resolve a backend name to its (cached) instance, constructing it on first use.
 
     Passing a :class:`Backend` returns it unchanged, so callers can accept either a

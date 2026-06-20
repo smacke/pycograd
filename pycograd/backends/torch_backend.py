@@ -26,12 +26,12 @@ from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
 
 
-def _torch_dtype(torch: "Any", np_dtype: "np.dtype") -> "Any":
+def _torch_dtype(torch: Any, np_dtype: np.dtype) -> Any:
     """The ``torch`` dtype matching a numpy dtype (names line up: float32, bfloat16, ...)."""
     return getattr(torch, np_dtype.name)
 
 
-def _as_torch(torch: "Any", x: "Any") -> "Any":
+def _as_torch(torch: Any, x: Any) -> Any:
     """Convert ``x`` to a torch tensor in the active working dtype (bf16 via float32)."""
     if isinstance(x, torch.Tensor):
         return x
@@ -42,7 +42,7 @@ def _as_torch(torch: "Any", x: "Any") -> "Any":
     return torch.as_tensor(np.asarray(x, dtype=dt))
 
 
-def _torch_to_numpy(torch: "Any", t: "Any") -> "Any":
+def _torch_to_numpy(torch: Any, t: Any) -> Any:
     """A torch tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
     if isinstance(t, torch.Tensor):
         t = t.detach().cpu()
@@ -54,7 +54,7 @@ def _torch_to_numpy(torch: "Any", t: "Any") -> "Any":
     return np.asarray(t)
 
 
-def _make_adapters(torch: "Any") -> dict:
+def _make_adapters(torch: Any) -> dict:
     """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set."""
 
     def as_t(x: Any) -> Any:

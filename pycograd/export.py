@@ -82,7 +82,7 @@ def to_torch_module(
 
 
 def export_torchscript(
-    module: object, example_inputs: Sequence[object], path: "str | None" = None
+    module: object, example_inputs: Sequence[object], path: str | None = None
 ) -> object:
     """Trace ``module`` (e.g. from :func:`to_torch_module`) to TorchScript.
 

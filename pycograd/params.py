@@ -86,7 +86,7 @@ class _Tied:
     def __call__(self, key: object, value: ArrayLike) -> Param:
         return Param(np.asarray(value, dtype=current_dtype()), tie=key)
 
-    def __getitem__(self, ref: object) -> "_TieRef":
+    def __getitem__(self, ref: object) -> _TieRef:
         return _TieRef(ref)
 
 

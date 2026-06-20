@@ -40,7 +40,7 @@ def _runner_for(f: Callable[..., object]) -> Callable[..., object]:
 
 
 def compile_to(
-    fn: Callable[..., object], backend: "str | Backend", *, dtype: object = None
+    fn: Callable[..., object], backend: str | Backend, *, dtype: object = None
 ) -> Callable[..., object]:
     """Return a forward callable running ``fn`` with ``backend`` as the swap target.
 
@@ -116,7 +116,7 @@ def _grad_for(slot: _Slot, grads: list, be: Backend) -> object:
 def value_and_grad(
     fn: Callable[..., object],
     *,
-    backend: "str | Backend" = "numpy",
+    backend: str | Backend = "numpy",
     dtype: object = None,
 ) -> Callable[..., tuple[object, tuple[PyTree, ...]]]:
     """Wrap ``fn`` so calling it returns ``(value, grads)`` computed on ``backend``.
@@ -172,7 +172,7 @@ def value_and_grad(
 def grad(
     fn: Callable[..., object],
     *,
-    backend: "str | Backend" = "numpy",
+    backend: str | Backend = "numpy",
     dtype: object = None,
 ) -> Callable[..., tuple[PyTree, ...]]:
     """Like :func:`value_and_grad` but returns only the gradient tuple."""

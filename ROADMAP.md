@@ -143,7 +143,12 @@ it is gated by the foundation.
 - **Graph capture + compilation / fusion.** Eliminate per-op Python overhead by
   tracing to a graph IR and compiling/fusing (XLA-style). This is a fundamentally
   different execution model from the eager tape and likely a separate engine.
-  Crucial: highest for throughput. Feasibility: **low** (research-grade).
+  Crucial: highest for throughput. Feasibility: **low** (research-grade). The
+  abstract-shape engine (`shapes.py`) is a down payment: its per-primitive
+  `abstract_eval` rules already size every node without data, and now carry
+  *symbolic* dims (`_dims.Dim`) for data-dependent shapes — so a capture tracer can
+  subclass `ShapedArray` and reuse the rules unchanged, with `vmap`'s batch axis as
+  one more dim in the same algebra.
 - **Distributed / multi-device.** Data / model / pipeline parallelism,
   collectives. Crucial: only for truly large scale. Feasibility: **very low**;
   pointless before the above.

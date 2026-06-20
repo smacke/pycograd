@@ -72,6 +72,7 @@ from pycograd.params import (
     tied,
 )
 from pycograd.shapes import (
+    Dim,
     ShapedArray,
     ShapeDtypeStruct,
     ShapeError,
@@ -125,6 +126,7 @@ __all__ = [
     "ShapeDtypeStruct",
     "ShapedArray",
     "ShapeError",
+    "Dim",
     # compile to other frameworks (torch / tf / jax)
     "compile_to",
     "get_backend",

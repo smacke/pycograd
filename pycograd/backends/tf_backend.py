@@ -26,7 +26,7 @@ from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
 
 
-def _as_tf(tf: "Any", x: "Any") -> "Any":
+def _as_tf(tf: Any, x: Any) -> Any:
     """Convert ``x`` to a tf tensor in the active working dtype (bf16 via float32)."""
     if tf.is_tensor(x) or isinstance(x, tf.Variable):
         return x
@@ -37,7 +37,7 @@ def _as_tf(tf: "Any", x: "Any") -> "Any":
     return tf.constant(np.asarray(x, dtype=dt))
 
 
-def _tf_to_numpy(tf: "Any", t: "Any") -> "Any":
+def _tf_to_numpy(tf: Any, t: Any) -> Any:
     """A tf tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
     if tf.is_tensor(t) or isinstance(t, tf.Variable):
         if t.dtype == tf.bfloat16:
@@ -48,7 +48,7 @@ def _tf_to_numpy(tf: "Any", t: "Any") -> "Any":
     return np.asarray(t)
 
 
-def _make_adapters(tf: "Any") -> dict:
+def _make_adapters(tf: Any) -> dict:
     def as_t(x: Any) -> Any:
         return _as_tf(tf, x)
 

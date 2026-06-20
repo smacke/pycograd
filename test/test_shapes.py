@@ -119,10 +119,81 @@ def test_abstract_matmul_error_matches_eager_message():
     assert str(eager.value) == str(abstract.value)
 
 
-def test_abstract_data_dependent_index_raises():
-    with pytest.raises(ShapeError) as ei:
-        eval_shape(lambda x: x[x > 0], SDS((10,)), method="abstract")
-    assert "depends on data" in str(ei.value)
+def test_abstract_boolean_mask_is_symbolic():
+    # A boolean mask is data-dependent: its length flows through as a symbolic Dim
+    # (was a ShapeError before symbolic dimensions existed).
+    from pycograd import Dim
+
+    out = eval_shape(lambda x: x[x > 0], SDS((10,)), method="abstract")
+    assert out.ndim == 1 and isinstance(out.shape[0], Dim)
+    assert repr(out) == "f64[n0]"
+
+
+def test_abstract_boolean_mask_keeps_trailing_axes():
+    from pycograd import Dim
+
+    out = eval_shape(lambda x: x[x[:, 0] > 0], SDS((10, 3)))
+    assert isinstance(out.shape[0], Dim) and out.shape[1:] == (3,)
+
+
+def test_abstract_mask_relationship_tracking():
+    # Two structurally identical masks share one symbol, so adding their selections
+    # broadcasts to that same symbol rather than a fresh one.
+    def f(x):
+        a = x[x > 0]
+        b = x[x > 0]
+        return {"a": a, "sum": a + b}
+
+    out = eval_shape(f, SDS((10,)))
+    assert out["a"].shape[0] == out["sum"].shape[0]
+
+
+def test_abstract_distinct_predicates_dont_merge():
+    # Soundness: different masks must NOT be claimed equal.
+    out = eval_shape(lambda x: {"gt": x[x > 0], "lt": x[x < 0]}, SDS((10,)))
+    assert out["gt"].shape[0] != out["lt"].shape[0]
+
+
+def test_abstract_symbol_names_restart_per_run():
+    a = eval_shape(lambda x: x[x > 0], SDS((10,)))
+    b = eval_shape(lambda x: x[x > 0], SDS((10,)))
+    assert repr(a) == repr(b) == "f64[n0]"
+
+
+def test_abstract_advanced_integer_index_is_determinable():
+    # An integer index array's result shape comes from the *key's* shape, not its
+    # values -- so it is exact, with no symbol.
+    out = eval_shape(lambda x, idx: x[idx], SDS((10, 3)), SDS((4,), np.intp))
+    assert out.shape == (4, 3)
+
+
+def test_abstract_advanced_index_after_slice():
+    out = eval_shape(lambda x, idx: x[:, idx], SDS((5, 6)), SDS((4,), np.intp))
+    assert out.shape == (5, 4)
+
+
+def test_abstract_advanced_non_contiguous_goes_to_front():
+    # Separated advanced indices put their broadcast block first (numpy semantics).
+    out = eval_shape(
+        lambda x, i, j: x[i, :, j],
+        SDS((5, 6, 7)),
+        SDS((4,), np.intp),
+        SDS((4,), np.intp),
+    )
+    assert out.shape == (4, 6)
+
+
+def test_abstract_symbolic_dim_flows_through_reshape():
+    from pycograd import Dim
+
+    out = eval_shape(lambda x: x[x > 0].reshape(-1, 1), SDS((12,)))
+    assert isinstance(out.shape[0], Dim) and out.shape[1] == 1
+
+
+def test_abstract_symbolic_contract_dim_does_not_raise():
+    # A matmul whose contract dim is symbolic can't be proven incompatible -> no error.
+    out = eval_shape(lambda x, w: x[x > 0] @ w, SDS((10,)), SDS((10, 4)))
+    assert out.shape == (4,)
 
 
 def test_abstract_static_index_ok():

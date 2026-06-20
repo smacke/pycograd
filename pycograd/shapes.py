@@ -10,22 +10,26 @@ and output, and friendlier shape-mismatch errors (:class:`ShapeError`).
 
 * ``method="abstract"`` (and ``"auto"``, the default) -- carry only ``(shape, dtype)``
   through :class:`ShapedArray` values via the abstract backend, with one shape rule per
-  primitive. Allocates nothing (so it sizes a 100000x100000 matmul instantly) and
-  raises a clear :class:`ShapeError` on *data-dependent* shapes (e.g. boolean-mask
-  indexing, whose size depends on values) rather than guessing.
+  primitive. Allocates nothing (so it sizes a 100000x100000 matmul instantly). A
+  *data-dependent* dimension (e.g. the length of a boolean-mask index, which depends on
+  values) flows through as a symbolic :class:`~pycograd._dims.Dim` rather than a guess
+  or an error -- so the inferred shape might read ``f64[n0]``.
 * ``method="dummy"`` -- run plain numpy on zero-filled **dummy** arrays and read the
   result's shape. Needs no tape and no tracer, but allocates and silently mis-sizes
   data-dependent shapes. It is the conformance oracle the abstract path is tested
-  against.
+  against for data-*independent* nets (it cannot model symbolic dims).
 """
 from __future__ import annotations
 
 import functools
+import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Sequence, cast
 
 import numpy as np
 
+from pycograd import _dims
+from pycograd._dims import Dim
 from pycograd._typing import Array
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import Var, _is_numeric
@@ -54,7 +58,33 @@ class ShapeError(ValueError):
     """
 
 
-def _shape_context(op_name: str, *shapes: "tuple[int, ...]") -> str:
+def _norm_dim(d: object) -> int | Dim:
+    """Normalize one dimension: symbolic :class:`Dim`s pass through, everything else
+    coerces to a plain ``int``."""
+    return d if isinstance(d, Dim) else int(cast(Any, d))
+
+
+# Provenance: a hashable fingerprint of how an abstract value was produced, used only
+# to dedupe data-dependent symbols (so identical ``x > 0`` masks share one symbol).
+_PROV_CTR = itertools.count()
+
+
+def _fresh_prov() -> tuple:
+    """A unique token -- the default provenance, so distinct values never merge."""
+    return ("fresh", next(_PROV_CTR))
+
+
+def _prov_of(x: object) -> object:
+    """The provenance of an operand: a value's own ``prov``; a structural tag for a
+    concrete constant; else a fresh token."""
+    if isinstance(x, ShapedArray):
+        return x.prov
+    if _is_numeric(x) and np.ndim(cast(Any, x)) == 0:
+        return ("const", type(x).__name__, x.item() if hasattr(x, "item") else x)
+    return _fresh_prov()
+
+
+def _shape_context(op_name: str, *shapes: tuple[int | Dim, ...]) -> str:
     joined = " and ".join(str(tuple(s)) for s in shapes)
     return f"{op_name}: incompatible shapes {joined}"
 
@@ -67,11 +97,12 @@ class ShapeDtypeStruct:
     """A shape + dtype with no data -- pass it to :func:`eval_shape`/:func:`summary`
     in place of a real array, the way ``jax.eval_shape`` takes ``ShapeDtypeStruct``.
 
-    ``shape`` is a tuple of ints; ``dtype`` defaults to float64 (pycograd's working
-    dtype). ``ndim``/``size`` mirror the numpy attributes so it reads like an array.
+    ``shape`` is a tuple of dims (ints, or a symbolic :class:`~pycograd._dims.Dim` for
+    a data-dependent size); ``dtype`` defaults to float64 (pycograd's working dtype).
+    ``ndim``/``size`` mirror the numpy attributes so it reads like an array.
     """
 
-    shape: tuple[int, ...]
+    shape: tuple[int | Dim, ...]
     dtype: np.dtype = np.dtype(np.float64)
 
     def __post_init__(self) -> None:
@@ -79,7 +110,7 @@ class ShapeDtypeStruct:
         shape = self.shape
         if isinstance(shape, int):
             shape = (shape,)
-        object.__setattr__(self, "shape", tuple(int(d) for d in shape))
+        object.__setattr__(self, "shape", tuple(_norm_dim(d) for d in shape))
         object.__setattr__(self, "dtype", np.dtype(self.dtype))
 
     @property
@@ -87,8 +118,8 @@ class ShapeDtypeStruct:
         return len(self.shape)
 
     @property
-    def size(self) -> int:
-        return int(np.prod(self.shape, dtype=np.int64))
+    def size(self) -> int | Dim:
+        return _dims.prod_dims(self.shape)
 
     def __repr__(self) -> str:
         tag = _DTYPE_TAG.get(self.dtype.name, self.dtype.name)
@@ -119,7 +150,7 @@ def _dummy(spec: ShapeDtypeStruct) -> Array:
     Only the *shape* matters downstream, so zeros are as good as anything and avoid
     NaNs from ``log(0)`` etc. derailing a forward we only run to read shapes from.
     """
-    return np.zeros(spec.shape, dtype=spec.dtype)
+    return np.zeros(cast("tuple[int, ...]", spec.shape), dtype=spec.dtype)
 
 
 def _dummy_leaf(leaf: Leaf) -> Leaf:
@@ -173,24 +204,35 @@ class ShapedArray:
     It is the value the :class:`~pycograd.backends.abstract_backend.AbstractBackend`
     computes on: operators and numpy calls on a ``ShapedArray`` produce another
     ``ShapedArray`` via the shape rules below, never touching real numbers. Unlike the
-    dummy-array path it allocates nothing, and it makes *data-dependent* shapes an
-    explicit error rather than a wrong guess.
+    dummy-array path it allocates nothing, and a *data-dependent* dimension (e.g. the
+    length of ``x[x > 0]``) flows through as a symbolic :class:`~pycograd._dims.Dim`
+    rather than a wrong guess.
 
     The read-only surface a model performs on a tensor is mirrored from
     :class:`~pycograd.tensor.Var`: ``.shape``/``.ndim``/``.size``/``.dtype`` are concrete
-    (so ``q.shape[-1] ** -0.5`` and ``rng.random(x.shape)`` work), only the *element
-    data* is abstract. ``__array_ufunc__ = None`` makes numpy defer ufuncs/operators to
-    our reflected methods, exactly as ``Var`` does.
+    (so ``q.shape[-1] ** -0.5`` and ``rng.random(x.shape)`` work) -- though a dim may be
+    a symbolic ``Dim`` -- only the *element data* is abstract. ``__array_ufunc__ = None``
+    makes numpy defer ufuncs/operators to our reflected methods, exactly as ``Var`` does.
+
+    ``prov`` is a hashable *provenance* fingerprint used only to recognize when two
+    data-dependent values are structurally the same (so two ``x > 0`` masks intern the
+    same symbol); a freshly-minted token by default, so distinct values never merge.
     """
 
-    __slots__ = ("shape", "dtype")
+    __slots__ = ("shape", "dtype", "prov")
     __array_ufunc__ = None
 
-    def __init__(self, shape: "tuple[int, ...]", dtype: object = np.float64) -> None:
+    def __init__(
+        self,
+        shape: tuple[int | Dim, ...] | int,
+        dtype: object = np.float64,
+        prov: object = None,
+    ) -> None:
         if isinstance(shape, int):
             shape = (shape,)
-        self.shape: tuple[int, ...] = tuple(int(d) for d in shape)
+        self.shape: tuple[int | Dim, ...] = tuple(_norm_dim(d) for d in shape)
         self.dtype: np.dtype = np.dtype(cast(Any, dtype))
+        self.prov: object = _fresh_prov() if prov is None else prov
 
     # -- concrete metadata (mirrors Var) -------------------------------------
     @property
@@ -198,44 +240,57 @@ class ShapedArray:
         return len(self.shape)
 
     @property
-    def size(self) -> int:
-        return int(np.prod(self.shape, dtype=np.int64))
+    def size(self) -> int | Dim:
+        return _dims.prod_dims(self.shape)
 
     @property
-    def T(self) -> "ShapedArray":
+    def T(self) -> ShapedArray:
         return abstract_transpose(self)
 
     # -- arithmetic: every elementwise op is a broadcast of operand shapes ----
-    def __add__(self, o: object) -> "ShapedArray":
+    def __add__(self, o: object) -> ShapedArray:
         return _ew_binary(self, o)
 
     __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
     __truediv__ = __rtruediv__ = __add__
 
-    def __pow__(self, p: object) -> "ShapedArray":
+    def __pow__(self, p: object) -> ShapedArray:
         return _ew_binary(self, p)
 
     __rpow__ = __pow__
 
-    def __neg__(self) -> "ShapedArray":
+    def __neg__(self) -> ShapedArray:
         return ShapedArray(self.shape, self.dtype)
 
-    def __abs__(self) -> "ShapedArray":
+    def __abs__(self) -> ShapedArray:
         return ShapedArray(self.shape, self.dtype)
 
-    def __matmul__(self, o: object) -> "ShapedArray":
+    def __matmul__(self, o: object) -> ShapedArray:
         return abstract_matmul(self, o)
 
-    def __rmatmul__(self, o: object) -> "ShapedArray":
+    def __rmatmul__(self, o: object) -> ShapedArray:
         return abstract_matmul(o, self)
 
     # -- comparisons return a boolean abstract mask (broadcast shape) ---------
-    def _cmp(self, o: object) -> "ShapedArray":
-        return ShapedArray(_broadcast_shape("compare", self, o), np.dtype(bool))
+    # The op tag enters ``prov`` so ``x > 0`` and ``x < 0`` get distinct fingerprints
+    # (a collision would unsoundly claim their masked lengths are equal).
+    def _cmp(self, o: object, op: str) -> ShapedArray:
+        prov = ("cmp", op, _prov_of(self), _prov_of(o))
+        return ShapedArray(_broadcast_shape("compare", self, o), np.dtype(bool), prov)
 
-    __lt__ = __le__ = __gt__ = __ge__ = _cmp
+    def __lt__(self, o: object) -> ShapedArray:
+        return self._cmp(o, "lt")
 
-    def __getitem__(self, key: object) -> "ShapedArray":
+    def __le__(self, o: object) -> ShapedArray:
+        return self._cmp(o, "le")
+
+    def __gt__(self, o: object) -> ShapedArray:
+        return self._cmp(o, "gt")
+
+    def __ge__(self, o: object) -> ShapedArray:
+        return self._cmp(o, "ge")
+
+    def __getitem__(self, key: object) -> ShapedArray:
         return abstract_getitem(self, key)
 
     # -- numpy-method surface (x.sum(...), x.reshape(...), ...) ---------------
@@ -262,10 +317,10 @@ def _aval(x: object) -> ShapedArray:
     return ShapedArray(arr.shape, arr.dtype)
 
 
-def _broadcast_shape(op: str, *operands: object) -> "tuple[int, ...]":
+def _broadcast_shape(op: str, *operands: object) -> tuple[int, ...]:
     shapes = [_aval(o).shape for o in operands]
     try:
-        return tuple(np.broadcast_shapes(*shapes))
+        return _dims.broadcast_shapes(*shapes)
     except ValueError as e:
         raise ShapeError(_shape_context(op, *shapes)) from e
 
@@ -306,21 +361,21 @@ def abstract_matmul(a: object, b: object) -> ShapedArray:
     if len(sa) == 0 or len(sb) == 0:
         raise ShapeError(_shape_context("matmul (needs >=1-D operands)", sa, sb))
     if len(sa) == 1 and len(sb) == 1:
-        if sa[0] != sb[0]:
+        if _dims.provably_unequal(sa[0], sb[0]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray((), dtype)
     if len(sa) == 1:  # (k,) @ (..., k, n) -> (..., n)
-        if sa[0] != sb[-2]:
+        if _dims.provably_unequal(sa[0], sb[-2]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray(tuple(sb[:-2]) + (sb[-1],), dtype)
     if len(sb) == 1:  # (..., m, k) @ (k,) -> (..., m)
-        if sa[-1] != sb[0]:
+        if _dims.provably_unequal(sa[-1], sb[0]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray(tuple(sa[:-1]), dtype)
-    if sa[-1] != sb[-2]:  # (..., m, k) @ (..., k, n) -> (..., m, n)
+    if _dims.provably_unequal(sa[-1], sb[-2]):  # (..., m, k) @ (..., k, n)
         raise ShapeError(_shape_context("matmul", sa, sb))
     try:
-        batch = tuple(np.broadcast_shapes(sa[:-2], sb[:-2]))
+        batch = _dims.broadcast_shapes(sa[:-2], sb[:-2])
     except ValueError as e:
         raise ShapeError(_shape_context("matmul (batch dims)", sa, sb)) from e
     return ShapedArray(batch + (sa[-2], sb[-1]), dtype)
@@ -331,6 +386,7 @@ def abstract_reduce(
 ) -> ShapedArray:
     a = _aval(x)
     shp = a.shape
+    new: tuple[int | Dim, ...]
     if axis is None:
         new = tuple(1 for _ in shp) if keepdims else ()
     else:
@@ -343,7 +399,7 @@ def abstract_reduce(
     return ShapedArray(new, a.dtype)
 
 
-def abstract_transpose(x: object, axes: "tuple[int, ...] | None" = None) -> ShapedArray:
+def abstract_transpose(x: object, axes: tuple[int, ...] | None = None) -> ShapedArray:
     a = _aval(x)
     if axes is None:
         return ShapedArray(tuple(reversed(a.shape)), a.dtype)
@@ -356,17 +412,21 @@ def abstract_reshape(x: object, *shape: object) -> ShapedArray:
     if isinstance(newshape, int):
         newshape = (newshape,)
     newshape = tuple(int(d) for d in cast(Sequence, newshape))
-    size = a.size
+    size = a.size  # int, or a Dim when the input has a symbolic dim
     if -1 in newshape:
         known = 1
         for d in newshape:
             if d != -1:
                 known *= d
-        if known == 0 or size % known != 0:
-            raise ShapeError(f"reshape: cannot reshape size {size} into {newshape}")
+        if isinstance(size, int):  # concrete: validate divisibility as before
+            if known == 0 or size % known != 0:
+                raise ShapeError(f"reshape: cannot reshape size {size} into {newshape}")
         newshape = tuple(size // known if d == -1 else d for d in newshape)
-    if int(np.prod(newshape)) != size:
-        raise ShapeError(f"reshape: cannot reshape size {size} into {newshape}")
+    # The total-size check only holds when nothing symbolic is involved; a symbolic
+    # size is trusted (it flowed in from a data-dependent dim).
+    if isinstance(size, int) and not _dims.has_symbol(newshape):
+        if int(np.prod(cast("tuple[int, ...]", newshape))) != size:
+            raise ShapeError(f"reshape: cannot reshape size {size} into {newshape}")
     return ShapedArray(newshape, a.dtype)
 
 
@@ -378,13 +438,15 @@ def abstract_expand_dims(x: object, axis: int) -> ShapedArray:
     return ShapedArray(tuple(shp), a.dtype)
 
 
-def abstract_concatenate(seq: "Sequence[object]", axis: int = 0) -> ShapedArray:
+def abstract_concatenate(seq: Sequence[object], axis: int = 0) -> ShapedArray:
     avals = [_aval(s) for s in seq]
     ndim = avals[0].ndim
     ax = axis % ndim
     out = list(avals[0].shape)
     for a in avals[1:]:
-        if a.ndim != ndim or any(d != out[i] for i, d in enumerate(a.shape) if i != ax):
+        if a.ndim != ndim or any(
+            _dims.provably_unequal(d, out[i]) for i, d in enumerate(a.shape) if i != ax
+        ):
             raise ShapeError(
                 _shape_context("concatenate", *(a.shape for a in avals))
                 + f" along axis {axis}"
@@ -393,7 +455,7 @@ def abstract_concatenate(seq: "Sequence[object]", axis: int = 0) -> ShapedArray:
     return ShapedArray(tuple(out), np.result_type(*[a.dtype for a in avals]))
 
 
-def abstract_stack(seq: "Sequence[object]", axis: int = 0) -> ShapedArray:
+def abstract_stack(seq: Sequence[object], axis: int = 0) -> ShapedArray:
     return abstract_concatenate([abstract_expand_dims(s, axis) for s in seq], axis=axis)
 
 
@@ -406,17 +468,17 @@ def _atleast_2d_row(x: object) -> ShapedArray:
     return a
 
 
-def abstract_vstack(seq: "Sequence[object]") -> ShapedArray:
+def abstract_vstack(seq: Sequence[object]) -> ShapedArray:
     return abstract_concatenate([_atleast_2d_row(s) for s in seq], axis=0)
 
 
-def abstract_hstack(seq: "Sequence[object]") -> ShapedArray:
+def abstract_hstack(seq: Sequence[object]) -> ShapedArray:
     avals = [_aval(s) for s in seq]
     axis = 0 if all(a.ndim <= 1 for a in avals) else 1
     return abstract_concatenate(avals, axis=axis)
 
 
-def abstract_column_stack(seq: "Sequence[object]") -> ShapedArray:
+def abstract_column_stack(seq: Sequence[object]) -> ShapedArray:
     parts: list[object] = []
     for s in seq:
         a = _aval(s)
@@ -435,35 +497,131 @@ def _atleast_3d_depth(x: object) -> ShapedArray:
     return a
 
 
-def abstract_dstack(seq: "Sequence[object]") -> ShapedArray:
+def abstract_dstack(seq: Sequence[object]) -> ShapedArray:
     return abstract_concatenate([_atleast_3d_depth(s) for s in seq], axis=2)
 
 
 def abstract_getitem(x: object, key: object) -> ShapedArray:
-    """Shape of ``x[key]`` for *static* indexing (int/slice/ellipsis/newaxis).
+    """Shape of ``x[key]`` for basic *and* array indexing.
 
-    A boolean mask or integer-array key makes the result size depend on data values,
-    which shape inference cannot determine -- raise a clear error pointing at a hint
-    (handled fully in a later phase). Static keys are resolved on a zero-stride view,
-    which costs no allocation.
+    Basic keys (int/slice/ellipsis/newaxis) over a concrete shape are resolved on a
+    zero-stride view (no allocation); over a symbolic shape they are resolved per-axis
+    via :func:`~pycograd._dims.slice_dim`. *Advanced* (array) keys split two ways:
+
+    * an **integer/array index** has a result shape determined by the *key's* shape
+      (not its values), so it is computed exactly -- e.g. ``x[idx]`` with ``idx`` of
+      shape ``(4,)`` and ``x`` of shape ``(10, 3)`` gives ``(4, 3)``;
+    * a **boolean mask** is genuinely *data-dependent* (its length is the count of
+      ``True``), so it contributes a symbolic :class:`~pycograd._dims.Dim`. Two
+      structurally identical masks (same provenance) share one symbol.
     """
     a = _aval(x)
     keys = key if isinstance(key, tuple) else (key,)
-    for k in keys:
-        # An array-valued key (a boolean mask or an integer index array) makes the
-        # output size depend on the data, not just the shape -- inference can't know it.
-        if isinstance(k, (ShapedArray, np.ndarray, list)):
-            kind = "boolean mask" if _is_bool_key(k) else "array index"
-            raise ShapeError(
-                f"indexing: result shape depends on data values ({kind}); "
-                "shape inference cannot determine it -- use a static int/slice index"
+    if not any(_is_advanced(k) for k in keys):
+        if not _dims.has_symbol(a.shape):
+            view = np.broadcast_to(
+                np.zeros((), a.dtype), cast("tuple[int, ...]", a.shape)
             )
-    view = np.broadcast_to(np.zeros((), a.dtype), a.shape)
-    return ShapedArray(view[cast(Any, key)].shape, a.dtype)
+            return ShapedArray(view[cast(Any, key)].shape, a.dtype)
+        return _basic_getitem(a, _expand_ellipsis(keys, a.ndim))
+    return _advanced_getitem(a, _expand_ellipsis(keys, a.ndim))
+
+
+def _is_advanced(k: object) -> bool:
+    """An array-valued key (boolean mask or integer index array / list)."""
+    return isinstance(k, (ShapedArray, np.ndarray, list))
 
 
 def _is_bool_key(k: object) -> bool:
     return isinstance(k, (np.ndarray, ShapedArray)) and k.dtype == np.dtype(bool)
+
+
+def _consumed(k: object) -> int:
+    """How many source axes a key element consumes (``newaxis`` adds, consumes none;
+    a k-D boolean mask consumes k axes; everything else consumes one)."""
+    if k is None:
+        return 0
+    if _is_bool_key(k):
+        return _aval(k).ndim
+    return 1
+
+
+def _expand_ellipsis(keys: tuple, ndim: int) -> tuple:
+    """Replace a single ``...`` with the full slices it stands for."""
+    if not any(k is Ellipsis for k in keys):
+        return keys
+    fill = ndim - sum(_consumed(k) for k in keys if k is not Ellipsis)
+    out: list = []
+    for k in keys:
+        if k is Ellipsis:
+            out.extend([slice(None)] * max(fill, 0))
+        else:
+            out.append(k)
+    return tuple(out)
+
+
+def _basic_getitem(a: ShapedArray, keys: tuple) -> ShapedArray:
+    """Per-axis basic indexing over a (possibly symbolic) shape: ``int`` drops an axis,
+    ``slice`` maps a dim via :func:`slice_dim`, ``newaxis`` inserts ``1``."""
+    out: list = []
+    axis = 0
+    for k in keys:
+        if k is None:
+            out.append(1)
+        elif isinstance(k, slice):
+            out.append(_dims.slice_dim(a.shape[axis], k))
+            axis += 1
+        else:  # an int drops its axis
+            axis += 1
+    out.extend(a.shape[axis:])  # trailing axes with no key are kept whole
+    return ShapedArray(tuple(out), a.dtype)
+
+
+def _advanced_getitem(a: ShapedArray, keys: tuple) -> ShapedArray:
+    """Array indexing. Integer/array keys broadcast to a single advanced block (placed
+    in-position when contiguous, else at the front, mirroring numpy); a boolean mask
+    contributes one symbolic count dimension."""
+    pieces: list = []  # ("basic", dim) for kept axes, or ("adv",) block markers
+    adv_shapes: list = []
+    axis = 0
+    for k in keys:
+        if k is None:
+            pieces.append(("basic", 1))
+        elif _is_bool_key(k):
+            kav = _aval(k)
+            adv_shapes.append((_dims.symbol(("nonzero", kav.prov)),))
+            pieces.append(("adv",))
+            axis += kav.ndim
+        elif _is_advanced(k):
+            adv_shapes.append(_aval(k).shape)
+            pieces.append(("adv",))
+            axis += 1
+        elif isinstance(k, slice):
+            pieces.append(("basic", _dims.slice_dim(a.shape[axis], k)))
+            axis += 1
+        else:  # int drops its axis
+            axis += 1
+    for rem in range(axis, a.ndim):
+        pieces.append(("basic", a.shape[rem]))
+
+    adv_shape = _dims.broadcast_shapes(*adv_shapes) if adv_shapes else ()
+    adv_at = [i for i, p in enumerate(pieces) if p[0] == "adv"]
+    contiguous = adv_at == list(range(adv_at[0], adv_at[0] + len(adv_at)))
+
+    out: list = []
+    if contiguous:
+        inserted = False
+        for p in pieces:
+            if p[0] == "adv":
+                if not inserted:
+                    out.extend(adv_shape)
+                    inserted = True
+            else:
+                out.append(p[1])
+    else:  # separated advanced indices -> their broadcast block leads the result
+        out.extend(adv_shape)
+        out.extend(p[1] for p in pieces if p[0] == "basic")
+    return ShapedArray(tuple(out), a.dtype)
 
 
 # The shape rules above form the ``abstract_eval(primitive, *avals) -> aval`` registry
@@ -471,15 +629,15 @@ def _is_bool_key(k: object) -> bool:
 # ``vmap``) would call to size each node without data. The seam to get there: a tracer
 # value subclasses ``ShapedArray`` with an extra graph-node field and reuses these exact
 # rules unchanged -- shape inference lives on the abstract value, and tracing adds only
-# graph recording on top. Data-dependent dims (today an error in ``abstract_getitem``)
-# would carry a symbolic placeholder instead; that symbolic-dimension algebra is the
-# natural next increment and deliberately not built yet (no model here exercises it).
+# graph recording on top. Data-dependent dims already carry a symbolic
+# :class:`~pycograd._dims.Dim` (see ``abstract_getitem``); the remaining increment is
+# the graph recording itself (and ``vmap``'s batch-axis algebra on top of these dims).
 
 
 # ---------------------------------------------------------------------------
 # The abstract interception table, keyed identically to ``ops._INTERCEPT``.
 # ---------------------------------------------------------------------------
-def _build_abstract_table() -> "dict[object, Callable[..., object]]":
+def _build_abstract_table() -> dict[object, Callable[..., object]]:
     """Map every numpy/math callable pycograd differentiates to its shape rule.
 
     Derived from ``ops._RULES`` so coverage is *identical* to ``ops._INTERCEPT`` by
@@ -532,7 +690,7 @@ def _build_abstract_table() -> "dict[object, Callable[..., object]]":
     return {fn: abs_for[prim] for prim, fns in ops._RULES.items() for fn in fns}
 
 
-_ABSTRACT: "dict[object, Callable[..., object]]" = _build_abstract_table()
+_ABSTRACT: dict[object, Callable[..., object]] = _build_abstract_table()
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +727,9 @@ def _eval_shape_abstract(fn: Callable[..., object], args: tuple[PyTree, ...]) ->
         )
         for leaves, treedef in (tree_flatten(a) for a in args)
     ]
-    with activate(get_backend("abstract")):
+    # ``naming_scope`` restarts symbolic-dim names at ``n0`` per call, so reprs are
+    # deterministic across independent inferences.
+    with _dims.naming_scope(), activate(get_backend("abstract")):
         out = runner(*call_args)
     return _to_specs(cast(PyTree, out))
 
@@ -639,7 +799,7 @@ class _ParamRow:
 
     @property
     def count(self) -> int:
-        return self.spec.size
+        return cast(int, self.spec.size)  # a parameter's shape is always concrete
 
 
 @dataclass
@@ -682,7 +842,7 @@ def summary(
     fn: Callable[..., object],
     params: PyTree,
     *example_input_shapes: object,
-    print_fn: "Callable[[str], None] | None" = print,
+    print_fn: Callable[[str], None] | None = print,
 ) -> Summary:
     """Tabulate ``params``' per-tensor shapes and counts, plus the shape ``fn`` returns.
 

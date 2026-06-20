@@ -24,7 +24,7 @@ from pycograd.ops import _INTERCEPT
 _NAME_OVERRIDE = {"atan": "arctan"}
 
 
-def _build_intercept(jnp: "Any") -> dict:
+def _build_intercept(jnp: Any) -> dict:
     """Map every numpy/math callable pycograd differentiates to its ``jnp`` twin."""
     table: dict = {}
     for fn in _INTERCEPT:
