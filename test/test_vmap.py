@@ -196,6 +196,47 @@ def test_per_example_grad_matches_loop():
 
 
 # ---------------------------------------------------------------------------
+# batched (per-example) gather: x[idx] where each example indexes its own data
+# ---------------------------------------------------------------------------
+def gather(x, idx):
+    return x[idx]
+
+
+def test_vmap_batched_gather_1d():
+    r = _rng()
+    X = r.standard_normal((4, 6))
+    IDX = r.integers(0, 6, size=(4, 3))
+    _check(gather, (X, IDX), in_axes=(0, 0))
+
+
+def test_vmap_batched_gather_rows():
+    r = _rng()
+    X = r.standard_normal((4, 5, 2))  # gather whole rows per example
+    IDX = r.integers(0, 5, size=(4, 3))
+    _check(gather, (X, IDX), in_axes=(0, 0))
+
+
+# Module-level so the differentiated function closes over globals only (pyccolo
+# re-instruments it from source, which doesn't preserve enclosing-function closures).
+_GIDX = _rng(7).integers(0, 6, size=(4, 3))
+
+
+def _gather_loss(x):
+    return np.sum(vmap(gather, in_axes=(0, 0))(x, _GIDX))
+
+
+def test_grad_through_batched_gather():
+    X = _rng().standard_normal((4, 6))
+    (g,) = grad(_gather_loss)(X)
+    # d/dx of summing gathered entries = count of how many times each (row, col) is picked
+    expected = np.zeros_like(X)
+    for i in range(4):
+        for j in _GIDX[i]:
+            expected[i, j] += 1.0
+    assert np.allclose(g, expected)
+
+
+# ---------------------------------------------------------------------------
 # documented v1 limits
 # ---------------------------------------------------------------------------
 def test_nested_vmap_not_supported():

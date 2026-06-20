@@ -21,7 +21,7 @@ from typing import Any, Callable, cast
 import numpy as np
 
 from pycograd import ops
-from pycograd.tensor import Var
+from pycograd.tensor import Var, _value
 
 
 class BatchedArray:
@@ -290,17 +290,37 @@ def batch_matmul(a: object, b: object) -> object:
 
 
 def batch_getitem(x: object, key: object) -> object:
+    keys = key if isinstance(key, tuple) else (key,)
+    if any(_is_batched(k) for k in keys):
+        return _batched_gather(x, keys)
+    # Static key (same across the batch).
     if not _is_batched(x):
         return _phys(x)[key]
-    if isinstance(key, BatchedArray) or (
-        isinstance(key, tuple) and any(isinstance(k, BatchedArray) for k in key)
-    ):
-        raise NotImplementedError(
-            "vmap: per-example (batched) index keys are not supported yet; "
-            "use a key that is the same across the batch"
-        )
-    keys = key if isinstance(key, tuple) else (key,)
     return BatchedArray(_phys(x)[(slice(None),) + keys])  # skip the batch axis
+
+
+def _batched_gather(x: object, keys: "tuple") -> object:
+    """``x[idx]`` with a per-example integer-array index. Indexes the first logical axis
+    of ``x`` with each example's own indices, via advanced indexing paired with an
+    ``arange`` over the batch; the gather rides ``Var.__getitem__`` so its scatter-add
+    backward (hence grad) comes for free."""
+    if len(keys) != 1:
+        raise NotImplementedError(
+            "vmap: a batched index is only supported as a single key (x[idx]), "
+            "not combined with other indices in a tuple"
+        )
+    idx = keys[0]
+    # Indices ride in as a Var, so they were coerced to the working float dtype; cast back
+    # to int (the round-trip is exact for index values).
+    idx_arr = np.asarray(cast(Any, _value(cast(Any, _phys(idx))))).astype(np.intp)
+    xv = _phys(x)
+    if not _is_batched(x):  # shared array, per-example indices -> one advanced index
+        return BatchedArray(xv[idx_arr])
+    # Batched x: pair an arange over the batch with the per-example indices so example i
+    # is gathered from row i only.
+    b = _phys_shape(xv)[0]
+    bidx = np.arange(b).reshape((b,) + (1,) * (idx_arr.ndim - 1))
+    return BatchedArray(xv[(bidx, idx_arr)])
 
 
 def _concat_like(name: str) -> Callable:

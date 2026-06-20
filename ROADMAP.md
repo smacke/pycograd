@@ -132,12 +132,15 @@ it is gated by the foundation.
   (`pycograd/batching.py`): a `BatchedArray` materializes the batch axis on a `Var`
   and a per-primitive batching-rule table (built from `ops._RULES`, like the abstract
   backend) vectorizes the forward; because the batch axis is a real axis, the existing
-  tape differentiates it, so `grad(vmap(f))` and `per_example_grad` work for free. The
-  *remaining* hard part is exactly the ROADMAP's original worry — simultaneously-live
-  transforms (`vmap(vmap(f))`, per-sample grads of a *shared* parameter, batched index
-  keys) need a trace-level interpreter stack (multiple live levels + per-value level
-  tags, à la JAX); they currently raise `NotImplementedError`. That stack is the v2
-  increment, and the same machinery underlies the trace-and-compile work below.
+  tape differentiates it, so `grad(vmap(f))` and `per_example_grad` work for free.
+  Per-example *gather* on batched data (`vmap(lambda x, i: x[i])`) also works (it rides
+  `Var`'s scatter-add backward). The *remaining* hard part is exactly the ROADMAP's
+  original worry — simultaneously-live transforms (`vmap(vmap(f))`, per-sample grads of a
+  *shared* parameter, and gather from a *shared* table `vmap(lambda i: E[i])`) need a
+  trace-level interpreter stack (multiple live levels + per-value level tags, à la JAX);
+  they currently raise `NotImplementedError` (or, for the shared-table gather, need
+  subscript interception that the stack brings). That stack is the v2 increment (planned),
+  and the same machinery underlies the trace-and-compile work below.
 
 ### Phase 4 — Scale (the hard ceiling)
 
