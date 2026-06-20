@@ -19,7 +19,7 @@ from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import Var, _is_array, _is_numeric, _lift, _value, _xp
-from pycograd.trace import Tracer, _get_stack, bind, new_main
+from pycograd.trace import ReverseTrace, Tracer, _get_stack, bind, new_main
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
     Leaf,
@@ -110,6 +110,14 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[object, Var]) -> tuple[Var | None, Lea
         if isinstance(primal, Var):
             return primal, leaf
         return None, leaf
+    if isinstance(leaf, Var):
+        # ``grad`` is running inside an enclosing ``grad`` (``grad(grad(f))``): the leaf is
+        # already a tape node on the outer ``grad``'s graph. Use it as both the tape node
+        # (its ``.grad`` is filled with a cotangent that is itself a level-connected
+        # ``Var`` chained back to it) and the call value, so the inner forward builds on
+        # top of the outer's graph and the outer ``grad`` can differentiate the inner
+        # gradient.
+        return leaf, leaf
     if _is_numeric(leaf):
         v = Var(cast(ArrayLike, leaf))
         return v, v
@@ -151,24 +159,34 @@ def value_and_grad(
             call_args.append(tree_unflatten(treedef, wrapped_leaves))
             per_arg.append((treedef, info))
 
-        out = runner(*call_args)
-        # Under a live higher trace level (``jvp(grad(f))``) the differentiable backward
-        # produces level-connected cotangents (``Var``/``Tracer``) on each leaf's ``.grad``;
-        # return those as-is so the enclosing transform keeps differentiating. At top level
-        # behave exactly as before: materialize the value and ``_match_arg`` the gradients.
+        # Is a differentiation context already enclosing this call? -- an outer ``jvp``
+        # (Phase 1: forward-over-reverse) or an outer ``grad``'s reverse marker (Phase 2:
+        # reverse-over-reverse). Measured *before* pushing this call's own marker, so a
+        # single top-level ``grad`` reads ``higher=False`` and behaves byte-for-byte. When
+        # enclosed, the backward runs differentiably (its cotangents are level-connected
+        # ``Var``s the enclosing transform can keep differentiating) and the leaf grads are
+        # returned as those ``Var``s rather than materialized arrays.
         higher = len(_get_stack()) > 1
-        if isinstance(out, Var):
-            root: Var = out
-        elif isinstance(out, Tracer) and isinstance(getattr(out, "primal", None), Var):
-            root = cast(Var, getattr(out, "primal"))
-        else:
-            root = cast(Var, None)
+        # Push a reverse marker so a *nested* ``grad`` (``grad(grad(f))``) detects it is
+        # enclosed; the marker carries no tracer, so dispatch is unchanged (see
+        # ``trace.ReverseTrace``). Forward and backward both run inside it.
+        with new_main(ReverseTrace):
+            out = runner(*call_args)
+            if isinstance(out, Var):
+                root: Var = out
+            elif isinstance(out, Tracer) and isinstance(
+                getattr(out, "primal", None), Var
+            ):
+                root = cast(Var, getattr(out, "primal"))
+            else:
+                root = cast(Var, None)
 
-        if root is not None:
-            root.backward()  # otherwise each leaf's grad stays at its init zeros
-            value: Array = out.value if isinstance(out, Var) else root.value
-        else:
-            value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
+            if root is not None:
+                # otherwise each leaf's grad stays at its init zeros
+                root.backward(differentiable=higher)
+                value: Array = out.value if isinstance(out, Var) else root.value
+            else:
+                value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
 
         def _grad_leaf(orig: Leaf, v: Var | None) -> object:
             if v is None:
@@ -746,6 +764,59 @@ def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
         out_shape = stacked.shape[1:]
         jac = np.moveaxis(stacked, 0, -1)
         return jac.reshape(out_shape + x_arr.shape)
+
+    return jacobian
+
+
+def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
+    """Reverse-mode Jacobian of ``f`` w.r.t. its ``argnum``-th argument.
+
+    Builds the Jacobian one *row* at a time: the gradient of each scalar output component
+    ``sum(f(x) * e_i)`` w.r.t. the input is that row of the Jacobian, computed by reverse
+    mode (:func:`grad`). The rows stack into the full ``(*out_shape, *in_shape)`` Jacobian
+    (for scalar output it is the single-row gradient, agreeing with :func:`grad` and
+    :func:`jacfwd`).
+
+    Composes with :func:`grad` for *reverse-over-reverse* Hessians: ``jacrev(grad(f))``
+    differentiates the gradient of ``f`` again -- each row's reverse pass runs while the
+    enclosing ``grad`` is live, so its inner backward records a cotangent graph the outer
+    backward differentiates. The result agrees with the forward-over-reverse
+    ``jacfwd(grad(f))`` Hessian.
+    """
+
+    def jacobian(*args: PyTree) -> object:
+        x = args[argnum]
+        flat, treedef = tree_flatten(x)
+        if len(flat) != 1 or not _is_numeric(flat[0]):
+            raise ValueError(
+                "jacrev: the differentiated argument must be a single array"
+            )
+        x_arr = np.asarray(_value(cast(Operand, flat[0])))
+        # Probe the output shape with a plain (untraced) call.
+        y0 = np.asarray(_value(cast(Operand, f(*args))))
+        out_shape = y0.shape
+        m = int(y0.size)
+        basis = np.eye(m, dtype=x_arr.dtype).reshape((m,) + out_shape)
+
+        def make_component(e: Array) -> Callable[..., object]:
+            # ``sum(f(x) * e_i)`` -- a scalar whose gradient is one Jacobian row. Tagged to
+            # run directly so the tracer keeps it (and its closure over ``f``/``e``) intact
+            # while still intercepting the ``np.*`` calls inside.
+            def component(xa: object) -> object:
+                replaced = tuple(
+                    tree_unflatten(treedef, [cast(Leaf, xa)]) if i == argnum else a
+                    for i, a in enumerate(args)
+                )
+                weighted = _lift(cast(Operand, f(*replaced))) * cast(Operand, e)
+                return ops.d_sum(weighted)
+
+            component._pycograd_run_directly = True  # type: ignore[attr-defined]
+            return component
+
+        rows = [np.asarray(grad(make_component(basis[i]))(x)[argnum]) for i in range(m)]
+        stacked = np.stack(rows, axis=0)  # (m, *in_shape)
+        jac = stacked.reshape(out_shape + x_arr.shape)
+        return jac
 
     return jacobian
 

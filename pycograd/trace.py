@@ -140,6 +140,41 @@ class EvalTrace(Trace):
 
 
 # ---------------------------------------------------------------------------
+# Reverse-mode marker level.
+#
+# ``value_and_grad`` pushes one of these around its forward+backward so that a *nested*
+# ``grad``/``value_and_grad`` can detect it is running inside an enclosing differentiation
+# context (``grad(grad(f))``): the inner call sees the stack is deeper than base and takes
+# the differentiable backward, building a cotangent graph the outer ``grad`` then walks.
+#
+# It is a pure depth marker: it carries no :class:`Tracer`, so :func:`find_top_trace`
+# never selects it and ``bind`` dispatch is completely unaffected (every operation still
+# lands on the base ``EvalTrace`` or whatever real transform level is live). The
+# fast/slow discriminators that must stay byte-for-byte for a single top-level ``grad``
+# (the tracer's ``np.*``-routing gate and ``jvp``'s top-level coercion) therefore count
+# *transform* levels via :func:`num_transform_levels`, which skips these markers.
+# ---------------------------------------------------------------------------
+class ReverseTrace(Trace):
+    """A do-nothing marker level pushed by ``value_and_grad`` (see module note above).
+
+    It exists only to raise ``len(_get_stack())`` for the duration of a reverse pass so a
+    nested ``grad`` knows it is enclosed. It never processes a primitive (no operand ever
+    carries it, so :func:`find_top_trace` skips it); the methods are present only to honor
+    the :class:`Trace` interface.
+    """
+
+    def pure(self, val: object) -> object:  # pragma: no cover - never selected
+        return val
+
+    lift = pure
+
+    def process_primitive(  # pragma: no cover - never selected
+        self, prim: Callable[..., object], args: Sequence[object], params: dict
+    ) -> object:
+        return prim(*args, **params)
+
+
+# ---------------------------------------------------------------------------
 # The stack.
 # ---------------------------------------------------------------------------
 _BASE_MAIN = MainTrace(0, EvalTrace)
@@ -151,6 +186,20 @@ trace_stack: contextvars.ContextVar[list[MainTrace]] = contextvars.ContextVar(
 
 def _get_stack() -> list[MainTrace]:
     return trace_stack.get()
+
+
+def num_transform_levels() -> int:
+    """How many *dispatch-affecting* transform levels are live above the base.
+
+    Counts every pushed level except the base ``EvalTrace`` and the
+    :class:`ReverseTrace` markers ``value_and_grad`` pushes. This is the discriminator for
+    behavior that must stay byte-for-byte under a single top-level ``grad`` (whose only
+    extra level is its own marker): a real ``vmap``/``jvp`` level is present iff this is
+    nonzero, while a bare reverse pass leaves it at zero.
+    """
+    return sum(
+        1 for m in _get_stack() if m.level > 0 and m.trace_type is not ReverseTrace
+    )
 
 
 @contextlib.contextmanager

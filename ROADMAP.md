@@ -123,11 +123,20 @@ it is gated by the foundation.
 
 ### Phase 3 — Advanced autodiff transforms
 
-- **Higher-order gradients.** Make `backward` itself differentiable
-  (`create_graph`) for Hessians, meta-learning, gradient penalties. Crucial:
-  research-high. Feasibility: medium-hard.
-- **Forward-mode / `jvp`.** Jacobians, some second-order methods. Crucial:
-  medium. Feasibility: medium.
+- **Higher-order gradients.** *Landed.* `Var.backward` has a differentiable path:
+  when an enclosing transform is live it accumulates cotangents as level-connected
+  `Var`s (a `_VJP_FOR` rule table riding `bind`) instead of mutating numpy `.grad`,
+  while a single top-level `grad`/training run keeps the original raw path byte-for-byte
+  (gated by `trace.num_transform_levels()`). This gives Hessians/HVPs via
+  forward-over-reverse (`jvp(grad(f))`, `jacfwd(grad(f))`) and literal reverse-over-reverse
+  (`grad` of a scalarized inner `grad`, `jacrev(grad(f))`) — reverse and forward Hessians
+  agree and match finite differences; gradient-penalty losses work. Cut for now:
+  `vmap`-composed higher-order (per-sample Hessians) — the differentiable `_unbroadcast`
+  and the `vmap(grad)` `_KEEP_BATCH_AXES` path share state. (`grad` requires scalar output,
+  as in JAX; `grad(grad(f))` on a non-scalar inner is ill-posed.)
+- **Forward-mode / `jvp`.** *Landed* (`pycograd/forward.py`): `jvp(f, primals, tangents)`
+  + `jacfwd` as a `JVPTrace` level riding `bind`; composes with `vmap` both ways and
+  with itself (`jvp(jvp(f))`, second-order forward).
 - **`vmap` (auto-batching) / per-sample gradients.** *Landed* — including the
   composable v2. A trace-level interpreter stack (`pycograd/trace.py`: `bind` over a
   stack of `Trace`/`Tracer` levels, fed by pyccolo's operator/subscript interception)

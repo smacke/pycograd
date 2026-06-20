@@ -89,6 +89,7 @@ from pycograd.transforms import (
     grad,
     gradient_descent,
     jacfwd,
+    jacrev,
     jvp,
     value_and_grad,
     vmap,
@@ -128,6 +129,7 @@ __all__ = [
     "vmap",
     "jvp",
     "jacfwd",
+    "jacrev",
     "gradient_descent",
     "sgd_update",
     # shape inference

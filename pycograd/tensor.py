@@ -401,6 +401,7 @@ class Var:
         self,
         cotangent: Array | None = None,
         keep_batch_axis: int | None = None,
+        differentiable: bool | None = None,
     ) -> None:
         """Accumulate gradients into every ancestor leaf's ``.grad``.
 
@@ -415,6 +416,18 @@ class Var:
         batched forward with a size-1 batch axis -- keeps that axis on the way back,
         yielding a per-sample gradient of shape ``(B, *param.shape)`` instead of the
         batch-summed ``param.shape``.
+
+        ``differentiable`` selects the *differentiable cotangent* pass (cotangents
+        accumulated as tape/level-connected ``Var``s, see :meth:`_backward_differentiable`)
+        rather than the raw-numpy ``.grad`` pass. ``value_and_grad`` passes ``True`` exactly
+        when an enclosing differentiation context is live -- an outer ``jvp``
+        (forward-over-reverse) or an outer ``grad`` (reverse-over-reverse, ``grad(grad)``)
+        -- so the enclosing transform can differentiate this gradient. ``None`` (a direct
+        ``.backward()`` call) falls back to "a real ``jvp``/``vmap`` transform level is
+        live", keeping the default safe. The raw pass is re-entrant: its toposort/visited
+        and zero/seed state are entirely local to this call, so an *outer* raw pass can
+        walk the cotangent ``Var`` graph an *inner* differentiable pass produced
+        (``grad(grad(f))`` materializes at the top via the outer raw pass).
         """
         topo: list[Var] = []
         visited = set()
@@ -428,15 +441,17 @@ class Var:
             topo.append(v)
 
         build(self)
-        # A higher trace level is live (``jvp(grad(f))`` / ``jacfwd(grad(f))``): run the
-        # *differentiable* cotangent path so the gradient graph is itself recorded on the
-        # enclosing level. The base-level fast path below is otherwise byte-for-byte
-        # unchanged. (``keep_batch_axis`` -- the ``vmap(grad)`` per-sample path -- shares
-        # state with the differentiable ``_unbroadcast`` and is explicitly out of scope, so
-        # it always takes the raw path.)
-        from pycograd.trace import _get_stack
+        # Differentiable path: an enclosing differentiation context wants the gradient
+        # computation *recorded* (on a ``jvp`` level for forward-over-reverse, or on the
+        # outer ``grad``'s ``Var`` tape for reverse-over-reverse). The raw-numpy path below
+        # is otherwise byte-for-byte unchanged. (``keep_batch_axis`` -- the ``vmap(grad)``
+        # per-sample path -- shares state with the differentiable ``_unbroadcast`` and is
+        # explicitly out of scope, so it always takes the raw path.)
+        if differentiable is None:
+            from pycograd.trace import num_transform_levels
 
-        if keep_batch_axis is None and len(_get_stack()) > 1:
+            differentiable = num_transform_levels() > 0
+        if keep_batch_axis is None and differentiable:
             self._backward_differentiable(topo, cotangent)
             return
         xp = _xp()

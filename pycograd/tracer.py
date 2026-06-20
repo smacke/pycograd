@@ -28,9 +28,9 @@ from pycograd.trace import (
     _BINOP_PRIM,
     _COMPARE_PRIM,
     _UNARYOP_PRIM,
-    _get_stack,
     _SubscriptProxy,
     bind,
+    num_transform_levels,
 )
 
 # Directories holding stdlib / installed packages -- functions defined here are
@@ -131,8 +131,10 @@ class AutodiffTracer(pyc.BaseTracer):
             # base, route the intercepted call through the trace-level stack so the top
             # level processes it -- this is what makes ``vmap`` (and nested ``vmap``)
             # vectorize ``np.*`` calls. With only the base level active, ``bind`` lands
-            # on ``EvalTrace`` and runs the primitive directly, identical to today.
-            if len(_get_stack()) > 1:
+            # on ``EvalTrace`` and runs the primitive directly, identical to today. A
+            # bare reverse pass (``grad``'s own ``ReverseTrace`` marker) is *not* such a
+            # level, so a single top-level ``grad`` stays on the direct path.
+            if num_transform_levels() > 0:
                 return functools.partial(bind, replacement)
             return replacement
         if _is_user_function(func):
