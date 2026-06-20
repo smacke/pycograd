@@ -164,3 +164,28 @@ def test_render_expressions():
         n = symbol("a")  # -> n0
         assert str(2 * n) == "2*n0"
         assert str(n + 1) == "n0 + 1"
+
+
+def test_named_symbol_renders_by_name_and_unifies():
+    b1 = symbol("B", name="B")
+    b2 = symbol("B", name="B")
+    assert str(b1) == "B"
+    assert b1 == b2  # same key -> same symbol regardless of scope
+    assert str(2 * b1 + 1) == "2*B + 1"
+
+
+def test_subs_and_symbol_keys():
+    b = symbol("B", name="B")
+    k = symbol("K", name="K")
+    assert (2 * b + 1).subs({"B": 4}) == 9
+    assert (b * k).subs({"K": 3}) == 3 * b
+    assert (b * k).symbol_keys() == {"B", "K"}
+    # unmapped symbols stay symbolic
+    assert isinstance((b + k).subs({"B": 2}), Dim)
+
+
+def test_as_symbol():
+    b = symbol("B", name="B")
+    assert b.as_symbol() == ("B", "B")
+    assert (2 * b).as_symbol() is None
+    assert (b + 1).as_symbol() is None

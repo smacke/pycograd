@@ -52,17 +52,18 @@ class _Atom:
 class Symbol(_Atom):
     """An atomic unknown dimension, identified by a hashable ``key``.
 
-    Two symbols are equal iff their keys are equal. The rendered ``name`` (``n0``,
-    ``n1``, ...) is cosmetic, assigned *at creation* from the active
-    :func:`naming_scope` (so reprs are deterministic and survive the scope exit);
-    equal keys created within one scope share a name.
+    Two symbols are equal iff their keys are equal. The rendered ``name`` is either an
+    explicit one (a caller-declared input dim like ``"B"``) or, for an internal symbol
+    (a mask count, a broadcast), a cosmetic ``n0``/``n1``/... assigned *at creation*
+    from the active :func:`naming_scope` (so reprs are deterministic and survive the
+    scope exit); equal keys created within one scope share a name.
     """
 
     __slots__ = ("key", "name")
 
-    def __init__(self, key: object) -> None:
+    def __init__(self, key: object, name: "str | None" = None) -> None:
         self.key = key
-        self.name = _name_of(key)
+        self.name = name if name is not None else _name_of(key)
 
     @property
     def sort_key(self) -> tuple:
@@ -243,6 +244,40 @@ class Dim:
     def __hash__(self) -> int:
         return self._hash
 
+    # -- substitution / inspection -------------------------------------------
+    def subs(self, mapping: "dict") -> int | Dim:
+        """Replace symbols whose ``key`` is in ``mapping`` with the mapped value (an
+        int or another dim) and re-evaluate the polynomial. Unmapped symbols stay."""
+        total: int | Dim = 0
+        for mono, coeff in self._poly.items():
+            term: int | Dim = coeff
+            for atom, power in mono:
+                v = _atom_subs(atom, mapping)
+                for _ in range(power):
+                    term = term * v
+            total = total + term
+        return total
+
+    def as_symbol(self) -> "tuple | None":
+        """``(key, name)`` if this dim is exactly one bare symbol, else ``None``."""
+        if len(self._poly) != 1:
+            return None
+        ((mono, coeff),) = self._poly.items()
+        if coeff != 1 or len(mono) != 1:
+            return None
+        ((atom, power),) = mono
+        if power != 1 or not isinstance(atom, Symbol):
+            return None
+        return (atom.key, atom.name)
+
+    def symbol_keys(self) -> set:
+        """The set of distinct symbol keys appearing anywhere in this expression."""
+        keys: set = set()
+        for mono in self._poly:
+            for atom, _ in mono:
+                _collect_keys(atom, keys)
+        return keys
+
     # -- rendering -----------------------------------------------------------
     def __str__(self) -> str:
         terms = [
@@ -255,6 +290,29 @@ class Dim:
 
 def _opaque_floordiv(num: object, den: object) -> int | Dim:
     return _make({((FloorDiv(num, den), 1),): 1})
+
+
+def _val_subs(x: object, mapping: dict) -> "int | Dim":
+    return x.subs(mapping) if isinstance(x, Dim) else cast("int | Dim", x)
+
+
+def _atom_subs(atom: _Atom, mapping: dict) -> "int | Dim":
+    if isinstance(atom, Symbol):
+        if atom.key in mapping:
+            return mapping[atom.key]
+        return symbol(atom.key, atom.name)
+    fd = cast(FloorDiv, atom)
+    return _val_subs(fd.num, mapping) // _val_subs(fd.den, mapping)
+
+
+def _collect_keys(atom: _Atom, keys: set) -> None:
+    if isinstance(atom, Symbol):
+        keys.add(atom.key)
+        return
+    fd = cast(FloorDiv, atom)
+    for v in (fd.num, fd.den):
+        if isinstance(v, Dim):
+            keys |= v.symbol_keys()
 
 
 def _term_sort_key(item: tuple) -> tuple:
@@ -276,9 +334,12 @@ def _fmt_term(mono: Monomial, c: int) -> str:
     return f"{c}*{body}"
 
 
-def symbol(key: object) -> Dim:
-    """A fresh symbolic dimension identified by the hashable ``key``."""
-    return Dim({((Symbol(key), 1),): 1})
+def symbol(key: object, name: "str | None" = None) -> Dim:
+    """A symbolic dimension identified by the hashable ``key`` (equal keys are the same
+    symbol). ``name`` overrides the rendered text -- used for caller-declared input
+    dims like ``symbol("B", name="B")``; internal symbols leave it ``None`` to get an
+    ``n0``/``n1`` name from the active :func:`naming_scope`."""
+    return Dim({((Symbol(key, name), 1),): 1})
 
 
 # ---------------------------------------------------------------------------

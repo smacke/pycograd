@@ -28,7 +28,7 @@ from typing import Any, Callable, Iterator, Sequence, cast
 
 import numpy as np
 
-from pycograd import _dims
+from pycograd import _constraints, _dims
 from pycograd._dims import Dim
 from pycograd._typing import Array
 from pycograd.params import Param, _TieRef
@@ -59,9 +59,14 @@ class ShapeError(ValueError):
 
 
 def _norm_dim(d: object) -> int | Dim:
-    """Normalize one dimension: symbolic :class:`Dim`s pass through, everything else
-    coerces to a plain ``int``."""
-    return d if isinstance(d, Dim) else int(cast(Any, d))
+    """Normalize one dimension: a symbolic :class:`Dim` passes through; a ``str`` names
+    a symbolic input dimension (``"B"`` -> the symbol ``B``, so same-named dims across
+    inputs are the same symbol); everything else coerces to a plain ``int``."""
+    if isinstance(d, Dim):
+        return d
+    if isinstance(d, str):
+        return _dims.symbol(d, name=d)
+    return int(cast(Any, d))
 
 
 # Provenance: a hashable fingerprint of how an abstract value was produced, used only
@@ -183,6 +188,28 @@ def _to_specs(out: PyTree) -> PyTree:
         cast(
             "list[Leaf]",
             [None if leaf is None else _spec_of(leaf) for leaf in leaves],
+        ),
+    )
+
+
+def _subs_spec(spec: ShapeDtypeStruct, mapping: dict) -> ShapeDtypeStruct:
+    shape = tuple(
+        d.subs(mapping) if isinstance(d, Dim) else d for d in spec.shape  # type: ignore[union-attr]
+    )
+    return ShapeDtypeStruct(shape, spec.dtype)
+
+
+def _substitute_specs(specs: PyTree, mapping: dict) -> PyTree:
+    """Apply a symbol-key -> value ``mapping`` to every ``ShapeDtypeStruct`` leaf."""
+    leaves, treedef = tree_flatten(specs)
+    return tree_unflatten(
+        treedef,
+        cast(
+            "list[Leaf]",
+            [
+                None if s is None else _subs_spec(cast(ShapeDtypeStruct, s), mapping)
+                for s in leaves
+            ],
         ),
     )
 
@@ -361,18 +388,18 @@ def abstract_matmul(a: object, b: object) -> ShapedArray:
     if len(sa) == 0 or len(sb) == 0:
         raise ShapeError(_shape_context("matmul (needs >=1-D operands)", sa, sb))
     if len(sa) == 1 and len(sb) == 1:
-        if _dims.provably_unequal(sa[0], sb[0]):
+        if not _constraints.register_eq(sa[0], sb[0]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray((), dtype)
     if len(sa) == 1:  # (k,) @ (..., k, n) -> (..., n)
-        if _dims.provably_unequal(sa[0], sb[-2]):
+        if not _constraints.register_eq(sa[0], sb[-2]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray(tuple(sb[:-2]) + (sb[-1],), dtype)
     if len(sb) == 1:  # (..., m, k) @ (k,) -> (..., m)
-        if _dims.provably_unequal(sa[-1], sb[0]):
+        if not _constraints.register_eq(sa[-1], sb[0]):
             raise ShapeError(_shape_context("matmul", sa, sb))
         return ShapedArray(tuple(sa[:-1]), dtype)
-    if _dims.provably_unequal(sa[-1], sb[-2]):  # (..., m, k) @ (..., k, n)
+    if not _constraints.register_eq(sa[-1], sb[-2]):  # (..., m, k) @ (..., k, n)
         raise ShapeError(_shape_context("matmul", sa, sb))
     try:
         batch = _dims.broadcast_shapes(sa[:-2], sb[:-2])
@@ -444,8 +471,10 @@ def abstract_concatenate(seq: Sequence[object], axis: int = 0) -> ShapedArray:
     ax = axis % ndim
     out = list(avals[0].shape)
     for a in avals[1:]:
-        if a.ndim != ndim or any(
-            _dims.provably_unequal(d, out[i]) for i, d in enumerate(a.shape) if i != ax
+        if a.ndim != ndim or not all(
+            _constraints.register_eq(d, out[i])
+            for i, d in enumerate(a.shape)
+            if i != ax
         ):
             raise ShapeError(
                 _shape_context("concatenate", *(a.shape for a in avals))
@@ -727,11 +756,18 @@ def _eval_shape_abstract(fn: Callable[..., object], args: tuple[PyTree, ...]) ->
         )
         for leaves, treedef in (tree_flatten(a) for a in args)
     ]
-    # ``naming_scope`` restarts symbolic-dim names at ``n0`` per call, so reprs are
-    # deterministic across independent inferences.
-    with _dims.naming_scope(), activate(get_backend("abstract")):
+    # ``naming_scope`` restarts symbolic-dim names at ``n0`` per call (deterministic
+    # reprs); ``constraint_scope`` records dim equalities so contractions can refine a
+    # pinned symbol or report a contradiction across operands.
+    with (
+        _dims.naming_scope(),
+        _constraints.constraint_scope() as env,
+        activate(get_backend("abstract")),
+    ):
         out = runner(*call_args)
-    return _to_specs(cast(PyTree, out))
+    specs = _to_specs(cast(PyTree, out))
+    mapping = env.mapping()
+    return _substitute_specs(specs, mapping) if mapping else specs
 
 
 def eval_shape(
@@ -773,6 +809,32 @@ def infer_shapes(fn: Callable[..., object], *example_args: PyTree) -> PyTree:
             [None if s is None else cast(ShapeDtypeStruct, s).shape for s in leaves],
         ),
     )
+
+
+def substitute(specs: PyTree, assignment: "dict[str, int]") -> PyTree:
+    """Plug concrete sizes into a *polymorphic* shape result.
+
+    ``specs`` is an :func:`eval_shape` output whose dims may be symbolic (declared via
+    string input dims, e.g. ``ShapeDtypeStruct(("B", 768))``); ``assignment`` maps a
+    symbol's name to an int. Every symbolic dim is re-evaluated, so e.g. ``f64[B,N]``
+    with ``{"B": 8, "N": 256}`` becomes ``f64[8,256]`` and ``f64[2*B]`` becomes
+    ``f64[16]``. Names not in ``assignment`` are left symbolic.
+    """
+    return _substitute_specs(specs, dict(assignment))
+
+
+def bind(
+    fn: Callable[..., object],
+    *example_args: PyTree,
+    sizes: "dict[str, int] | None" = None,
+) -> PyTree:
+    """Solve a polymorphic signature for a concrete call: infer ``fn``'s (possibly
+    symbolic) output shapes, then :func:`substitute` ``sizes`` into them. A size that
+    contradicts a constraint ``fn`` imposes (e.g. a matmul forcing two dims equal)
+    raises :class:`ShapeError`. With no symbolic inputs this is just :func:`eval_shape`.
+    """
+    specs = eval_shape(fn, *example_args)
+    return substitute(specs, sizes) if sizes else specs
 
 
 # ---------------------------------------------------------------------------

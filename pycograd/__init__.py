@@ -77,8 +77,10 @@ from pycograd.shapes import (
     ShapeDtypeStruct,
     ShapeError,
     Summary,
+    bind,
     eval_shape,
     infer_shapes,
+    substitute,
     summary,
 )
 from pycograd.tensor import Var, detach
@@ -121,6 +123,8 @@ __all__ = [
     # shape inference
     "eval_shape",
     "infer_shapes",
+    "substitute",
+    "bind",
     "summary",
     "Summary",
     "ShapeDtypeStruct",

@@ -12,13 +12,16 @@ import numpy as np
 import pytest
 
 from pycograd import (
+    Dim,
     ShapedArray,
     ShapeDtypeStruct,
     ShapeError,
     Var,
+    bind,
     eval_shape,
     frozen,
     infer_shapes,
+    substitute,
     summary,
 )
 from pycograd.examples import models as M
@@ -122,7 +125,6 @@ def test_abstract_matmul_error_matches_eager_message():
 def test_abstract_boolean_mask_is_symbolic():
     # A boolean mask is data-dependent: its length flows through as a symbolic Dim
     # (was a ShapeError before symbolic dimensions existed).
-    from pycograd import Dim
 
     out = eval_shape(lambda x: x[x > 0], SDS((10,)), method="abstract")
     assert out.ndim == 1 and isinstance(out.shape[0], Dim)
@@ -130,7 +132,6 @@ def test_abstract_boolean_mask_is_symbolic():
 
 
 def test_abstract_boolean_mask_keeps_trailing_axes():
-    from pycograd import Dim
 
     out = eval_shape(lambda x: x[x[:, 0] > 0], SDS((10, 3)))
     assert isinstance(out.shape[0], Dim) and out.shape[1:] == (3,)
@@ -184,7 +185,6 @@ def test_abstract_advanced_non_contiguous_goes_to_front():
 
 
 def test_abstract_symbolic_dim_flows_through_reshape():
-    from pycograd import Dim
 
     out = eval_shape(lambda x: x[x > 0].reshape(-1, 1), SDS((12,)))
     assert isinstance(out.shape[0], Dim) and out.shape[1] == 1
@@ -300,3 +300,66 @@ def test_shapedtypestruct_basics():
 def test_eval_shape_rejects_unknown_method():
     with pytest.raises(ValueError):
         eval_shape(lambda x: x, SDS((2,)), method="bogus")
+
+
+# ---------------------------------------------------------------------------
+# shape polymorphism (symbolic input dims + equality store + solve)
+# ---------------------------------------------------------------------------
+def test_polymorphic_matmul_flows_symbols():
+    out = eval_shape(lambda x, w: x @ w, SDS(("B", "K")), SDS(("K", "N")))
+    assert repr(out) == "f64[B,N]"
+    assert all(isinstance(d, Dim) for d in out.shape)
+
+
+def test_same_named_input_dims_unify():
+    # K appears on both operands by name, so the matmul is consistent and flows.
+    out = eval_shape(lambda x, w: x @ w, SDS(("B", "K")), SDS(("K", 4)))
+    assert repr(out) == "f64[B,4]"
+
+
+def test_contraction_pins_symbol_to_concrete():
+    # x:(B,K) @ w:(768,N) forces K == 768; since K appears in the returned x, it refines.
+    def h(x, w):
+        _ = x @ w
+        return x
+
+    out = eval_shape(h, SDS(("B", "K")), SDS((768, "N")))
+    assert repr(out) == "f64[B,768]"
+
+
+def test_substitute_solves_symbols():
+    out = eval_shape(lambda x, w: x @ w, SDS(("B", "K")), SDS(("K", "N")))
+    assert repr(substitute(out, {"B": 8, "N": 256})) == "f64[8,256]"
+    # an affine output dim evaluates too
+    cat = eval_shape(
+        lambda a, b: np.concatenate([a, b], axis=0), SDS(("B", 3)), SDS(("B", 3))
+    )
+    assert repr(cat) == "f64[2*B,3]"
+    assert repr(substitute(cat, {"B": 5})) == "f64[10,3]"
+
+
+def test_bind_concrete_and_mismatch():
+    def f(x, w):
+        return x @ w
+
+    assert repr(bind(f, SDS((8, 768)), SDS((768, 256)))) == "f64[8,256]"
+    with pytest.raises(ShapeError):
+        bind(f, SDS((8, 768)), SDS((512, 256)))
+
+
+def test_transitive_contradiction_on_concrete_call():
+    # x and y both contract with the shared w, so their inner dims must match; a
+    # concrete call with conflicting inner dims is caught (reduces to a per-op check).
+    def g(x, y, w):
+        return x @ w + y @ w
+
+    with pytest.raises(ShapeError):
+        eval_shape(g, SDS((4, 768)), SDS((4, 512)), SDS((768, 3)))
+
+
+def test_polymorphic_does_not_disturb_concrete_models():
+    # Symbols appear only when declared; the example models stay fully concrete.
+    out = eval_shape(
+        M.mlp_forward, SDS((5, 2)), SDS((2, 16)), SDS((16,)), SDS((16, 3)), SDS((3,))
+    )
+    assert out.shape == (5, 3)
