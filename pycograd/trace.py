@@ -13,11 +13,12 @@ exactly ``a + b``: the operator primitive (:mod:`pycograd.ops`) reuses ``Var``'s
 :class:`~pycograd.batching.BatchTrace` level per call (via :func:`new_main`), so
 ``vmap(vmap(f))`` runs two batch levels at once: :func:`find_top_trace` selects the
 outer one, its rules ``bind`` one level down, and the recursion bottoms out at
-``EvalTrace``. ``eval_shape``'s :class:`~pycograd.shapes.ShapedArray` is *not* a
-:class:`Tracer` -- it rides the active-backend swap rather than the stack -- so
-:func:`find_top_trace` ignores it and ``bind`` falls through to its own operator
-surface (its dunders), keeping the abstract path unchanged. (Reframing it onto the
-stack is the Phase-3 abstract-eval work.)
+``EvalTrace``. ``eval_shape``'s :class:`~pycograd.shapes.ShapedArray` is *also* a
+:class:`Tracer` now, at an :class:`~pycograd.shapes.AbstractTrace` level pushed by
+``eval_shape``: an operand routed through ``bind`` selects that level, whose
+``process_primitive`` runs the per-primitive shape rule. (A ``ShapedArray`` built
+outside a live ``eval_shape`` carries a level-0 sentinel trace, so it never out-ranks a
+real level and its standalone operator dunders -- which call the same rules -- work.)
 
 The pyccolo front-door (:mod:`pycograd.tracer`) routes intercepted operators here via
 :data:`_OP_PRIM` (ast op type -> primitive); intercepted ``np.*`` *calls* route here too
@@ -92,11 +93,12 @@ class Trace:
 class Tracer:
     """A value tagged with the stack level that is currently tracing it.
 
-    Phase 1 ships only the base level, so no concrete ``Tracer`` subclass exists yet
-    (``EvalTrace`` operates on raw arrays / ``Var``s, not ``Tracer``s). The base class
-    is the seam the Phase 2 ``BatchTracer`` / Phase 3 abstract tracer plug into:
-    :func:`find_top_trace` ranks operands by ``_trace.main.level`` and ``aval`` exposes
-    the value's shape/dtype.
+    ``EvalTrace`` operates on raw arrays / ``Var``s (not ``Tracer``s); the concrete
+    subclasses are :class:`~pycograd.batching.BatchTracer` (``vmap``),
+    :class:`~pycograd.forward.JVPTracer` (``jvp``), and
+    :class:`~pycograd.shapes.ShapedArray` (``eval_shape``'s abstract level). The base
+    class is the shared seam they plug into: :func:`find_top_trace` ranks operands by
+    ``_trace.main.level`` and ``aval`` exposes the value's shape/dtype.
     """
 
     _trace: Trace
@@ -239,11 +241,11 @@ def _iter_tracers(args: Sequence[object]) -> "list[Tracer]":
 def find_top_trace(args: Sequence[object]) -> Trace:
     """The highest-level interpreter among ``args`` (the base ``EvalTrace`` if none).
 
-    Only :class:`Tracer` operands carry a level; raw arrays / ``Var``s -- and the
-    not-yet-reframed ``ShapedArray`` (``eval_shape``) -- are level 0, so they leave the
-    base trace on top and ``bind`` evaluates (or, for ``ShapedArray``, falls through; see
-    :func:`bind`). Sequences are searched one level deep so a batched operand inside a
-    ``concatenate``/``stack`` list still selects its level.
+    Only :class:`Tracer` operands carry a level; raw arrays / ``Var``s are level 0, so
+    they leave the base trace on top and ``bind`` evaluates. A live ``ShapedArray`` (under
+    ``eval_shape``) is a ``Tracer`` at its :class:`~pycograd.shapes.AbstractTrace` level
+    and so selects that level here. Sequences are searched one level deep so a batched
+    operand inside a ``concatenate``/``stack`` list still selects its level.
     """
     top = _get_stack()[0]
     for a in _iter_tracers(args):
@@ -359,10 +361,11 @@ def _is_managed(val: object) -> bool:
     primitive: a :class:`~pycograd.tensor.Var`.
 
     Everything else with no :class:`Tracer` present -- plain numbers / arrays (plain
-    arithmetic), the abstract ``ShapedArray`` (its own dunders), and a compile backend's
-    foreign tensors -- must keep its *original* operator behavior, so for an operator
-    primitive ``bind`` falls through to the raw Python operator unless a ``Var`` is
-    present. (Imported lazily to keep ``trace`` import-light and dodge an import cycle.)
+    arithmetic) and a compile backend's foreign tensors -- must keep its *original*
+    operator behavior, so for an operator primitive ``bind`` falls through to the raw
+    Python operator unless a ``Var`` is present. (A live ``ShapedArray`` *is* a ``Tracer``,
+    so it is handled by its level, not here.) Imported lazily to keep ``trace``
+    import-light and dodge an import cycle.
     """
     from pycograd.tensor import Var
 
@@ -383,12 +386,12 @@ def bind(prim: Callable[..., object], *args: object, **params: Any) -> object:
     **Operator fall-through.** An *operator* primitive only builds the ``Var`` tape when
     a ``Var`` is actually present; with no :class:`Tracer` and no ``Var`` operand, routing
     through a ``d_*`` primitive would be wrong -- two plain numbers want plain arithmetic,
-    and the abstract ``ShapedArray`` (``eval_shape``) / a compile backend's foreign
-    tensors want their *own* dunders. So for an operator primitive (recognized by its
-    entry in :data:`_RAW_OPERATOR`) with no tracer and no managed operand, ``bind``
-    applies the raw Python operator. A :class:`Tracer` operand (e.g. a
-    :class:`~pycograd.batching.BatchTracer`) instead selects its level, which processes
-    the primitive.
+    and a compile backend's foreign tensors want their *own* dunders. So for an operator
+    primitive (recognized by its entry in :data:`_RAW_OPERATOR`) with no tracer and no
+    managed operand, ``bind`` applies the raw Python operator. A :class:`Tracer` operand
+    (a :class:`~pycograd.batching.BatchTracer`, a :class:`~pycograd.forward.JVPTracer`, or
+    an ``eval_shape`` :class:`~pycograd.shapes.ShapedArray`) instead selects its level,
+    which processes the primitive.
     """
     if (
         prim in _RAW_OPERATOR

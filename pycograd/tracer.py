@@ -164,9 +164,9 @@ class AutodiffTracer(pyc.BaseTracer):
     # original op and the op's AST node. For an op pycograd has a primitive for, we
     # return a callable that routes the operands through ``bind`` -- so a base-level
     # ``Var``/array runs the ``d_*`` primitive (identical to its dunder today), a
-    # ``BatchTracer`` selects its ``vmap`` level, and an unmanaged value (the abstract
-    # ``ShapedArray``) falls through to its own operator inside ``bind``. An op with no
-    # primitive (e.g. ``%``, ``&``) keeps the original callable, so it is untouched.
+    # ``BatchTracer`` selects its ``vmap`` level, and an ``eval_shape`` ``ShapedArray``
+    # selects its ``AbstractTrace`` level (its shape rule runs). An op with no primitive
+    # (e.g. ``%``, ``&``) keeps the original callable, so it is untouched.
     @pyc.register_handler(
         pyc.before_binop, when=lambda node: type(node.op) in _BINOP_PRIM
     )

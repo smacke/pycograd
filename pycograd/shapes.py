@@ -9,8 +9,10 @@ and output, and friendlier shape-mismatch errors (:class:`ShapeError`).
 :func:`eval_shape` runs ``fn`` for its shapes one of two ways:
 
 * ``method="abstract"`` (and ``"auto"``, the default) -- carry only ``(shape, dtype)``
-  through :class:`ShapedArray` values via the abstract backend, with one shape rule per
-  primitive. Allocates nothing (so it sizes a 100000x100000 matmul instantly). A
+  through :class:`ShapedArray` values on a dedicated :class:`AbstractTrace` level of the
+  trace-level stack, with one shape rule per primitive (dispatched via
+  :func:`~pycograd.trace.bind`). Allocates nothing (so it sizes a 100000x100000 matmul
+  instantly). A
   *data-dependent* dimension (e.g. the length of a boolean-mask index, which depends on
   values) flows through as a symbolic :class:`~pycograd._dims.Dim` rather than a guess
   or an error -- so the inferred shape might read ``f64[n0]``.
@@ -21,7 +23,6 @@ and output, and friendlier shape-mismatch errors (:class:`ShapeError`).
 """
 from __future__ import annotations
 
-import functools
 import itertools
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Sequence, cast
@@ -33,6 +34,7 @@ from pycograd._dims import Dim
 from pycograd._typing import Array
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import Var, _is_numeric
+from pycograd.trace import MainTrace, Trace, Tracer, new_main
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
 
 # A short numpy-dtype tag for ``__repr__`` ("f64", "i32", ...).
@@ -225,15 +227,24 @@ def _eval_shape_dummy(fn: Callable[..., object], args: tuple[PyTree, ...]) -> Py
 # ---------------------------------------------------------------------------
 # Abstract values (Tier B): shape + dtype, no data.
 # ---------------------------------------------------------------------------
-class ShapedArray:
-    """An abstract array -- a shape and dtype with no data behind them.
+class ShapedArray(Tracer):
+    """An abstract array -- a shape and dtype with no data behind them -- as a
+    :class:`~pycograd.trace.Tracer`.
 
-    It is the value the :class:`~pycograd.backends.abstract_backend.AbstractBackend`
-    computes on: operators and numpy calls on a ``ShapedArray`` produce another
-    ``ShapedArray`` via the shape rules below, never touching real numbers. Unlike the
-    dummy-array path it allocates nothing, and a *data-dependent* dimension (e.g. the
-    length of ``x[x > 0]``) flows through as a symbolic :class:`~pycograd._dims.Dim`
-    rather than a wrong guess.
+    It is the value an :class:`AbstractTrace` level computes on: operators and numpy
+    calls on a ``ShapedArray`` produce another ``ShapedArray`` via the shape rules below,
+    never touching real numbers. Unlike the dummy-array path it allocates nothing, and a
+    *data-dependent* dimension (e.g. the length of ``x[x > 0]``) flows through as a
+    symbolic :class:`~pycograd._dims.Dim` rather than a wrong guess.
+
+    Like :class:`~pycograd.batching.BatchTracer` / :class:`~pycograd.forward.JVPTracer`,
+    a ``ShapedArray`` is the :class:`Tracer` of its level: under :func:`eval_shape`'s
+    :class:`AbstractTrace` an operand routed through :func:`~pycograd.trace.bind` selects
+    that level, whose ``process_primitive`` runs the shape rule. A ``ShapedArray``
+    constructed *outside* a live level (e.g. ``ShapedArray((3, 4))`` directly, or one a
+    rule mints) is tagged with a sentinel level-0 trace, so its own operator dunders
+    (which call the same rules) still work standalone -- exactly the surface
+    ``test_shapedarray_metadata_is_concrete`` exercises.
 
     The read-only surface a model performs on a tensor is mirrored from
     :class:`~pycograd.tensor.Var`: ``.shape``/``.ndim``/``.size``/``.dtype`` are concrete
@@ -246,7 +257,7 @@ class ShapedArray:
     same symbol); a freshly-minted token by default, so distinct values never merge.
     """
 
-    __slots__ = ("shape", "dtype", "prov")
+    __slots__ = ("shape", "dtype", "prov", "_trace")
     __array_ufunc__ = None
 
     def __init__(
@@ -254,12 +265,22 @@ class ShapedArray:
         shape: tuple[int | Dim, ...] | int,
         dtype: object = np.float64,
         prov: object = None,
+        trace: "Trace | None" = None,
     ) -> None:
         if isinstance(shape, int):
             shape = (shape,)
         self.shape: tuple[int | Dim, ...] = tuple(_norm_dim(d) for d in shape)
         self.dtype: np.dtype = np.dtype(cast(Any, dtype))
         self.prov: object = _fresh_prov() if prov is None else prov
+        # A value not built under a live ``AbstractTrace`` (a bare ``ShapedArray(...)`` or
+        # one a rule mints) rides the sentinel level-0 trace, so it never out-ranks a real
+        # level in ``find_top_trace`` and its standalone dunders still work.
+        self._trace: Trace = _SENTINEL_ABSTRACT_TRACE if trace is None else trace
+
+    # -- Tracer interface ----------------------------------------------------
+    @property
+    def aval(self) -> "ShapeDtypeStruct":
+        return ShapeDtypeStruct(self.shape, self.dtype)
 
     # -- concrete metadata (mirrors Var) -------------------------------------
     @property
@@ -270,40 +291,50 @@ class ShapedArray:
     def size(self) -> int | Dim:
         return _dims.prod_dims(self.shape)
 
+    def _keep(self, result: ShapedArray) -> ShapedArray:
+        """Tag a rule's result with *this* value's trace so a ``ShapedArray`` minted by a
+        direct dunder / method call (``x.T``, ``x.sum()``, ``x[key]``) keeps flowing at the
+        live ``AbstractTrace`` level rather than dropping to the sentinel. For a standalone
+        ``ShapedArray`` this re-tags with the (level-0) sentinel -- a no-op."""
+        result._trace = self._trace
+        return result
+
     @property
     def T(self) -> ShapedArray:
-        return abstract_transpose(self)
+        return self._keep(abstract_transpose(self))
 
     # -- arithmetic: every elementwise op is a broadcast of operand shapes ----
     def __add__(self, o: object) -> ShapedArray:
-        return _ew_binary(self, o)
+        return self._keep(_ew_binary(self, o))
 
     __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
     __truediv__ = __rtruediv__ = __add__
 
     def __pow__(self, p: object) -> ShapedArray:
-        return _ew_binary(self, p)
+        return self._keep(_ew_binary(self, p))
 
     __rpow__ = __pow__
 
     def __neg__(self) -> ShapedArray:
-        return ShapedArray(self.shape, self.dtype)
+        return self._keep(ShapedArray(self.shape, self.dtype))
 
     def __abs__(self) -> ShapedArray:
-        return ShapedArray(self.shape, self.dtype)
+        return self._keep(ShapedArray(self.shape, self.dtype))
 
     def __matmul__(self, o: object) -> ShapedArray:
-        return abstract_matmul(self, o)
+        return self._keep(abstract_matmul(self, o))
 
     def __rmatmul__(self, o: object) -> ShapedArray:
-        return abstract_matmul(o, self)
+        return self._keep(abstract_matmul(o, self))
 
     # -- comparisons return a boolean abstract mask (broadcast shape) ---------
     # The op tag enters ``prov`` so ``x > 0`` and ``x < 0`` get distinct fingerprints
     # (a collision would unsoundly claim their masked lengths are equal).
     def _cmp(self, o: object, op: str) -> ShapedArray:
         prov = ("cmp", op, _prov_of(self), _prov_of(o))
-        return ShapedArray(_broadcast_shape("compare", self, o), np.dtype(bool), prov)
+        return self._keep(
+            ShapedArray(_broadcast_shape("compare", self, o), np.dtype(bool), prov)
+        )
 
     def __lt__(self, o: object) -> ShapedArray:
         return self._cmp(o, "lt")
@@ -318,7 +349,7 @@ class ShapedArray:
         return self._cmp(o, "ge")
 
     def __getitem__(self, key: object) -> ShapedArray:
-        return abstract_getitem(self, key)
+        return self._keep(abstract_getitem(self, key))
 
     # -- numpy-method surface (x.sum(...), x.reshape(...), ...) ---------------
     def __getattr__(self, name: str) -> object:
@@ -328,7 +359,12 @@ class ShapedArray:
         prim = _ABSTRACT.get(np_fn) if callable(np_fn) else None
         if prim is None:
             raise AttributeError(name)
-        return functools.partial(prim, self)
+
+        def _method(*a: object, **k: object) -> object:
+            out = prim(self, *a, **k)
+            return self._keep(out) if isinstance(out, ShapedArray) else out
+
+        return _method
 
     def __repr__(self) -> str:
         return f"ShapedArray({_spec_of(self)!r})"
@@ -372,6 +408,22 @@ def abstract_binary(a: object, b: object) -> ShapedArray:
     return _ew_binary(a, b)
 
 
+def _abstract_compare_for(op: str) -> Callable[..., ShapedArray]:
+    """A comparison shape rule for one op (``"lt"``/``"gt"``/...). Like
+    :meth:`ShapedArray._cmp`, it tags the boolean result with a dedup *provenance* built
+    from the op and the operands, so two structurally identical masks (``x > 0`` twice)
+    intern one symbolic length while distinct predicates (``x > 0`` vs ``x < 0``) do not.
+    Per-op so the op tag enters ``prov`` -- the same fingerprint the dunder produces."""
+
+    def rule(a: object, b: object) -> ShapedArray:
+        prov = ("cmp", op, _prov_of(a), _prov_of(b))
+        return ShapedArray(_broadcast_shape("compare", a, b), np.dtype(bool), prov)
+
+    return rule
+
+
+# Back-compat alias: a single bare comparison rule (no dedup provenance). Unused by the
+# trace level (which uses the per-op rules above) but kept for any direct caller.
 def abstract_compare(a: object, b: object) -> ShapedArray:
     return ShapedArray(_broadcast_shape("compare", a, b), np.dtype(bool))
 
@@ -663,14 +715,13 @@ def _advanced_getitem(a: ShapedArray, keys: tuple) -> ShapedArray:
     return ShapedArray(tuple(out), a.dtype)
 
 
-# The shape rules above form the ``abstract_eval(primitive, *avals) -> aval`` registry
-# that a future graph-capture tracer (cf. the ROADMAP's Phase 3/4 trace-and-compile and
-# ``vmap``) would call to size each node without data. The seam to get there: a tracer
-# value subclasses ``ShapedArray`` with an extra graph-node field and reuses these exact
-# rules unchanged -- shape inference lives on the abstract value, and tracing adds only
-# graph recording on top. Data-dependent dims already carry a symbolic
-# :class:`~pycograd._dims.Dim` (see ``abstract_getitem``); the remaining increment is
-# the graph recording itself (and ``vmap``'s batch-axis algebra on top of these dims).
+# The shape rules above form the ``abstract_eval(primitive, *avals) -> aval`` registry,
+# keyed by primitive in ``_ABS_FOR`` and consulted by ``AbstractTrace.process_primitive``
+# (so abstract evaluation rides the trace-level stack, exactly like ``vmap``/``jvp``). A
+# future graph-capture tracer (cf. the ROADMAP's trace-and-compile) would reuse this same
+# registry to size each node without data: ``ShapedArray`` already *is* the level's tracer,
+# so the remaining increment is graph recording on top. Data-dependent dims already carry
+# a symbolic :class:`~pycograd._dims.Dim` (see ``abstract_getitem``).
 
 
 # ---------------------------------------------------------------------------
@@ -715,12 +766,12 @@ def _build_abstract_table() -> (
             ops.d_div: abstract_binary,
             ops.d_neg: abstract_unary,
             ops.d_pow: abstract_binary,
-            ops.d_lt: abstract_compare,
-            ops.d_le: abstract_compare,
-            ops.d_gt: abstract_compare,
-            ops.d_ge: abstract_compare,
-            ops.d_eq: abstract_compare,
-            ops.d_ne: abstract_compare,
+            ops.d_lt: _abstract_compare_for("lt"),
+            ops.d_le: _abstract_compare_for("le"),
+            ops.d_gt: _abstract_compare_for("gt"),
+            ops.d_ge: _abstract_compare_for("ge"),
+            ops.d_eq: _abstract_compare_for("eq"),
+            ops.d_ne: _abstract_compare_for("ne"),
             ops.d_getitem: abstract_getitem,
             ops.d_maximum: abstract_binary,
             ops.d_minimum: abstract_binary,
@@ -750,34 +801,88 @@ def _build_abstract_table() -> (
 
 
 # ``_ABSTRACT`` is keyed by numpy callable (parity with ``ops._INTERCEPT``); ``_ABS_FOR``
-# is keyed by *primitive* (incl. the operator primitives, which have no numpy callable)
-# for a future by-primitive ``bind`` to consult.
+# is keyed by *primitive* (incl. the operator primitives, which have no numpy callable),
+# which is what ``AbstractTrace.process_primitive`` consults via ``bind``.
 _ABSTRACT: dict[object, Callable[..., object]]
 _ABS_FOR: dict[object, Callable[..., object]]
 _ABSTRACT, _ABS_FOR = _build_abstract_table()
 
 
 # ---------------------------------------------------------------------------
+# AbstractTrace: the abstract-eval level on the trace-level stack.
+#
+# Reframes shape inference as one level of the interpreter stack
+# (:mod:`pycograd.trace`), exactly like ``vmap``'s :class:`~pycograd.batching.BatchTrace`
+# and ``jvp``'s :class:`~pycograd.forward.JVPTrace`. ``eval_shape`` pushes one of these
+# via ``new_main`` and seeds the function's array/Var inputs as :class:`ShapedArray`
+# tracers; every operator / ``np.*`` call routes through ``bind``, which selects this
+# level and lets ``process_primitive`` run the per-primitive shape rule in ``_ABS_FOR``.
+# Nothing about the rules changes -- only how they are dispatched.
+# ---------------------------------------------------------------------------
+class AbstractTrace(Trace):
+    """One abstract-eval level: process each primitive by its shape rule, carrying only
+    ``(shape, dtype)`` through :class:`ShapedArray` values (no data)."""
+
+    def pure(self, val: object) -> ShapedArray:
+        return self._tag(_aval(val))
+
+    # A value from a lower level enters this level as its abstract shape/dtype.
+    lift = pure
+
+    def process_primitive(
+        self, prim: Callable[..., object], args: Sequence[object], params: dict
+    ) -> object:
+        rule = _ABS_FOR.get(prim)
+        if rule is None:  # pragma: no cover - every primitive in ``ops._RULES`` has one
+            raise NotImplementedError(
+                f"eval_shape: no shape rule for {getattr(prim, '__name__', prim)!r}"
+            )
+        return self._tag(rule(*args, **params))
+
+    def _tag(self, val: object) -> ShapedArray:
+        """Re-tag a rule's result (a sentinel-level ``ShapedArray``) with this level, so it
+        out-ranks lower levels in ``find_top_trace`` and keeps flowing through ``bind``.
+        The rule's symbolic dims / ``prov`` are preserved unchanged."""
+        if isinstance(val, ShapedArray):
+            val._trace = self
+            return val
+        a = _aval(val)
+        a._trace = self
+        return a
+
+
+# A sentinel level-0 ``AbstractTrace`` carried by any ``ShapedArray`` built outside a
+# live ``eval_shape`` (a bare ``ShapedArray(...)`` or one a rule mints). Level 0 means it
+# never out-ranks a real pushed level, so it leaves dispatch unaffected; it only exists so
+# a standalone ``ShapedArray``'s operator dunders (which call the rules directly) work.
+_SENTINEL_ABSTRACT_TRACE: Trace = AbstractTrace(MainTrace(0, AbstractTrace))
+
+
+# ---------------------------------------------------------------------------
 # Abstract inference driver.
 # ---------------------------------------------------------------------------
-def _abstract_leaf(leaf: Leaf) -> object:
+def _abstract_leaf(leaf: Leaf, trace: Trace) -> object:
+    """Seed one argument leaf as a :class:`ShapedArray` tracer at ``trace``'s level.
+
+    A ``ShapeDtypeStruct``/``Var``/``Param``/number becomes a same-shaped abstract value
+    tagged with the live ``AbstractTrace`` (so it selects that level through ``bind``);
+    anything else (a ``bool`` flag, ``None``, a string) passes through untouched."""
     if isinstance(leaf, _TieRef):
         raise ValueError(
             "eval_shape: tied[...] is only meaningful inside params(...); it reached "
             "shape inference unresolved"
         )
     if isinstance(leaf, ShapeDtypeStruct):
-        return ShapedArray(leaf.shape, leaf.dtype)
+        return ShapedArray(leaf.shape, leaf.dtype, trace=trace)
     if isinstance(leaf, (Var, Param)) or _is_numeric(leaf):
         spec = _spec_of(leaf)
-        return ShapedArray(spec.shape, spec.dtype)
+        return ShapedArray(spec.shape, spec.dtype, trace=trace)
     return leaf
 
 
 def _eval_shape_abstract(fn: Callable[..., object], args: tuple[PyTree, ...]) -> PyTree:
     # Deferred so importing this module (and ``pycograd``) stays light: the tracer
-    # pulls in pyccolo, and the abstract backend is only needed when actually used.
-    from pycograd.backends import activate, get_backend
+    # pulls in pyccolo, only needed when shape inference actually runs.
     from pycograd.tracer import _INSTRUMENTED, _make_runner
 
     runner = _INSTRUMENTED.get(fn)
@@ -785,22 +890,25 @@ def _eval_shape_abstract(fn: Callable[..., object], args: tuple[PyTree, ...]) ->
         runner = _make_runner(fn)
         _INSTRUMENTED[fn] = runner
 
-    call_args = [
-        tree_unflatten(
-            treedef, cast("list[Leaf]", [_abstract_leaf(leaf) for leaf in leaves])
-        )
-        for leaves, treedef in (tree_flatten(a) for a in args)
-    ]
     # ``naming_scope`` restarts symbolic-dim names at ``n0`` per call (deterministic
     # reprs); ``constraint_scope`` records dim equalities so contractions can refine a
-    # pinned symbol or report a contradiction across operands.
+    # pinned symbol or report a contradiction across operands; ``new_main`` pushes the
+    # abstract-eval level so the function's ops route through ``bind`` to its shape rules.
     with (
         _dims.naming_scope(),
         _constraints.constraint_scope() as env,
-        activate(get_backend("abstract")),
+        new_main(AbstractTrace) as main,
     ):
+        trace = AbstractTrace(main)
+        call_args = [
+            tree_unflatten(
+                treedef,
+                cast("list[Leaf]", [_abstract_leaf(leaf, trace) for leaf in leaves]),
+            )
+            for leaves, treedef in (tree_flatten(a) for a in args)
+        ]
         out = runner(*call_args)
-    specs = _to_specs(cast(PyTree, out))
+        specs = _to_specs(cast(PyTree, out))
     mapping = env.mapping()
     return _substitute_specs(specs, mapping) if mapping else specs
 
