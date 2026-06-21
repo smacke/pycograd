@@ -9,12 +9,12 @@ the graph.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, cast
+from typing import Any, Callable, Hashable, cast
 
 import numpy as np
 
 from pycograd import ops
-from pycograd._typing import Array, ArrayLike, Operand
+from pycograd._typing import Array, ArrayLike, Boxed, Operand
 from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
@@ -74,7 +74,7 @@ def _check_param_ownership(args: tuple[PyTree, ...]) -> None:
             val_owner.setdefault(id(leaf.value), leaf)
 
 
-def _wrap_leaf(leaf: Leaf, tie_vars: dict[object, Var]) -> tuple[Var | None, Leaf]:
+def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, Leaf]:
     """Lift one argument leaf onto the tape.
 
     Returns ``(var, call_value)``: ``var`` is the tape node whose ``.grad`` becomes
@@ -125,7 +125,7 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[object, Var]) -> tuple[Var | None, Lea
 
 
 def value_and_grad(
-    f: Callable[..., object],
+    f: Callable[..., PyTree],
 ) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]:
     """Wrap ``f`` so that calling it returns ``(value, grads)``.
 
@@ -147,7 +147,7 @@ def value_and_grad(
         call_args: list[PyTree] = []
         per_arg: list[tuple[TreeDef, list[tuple[Leaf, Var | None]]]] = []
         _check_param_ownership(args)
-        tie_vars: dict[object, Var] = {}
+        tie_vars: dict[Hashable, Var] = {}
         for a in args:
             leaves, treedef = tree_flatten(a)
             info: list[tuple[Leaf, Var | None]] = []
@@ -201,7 +201,7 @@ def value_and_grad(
             else:
                 value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
 
-        def _grad_leaf(orig: Leaf, v: Var | None) -> object:
+        def _grad_leaf(orig: Leaf, v: Var | None) -> Operand | None:
             if v is None:
                 return None
             return v.grad if higher else _match_arg(orig, v.grad)
@@ -230,7 +230,7 @@ def _match_arg(orig: Leaf, grad: Array) -> Operand:
     return grad if _is_array(value) else float(grad)
 
 
-def grad(f: Callable[..., object]) -> Callable[..., tuple[PyTree, ...]]:
+def grad(f: Callable[..., PyTree]) -> Callable[..., tuple[PyTree, ...]]:
     """Return a function computing just the gradient tuple of ``f`` (one entry per
     argument; each matches that argument's pytree structure)."""
     vg = value_and_grad(f)
@@ -301,8 +301,10 @@ def _finish_vmap_leaf(
 
 
 def vmap(
-    f: Callable[..., object], in_axes: object = 0, out_axes: int = 0
-) -> Callable[..., object]:
+    f: Callable[..., PyTree],
+    in_axes: int | None | tuple[int | None, ...] = 0,
+    out_axes: int = 0,
+) -> Callable[..., PyTree]:
     """Vectorize ``f`` over a batch axis: ``vmap(f)(xs)`` applies ``f`` to each slice of
     ``xs`` along ``in_axes`` and stacks the results along ``out_axes`` -- but vectorized
     (one batched pass), not looped.
@@ -343,7 +345,7 @@ def vmap(
         runner = _make_runner(f)
         _INSTRUMENTED[f] = runner
 
-    def wrapped(*args: PyTree) -> object:
+    def wrapped(*args: PyTree) -> PyTree:
         axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * len(args)
         with new_main(BatchTrace) as main:
             trace = BatchTrace(main)
@@ -351,7 +353,7 @@ def vmap(
             call_args: list[PyTree] = []
             batch = -1
             nested = False
-            for a, ax in zip(args, cast("tuple", axes)):
+            for a, ax in zip(args, axes):
                 leaves, treedef = tree_flatten(a)
                 new_leaves: list[Leaf] = []
                 for leaf in leaves:
@@ -415,7 +417,7 @@ class _BatchTracerLater:
         self.bdim = bdim
 
 
-def _mapped_batch_size(args: tuple[PyTree, ...], axes: tuple) -> int:
+def _mapped_batch_size(args: tuple[PyTree, ...], axes: tuple[int | None, ...]) -> int:
     """The batch size, read from the first *mapped* (``ax`` is an int) numeric leaf."""
     for a, ax in zip(args, axes):
         if ax is None:
@@ -428,8 +430,8 @@ def _mapped_batch_size(args: tuple[PyTree, ...], axes: tuple) -> int:
 
 
 def _grad_leaf(
-    leaf: Leaf, ax: object, batch: int, tie_vars: dict[object, Var]
-) -> tuple[Var | None, object, bool]:
+    leaf: Leaf, ax: int | None, batch: int, tie_vars: dict[Hashable, Var]
+) -> "tuple[Var | None, _BatchTracerLater | Leaf, bool]":
     """Lift one ``vmap(grad(f))`` argument leaf onto the tape *and* into the batch level.
 
     Returns ``(var, tracer_later, batched)``: ``var`` is the tape node whose ``.grad`` is
@@ -458,7 +460,7 @@ def _grad_leaf(
     return mapped, _BatchTracerLater(mapped, 0), True
 
 
-def _finish_grad_leaf(g: Array, batched: bool, ax: object) -> Operand:
+def _finish_grad_leaf(g: Array, batched: bool, ax: int | None) -> Operand:
     """One per-sample gradient leaf. A *mapped* leaf's per-example gradient is at axis 0;
     move it back to that argument's ``in_axes`` position. A *shared* leaf's gradient is
     already ``(B, *param.shape)`` (the per-sample stack); return it as-is."""
@@ -469,8 +471,10 @@ def _finish_grad_leaf(g: Array, batched: bool, ax: object) -> Operand:
 
 
 def _vmap_of_grad(
-    f: Callable[..., object], in_axes: object, return_value: bool
-) -> Callable[..., object]:
+    f: Callable[..., PyTree],
+    in_axes: int | None | tuple[int | None, ...],
+    return_value: bool,
+) -> Callable[..., PyTree]:
     """``vmap(grad(f))`` / ``vmap(value_and_grad(f))``: per-sample gradients in one pass.
 
     A single batched forward computes the per-example output; one *batched-cotangent*
@@ -487,14 +491,14 @@ def _vmap_of_grad(
         runner = _make_runner(f)
         _INSTRUMENTED[f] = runner
 
-    def wrapped(*args: PyTree) -> object:
+    def wrapped(*args: PyTree) -> PyTree:
         axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * len(args)
         _check_param_ownership(args)
-        batch = _mapped_batch_size(args, cast("tuple", axes))
-        tie_vars: dict[object, Var] = {}
-        per_arg: list[tuple[TreeDef, list[tuple[Var | None, bool]], object]] = []
+        batch = _mapped_batch_size(args, axes)
+        tie_vars: dict[Hashable, Var] = {}
+        per_arg: list[tuple[TreeDef, list[tuple[Var | None, bool]], int | None]] = []
         flat_args: list[tuple[TreeDef, list[Leaf]]] = []
-        for a, ax in zip(args, cast("tuple", axes)):
+        for a, ax in zip(args, axes):
             leaves, treedef = tree_flatten(a)
             info: list[tuple[Var | None, bool]] = []
             new_leaves: list[Leaf] = []
@@ -550,8 +554,8 @@ def _vmap_of_grad(
 
 
 def per_example_grad(
-    f: Callable[..., object], in_axes: int = 0
-) -> Callable[..., object]:
+    f: Callable[..., PyTree], in_axes: int = 0
+) -> Callable[..., PyTree]:
     """Per-sample gradients of a per-example scalar ``f`` w.r.t. its batched input.
 
     ``f`` maps one example to a scalar; ``per_example_grad(f)(xs)`` returns one gradient
@@ -564,7 +568,7 @@ def per_example_grad(
         runner = _make_runner(f)
         _INSTRUMENTED[f] = runner
 
-    def wrapped(x: PyTree) -> object:
+    def wrapped(x: PyTree) -> PyTree:
         arr = np.moveaxis(np.asarray(_value(cast(Operand, x))), in_axes, 0)
         xv = Var(arr)
         with new_main(BatchTrace) as main:
@@ -600,7 +604,7 @@ def per_example_grad(
 # assumption beyond the one ``per_example_grad`` already makes), and because the outer pass
 # is the established ``grad(grad)`` reverse-over-reverse path it needs no new machinery.
 # ---------------------------------------------------------------------------
-def _per_example_grad_var(runner: Callable[..., object], xv: Var) -> object:
+def _per_example_grad_var(runner: Callable[..., PyTree], xv: Var) -> object:
     """The stacked per-example gradient of a per-example scalar ``f`` (its ``runner``) w.r.t.
     the batched input ``xv`` ``(B, *x)``, as a level-connected ``Var`` graph (a *differentiable*
     inner backward so an enclosing reverse pass can differentiate it again).
@@ -616,7 +620,7 @@ def _per_example_grad_var(runner: Callable[..., object], xv: Var) -> object:
     return xv.grad
 
 
-def _per_sample_hvp(f: Callable[..., object], X: Array, D: Array) -> Array:
+def _per_sample_hvp(f: Callable[..., PyTree], X: Array, D: Array) -> Array:
     """Per-example Hessian-vector products of per-example scalar ``f``: ``H_i v_i`` stacked.
 
     ``X`` is the batched input ``(B, *x)`` (batch at axis 0); ``D`` the batched directions
@@ -636,7 +640,7 @@ def _per_sample_hvp(f: Callable[..., object], X: Array, D: Array) -> Array:
     return np.asarray(xv.grad)
 
 
-def _per_sample_hessian(f: Callable[..., object], X: Array) -> Array:
+def _per_sample_hessian(f: Callable[..., PyTree], X: Array) -> Array:
     """Per-example Hessian of per-example scalar ``f``: ``(B, *x, *x)`` stacked over the batch.
 
     Sweeps the ``n`` one-hot basis directions (each broadcast over the batch) through
@@ -658,14 +662,14 @@ def _per_sample_hessian(f: Callable[..., object], X: Array) -> Array:
 
 
 def _vmap_of_hessian(
-    f: Callable[..., object], in_axes: object
-) -> Callable[..., object]:
+    f: Callable[..., PyTree], in_axes: int | None | tuple[int | None, ...]
+) -> Callable[..., PyTree]:
     """``vmap(jacfwd(grad(f)))`` / ``vmap(jacrev(grad(f)))``: a per-example Hessian for each
     row of the batched input, shape ``(B, *x, *x)`` -- see the module note above."""
 
-    def wrapped(*args: PyTree) -> object:
+    def wrapped(*args: PyTree) -> PyTree:
         axes = in_axes if isinstance(in_axes, tuple) else (in_axes,) * len(args)
-        ax = next((a for a in cast("tuple", axes) if a is not None), 0)
+        ax = next((a for a in axes if a is not None), 0)
         X = np.moveaxis(np.asarray(_value(cast(Operand, args[0]))), cast(int, ax), 0)
         H = _per_sample_hessian(f, X)
         return np.moveaxis(H, 0, cast(int, ax)) if ax != 0 else H
@@ -675,10 +679,10 @@ def _vmap_of_hessian(
 
 
 def jvp(
-    f: Callable[..., object],
+    f: Callable[..., PyTree],
     primals: tuple[PyTree, ...],
     tangents: tuple[PyTree, ...],
-) -> tuple[object, object]:
+) -> tuple[PyTree, PyTree]:
     """Forward-mode AD: ``(f(*primals), df(*primals) . tangents)`` in one pass.
 
     JAX-style: ``primals`` and ``tangents`` are tuples with one entry per positional
@@ -722,10 +726,10 @@ def jvp(
 
 
 def _maybe_per_sample_hvp(
-    f: Callable[..., object],
+    f: Callable[..., PyTree],
     primals: tuple[PyTree, ...],
     tangents: tuple[PyTree, ...],
-) -> tuple[object, object] | None:
+) -> tuple[PyTree, PyTree] | None:
     """If this is ``jvp(grad(g), (x,), (v,))`` with ``x`` batched by an enclosing ``vmap``,
     return ``(primal_out, tangent_out)`` per example via :func:`_per_sample_hvp`; else
     ``None`` (the ordinary :func:`jvp` path runs).
@@ -768,7 +772,7 @@ def _phys_array(v: object) -> Array:
     return np.asarray(_value(cast(Operand, cur)))
 
 
-def _per_example_grad_stack(f: Callable[..., object], X: Array) -> Array:
+def _per_example_grad_stack(f: Callable[..., PyTree], X: Array) -> Array:
     """The per-example gradient of per-example scalar ``f`` over a batched ``X`` (batch
     leading), stacked ``(B, *x)`` -- the primal companion to :func:`_per_sample_hvp`."""
     runner = _INSTRUMENTED.get(f)
@@ -784,11 +788,11 @@ def _per_example_grad_stack(f: Callable[..., object], X: Array) -> Array:
 
 
 def _run_jvp(
-    f: Callable[..., object],
-    runner: Callable[..., object],
+    f: Callable[..., PyTree],
+    runner: Callable[..., PyTree],
     primals: tuple[PyTree, ...],
     tangents: tuple[PyTree, ...],
-) -> tuple[object, object]:
+) -> tuple[PyTree, PyTree]:
     with new_main(JVPTrace) as main:
         trace = JVPTrace(main)
         level = main.level
@@ -808,7 +812,12 @@ def _run_jvp(
                     new_leaves.append(pl)  # non-numeric leaf: pass through, no tangent
                     continue
                 new_leaves.append(
-                    cast(Leaf, JVPTracer(trace, primal_inner, tangent_inner))
+                    cast(
+                        Leaf,
+                        JVPTracer(
+                            trace, cast(Boxed, primal_inner), cast(Boxed, tangent_inner)
+                        ),
+                    )
                 )
             call_args.append(tree_unflatten(p_def, new_leaves))
 
@@ -892,7 +901,7 @@ def _jvp_tangent(leaf: object, level: int) -> object:
     return np.zeros_like(arr)
 
 
-def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
+def jacfwd(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
     """Forward-mode Jacobian of ``f`` w.r.t. its ``argnum``-th argument.
 
     Builds the Jacobian by pushing one-hot tangent basis vectors through :func:`jvp` --
@@ -906,7 +915,7 @@ def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
     Jacobian shaped ``(*out_shape, *in_shape)``.
     """
 
-    def jacobian(*args: PyTree) -> object:
+    def jacobian(*args: PyTree) -> PyTree:
         x = args[argnum]
         flat, treedef = tree_flatten(x)
         if len(flat) != 1 or not _is_numeric(flat[0]):
@@ -917,7 +926,7 @@ def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
         n = int(x_arr.size)
         basis = np.eye(n, dtype=x_arr.dtype).reshape((n,) + x_arr.shape)
 
-        def column(e: object) -> object:
+        def column(e: object) -> PyTree:
             tan_args = tuple(
                 tree_unflatten(treedef, [cast(Leaf, e)]) if i == argnum else a
                 for i, a in enumerate(args)
@@ -962,7 +971,7 @@ def jacfwd(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
     return jacobian
 
 
-def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
+def jacrev(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
     """Reverse-mode Jacobian of ``f`` w.r.t. its ``argnum``-th argument.
 
     Builds the Jacobian one *row* at a time: the gradient of each scalar output component
@@ -978,7 +987,7 @@ def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
     ``jacfwd(grad(f))`` Hessian.
     """
 
-    def jacobian(*args: PyTree) -> object:
+    def jacobian(*args: PyTree) -> PyTree:
         x = args[argnum]
         flat, treedef = tree_flatten(x)
         if len(flat) != 1 or not _is_numeric(flat[0]):
@@ -992,11 +1001,11 @@ def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
         m = int(y0.size)
         basis = np.eye(m, dtype=x_arr.dtype).reshape((m,) + out_shape)
 
-        def make_component(e: Array) -> Callable[..., object]:
+        def make_component(e: Array) -> Callable[..., PyTree]:
             # ``sum(f(x) * e_i)`` -- a scalar whose gradient is one Jacobian row. Tagged to
             # run directly so the tracer keeps it (and its closure over ``f``/``e``) intact
             # while still intercepting the ``np.*`` calls inside.
-            def component(xa: object) -> object:
+            def component(xa: object) -> PyTree:
                 replaced = tuple(
                     tree_unflatten(treedef, [cast(Leaf, xa)]) if i == argnum else a
                     for i, a in enumerate(args)
@@ -1022,7 +1031,7 @@ def jacrev(f: Callable[..., object], argnum: int = 0) -> Callable[..., object]:
 
 
 def gradient_descent(
-    loss_fn: Callable[..., object],
+    loss_fn: Callable[..., PyTree],
     init_params: tuple[ArrayLike, ...],
     lr: float = 0.1,
     steps: int = 100,

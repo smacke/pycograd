@@ -21,13 +21,17 @@ computation recurse into the batch level, and nesting a ``JVPTrace`` under ``gra
 from __future__ import annotations
 
 import contextvars
-from typing import Any, Callable, NoReturn, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, NoReturn, Sequence, cast
 
 import numpy as np
 
 from pycograd import ops
+from pycograd._typing import Array, Axis, BindArg, Boxed, DTypeLike, Index, Prim, Rule
 from pycograd.tensor import Var, _value, _xp
 from pycograd.trace import Trace, Tracer, bind, full_raise
+
+if TYPE_CHECKING:
+    from pycograd.shapes import ShapeDtypeStruct
 
 # ---------------------------------------------------------------------------
 # Higher-order bridge: map a *primal* ``Var`` (a forward-tape node) to the ``JVPTracer``
@@ -37,12 +41,12 @@ from pycograd.trace import Trace, Tracer, bind, full_raise
 # read by ``tensor._backward_differentiable``; an empty map (no live ``jvp``) means the
 # reverse pass simply uses the primal ``Var``s, which is the plain ``grad`` behavior.
 # ---------------------------------------------------------------------------
-_HOF_TRACER_FOR: contextvars.ContextVar[dict[int, object]] = contextvars.ContextVar(
+_HOF_TRACER_FOR: contextvars.ContextVar[dict[int, Boxed]] = contextvars.ContextVar(
     "pycograd_hof_tracer_for", default={}
 )
 
 
-def _hof_tracer_for() -> dict[int, object]:
+def _hof_tracer_for() -> dict[int, Boxed]:
     return _HOF_TRACER_FOR.get()
 
 
@@ -71,13 +75,13 @@ class JVPTracer(Tracer):
     __slots__ = ("_trace", "primal", "tangent")
     __array_ufunc__ = None
 
-    def __init__(self, trace: "JVPTrace", primal: object, tangent: object) -> None:
+    def __init__(self, trace: "JVPTrace", primal: Boxed, tangent: Boxed) -> None:
         self._trace = trace
         self.primal = primal
         self.tangent = tangent
 
     @property
-    def aval(self) -> object:
+    def aval(self) -> "ShapeDtypeStruct":
         from pycograd.shapes import ShapeDtypeStruct
 
         p = self.primal
@@ -99,13 +103,13 @@ class JVPTracer(Tracer):
         return int(np.prod(cast(Any, self.shape), dtype=np.int64))
 
     @property
-    def T(self) -> object:
+    def T(self) -> Boxed:
         return bind(ops.d_transpose, self)
 
-    def __getitem__(self, key: object) -> object:
+    def __getitem__(self, key: Index) -> Boxed:
         return bind(ops.d_getitem, self, key)
 
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> "Callable[..., Boxed]":
         # Route a numpy method name we have a primitive for through ``bind`` so the
         # method call (``x.sum(axis=0)``) differentiates exactly like the free function
         # ``np.sum(x, axis=0)`` -- mirrors ``BatchTracer.__getattr__``.
@@ -116,7 +120,7 @@ class JVPTracer(Tracer):
         if prim is None:
             raise AttributeError(name)
 
-        def _method(*a: object, **k: object) -> object:
+        def _method(*a: BindArg, **k: Any) -> Boxed:
             return bind(prim, self, *a, **k)
 
         return _method
@@ -132,17 +136,17 @@ class JVPTrace(Trace):
     """One forward-mode level: process each primitive by computing the primal one level
     down and the tangent via the per-primitive jvp rule."""
 
-    def pure(self, val: object) -> JVPTracer:
+    def pure(self, val: Boxed) -> JVPTracer:
         return JVPTracer(self, val, _zeros_like(val))
 
-    def lift(self, val: object) -> JVPTracer:
+    def lift(self, val: Boxed) -> JVPTracer:
         # A value from a lower level enters this level with a zero tangent (it does not
         # depend on the differentiated input at this level).
         return JVPTracer(self, val, _zeros_like(val))
 
     def process_primitive(
-        self, prim: Callable[..., object], args: Sequence[object], params: dict
-    ) -> object:
+        self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
+    ) -> Boxed:
         rule = _JVP_FOR.get(prim)
         if rule is None:
             _process_unknown(prim)
@@ -161,14 +165,14 @@ class JVPTrace(Trace):
                         _hof_register(el)
         return out
 
-    def _raise(self, val: object) -> "JVPTracer":
+    def _raise(self, val: Boxed) -> "JVPTracer":
         return cast(JVPTracer, full_raise(self, val))
 
 
 # ---------------------------------------------------------------------------
 # Zero-tangent construction.
 # ---------------------------------------------------------------------------
-def _zeros_like(val: object) -> object:
+def _zeros_like(val: Boxed) -> Boxed:
     """A zero tangent shaped like ``val`` (a constant entering the level, or a value from
     a lower level)."""
     arr = _value(cast(Any, val)) if isinstance(val, (Var,)) else val
@@ -186,24 +190,24 @@ def _zeros_like(val: object) -> object:
 # input tangents. Because those ops flow through ``bind`` too, forward mode composes and
 # nests automatically. The result is re-wrapped as a ``JVPTracer``.
 # ---------------------------------------------------------------------------
-def _result(trace: JVPTrace, primal: object, tangent: object) -> JVPTracer:
+def _result(trace: JVPTrace, primal: Boxed, tangent: Boxed) -> JVPTracer:
     return JVPTracer(trace, primal, tangent)
 
 
-def _primals(tracers: Sequence[JVPTracer]) -> list[object]:
+def _primals(tracers: Sequence[JVPTracer]) -> list[Boxed]:
     return [t.primal for t in tracers]
 
 
-def _tangents(tracers: Sequence[JVPTracer]) -> list[object]:
+def _tangents(tracers: Sequence[JVPTracer]) -> list[Boxed]:
     return [t.tangent for t in tracers]
 
 
 # -- linear ops: the tangent flows through the SAME op as the primal ---------
-def _linear_for(prim: Callable) -> Callable:
+def _linear_for(prim: Prim) -> Rule:
     """For a linear primitive ``L`` (add, sub, neg, sum, mean, reshape, transpose,
     concatenate, expand_dims, stack, ...) the jvp is itself: ``d L(x) = L(dx)``."""
 
-    def rule(trace: JVPTrace, *operands: object, **kwargs: object) -> JVPTracer:
+    def rule(trace: JVPTrace, *operands: Boxed, **kwargs: Any) -> JVPTracer:
         tracers = [trace._raise(o) for o in operands]
         primal_out = bind(prim, *_primals(tracers), **kwargs)
         tangent_out = bind(prim, *_tangents(tracers), **kwargs)
@@ -212,15 +216,13 @@ def _linear_for(prim: Callable) -> Callable:
     return rule
 
 
-def _linear_struct_for(prim: Callable) -> Callable:
+def _linear_struct_for(prim: Prim) -> Rule:
     """Like :func:`_linear_for`, but the primitive's *trailing* arguments are static
     structural metadata (a reshape target, an ``expand_dims`` axis, a ``broadcast_to``
     shape) -- not differentiable operands. Only the first operand is raised; the rest pass
     through unraised so they are not (wrongly) turned into zero-tangent tracers."""
 
-    def rule(
-        trace: JVPTrace, x: object, *static: object, **kwargs: object
-    ) -> JVPTracer:
+    def rule(trace: JVPTrace, x: Boxed, *static: BindArg, **kwargs: Any) -> JVPTracer:
         t = trace._raise(x)
         primal_out = bind(prim, t.primal, *static, **kwargs)
         tangent_out = bind(prim, t.tangent, *static, **kwargs)
@@ -229,11 +231,11 @@ def _linear_struct_for(prim: Callable) -> Callable:
     return rule
 
 
-def _linear_seq_for(prim: Callable) -> Callable:
+def _linear_seq_for(prim: Prim) -> Rule:
     """Linear over a *sequence* operand (concatenate / stack): the tangent of the join is
     the join of the per-element tangents."""
 
-    def rule(trace: JVPTrace, seq: Sequence, **kwargs: object) -> JVPTracer:
+    def rule(trace: JVPTrace, seq: Sequence[Boxed], **kwargs: Any) -> JVPTracer:
         tracers = [trace._raise(s) for s in seq]
         primal_out = bind(prim, _primals(tracers), **kwargs)
         tangent_out = bind(prim, _tangents(tracers), **kwargs)
@@ -243,12 +245,12 @@ def _linear_seq_for(prim: Callable) -> Callable:
 
 
 # -- elementwise unary: tangent_out = f'(primal) * tangent ------------------
-def _unary_for(deriv: Callable[[object], object]) -> Callable:
+def _unary_for(deriv: Callable[[Boxed], Boxed]) -> Callable[[Prim], Rule]:
     """``deriv(primal)`` is the local derivative ``f'(x)``; the jvp is ``f'(x) * dx``.
     ``deriv`` is written with ordinary ``ops`` so the tangent rides ``bind``."""
 
-    def make(prim: Callable) -> Callable:
-        def rule(trace: JVPTrace, x: object, **kwargs: object) -> JVPTracer:
+    def make(prim: Prim) -> Rule:
+        def rule(trace: JVPTrace, x: Boxed, **kwargs: Any) -> JVPTracer:
             t = trace._raise(x)
             primal_out = bind(prim, t.primal, **kwargs)
             tangent_out = bind(ops.d_mul, deriv(t.primal), t.tangent)
@@ -260,7 +262,7 @@ def _unary_for(deriv: Callable[[object], object]) -> Callable:
 
 
 # -- binary / selection -----------------------------------------------------
-def _mul_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
+def _mul_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_mul, ta.primal, tb.primal)
     # d(a*b) = a*db + b*da
@@ -272,7 +274,7 @@ def _mul_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _div_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
+def _div_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_div, ta.primal, tb.primal)
     # d(a/b) = (da*b - a*db) / b**2
@@ -285,7 +287,7 @@ def _div_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _pow_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
+def _pow_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_pow, ta.primal, tb.primal)
     # d(a**b) = b*a**(b-1)*da + a**b*log(a)*db. Drop the exponent-tangent term when the
@@ -301,7 +303,7 @@ def _pow_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
         ta.tangent,
     )
     if _is_zero(tb.tangent):
-        tangent_out: object = da_term
+        tangent_out: Boxed = da_term
     else:
         db_term = bind(
             ops.d_mul,
@@ -312,7 +314,7 @@ def _pow_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _matmul_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
+def _matmul_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops._matmul, ta.primal, tb.primal)
     # d(a@b) = da@b + a@db
@@ -324,11 +326,11 @@ def _matmul_rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _select_for(prim: Callable) -> Callable:
+def _select_for(prim: Prim) -> Rule:
     """max / min of two operands: route each operand's tangent through wherever that
     operand was selected (``mask = primal_out == operand``)."""
 
-    def rule(trace: JVPTrace, a: object, b: object) -> JVPTracer:
+    def rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
         ta, tb = trace._raise(a), trace._raise(b)
         primal_out = bind(prim, ta.primal, tb.primal)
         mask = bind(ops.d_eq, ta.primal, primal_out)  # boolean: where a was picked
@@ -340,9 +342,9 @@ def _select_for(prim: Callable) -> Callable:
 
 def _clip_rule(
     trace: JVPTrace,
-    x: object,
-    a_min: object = None,
-    a_max: object = None,
+    x: Boxed,
+    a_min: Boxed = None,
+    a_max: Boxed = None,
 ) -> JVPTracer:
     tx = trace._raise(x)
     primal_out = bind(ops.d_clip, tx.primal, a_min, a_max)
@@ -360,7 +362,7 @@ def _clip_rule(
     return _result(trace, primal_out, tangent_out)
 
 
-def _where_rule(trace: JVPTrace, cond: object, a: object, b: object) -> JVPTracer:
+def _where_rule(trace: JVPTrace, cond: Boxed, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     cmask = (
         _value(cast(Any, trace._raise(cond).primal))
@@ -372,7 +374,7 @@ def _where_rule(trace: JVPTrace, cond: object, a: object, b: object) -> JVPTrace
     return _result(trace, primal_out, tangent_out)
 
 
-def _getitem_rule(trace: JVPTrace, x: object, key: object) -> JVPTracer:
+def _getitem_rule(trace: JVPTrace, x: Boxed, key: Index) -> JVPTracer:
     tx = trace._raise(x)
     k = _unwrap_key(key)
     primal_out = bind(ops.d_getitem, tx.primal, k)
@@ -380,11 +382,11 @@ def _getitem_rule(trace: JVPTrace, x: object, key: object) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _unwrap_key(key: object) -> object:
+def _unwrap_key(key: Index) -> Index:
     """Strip any JVPTracer wrapper off an index, using its primal (an index is not
     differentiated)."""
 
-    def _one(k: object) -> object:
+    def _one(k: Index) -> Index:
         if isinstance(k, JVPTracer):
             return _value(cast(Any, k.primal))
         return k
@@ -394,15 +396,15 @@ def _unwrap_key(key: object) -> object:
     return _one(key)
 
 
-def _reduce_for(prim: Callable) -> Callable:
+def _reduce_for(prim: Prim) -> Rule:
     """sum / mean are linear: ``d reduce(x) = reduce(dx)`` (same axis/keepdims)."""
 
     def rule(
         trace: JVPTrace,
-        x: object,
-        axis: object = None,
+        x: Boxed,
+        axis: Axis = None,
         keepdims: bool = False,
-        **kw: object,
+        **kw: Any,
     ) -> JVPTracer:
         t = trace._raise(x)
         primal_out = bind(prim, t.primal, axis=axis, keepdims=keepdims, **kw)
@@ -412,7 +414,7 @@ def _reduce_for(prim: Callable) -> Callable:
     return rule
 
 
-def _reduced_count(x: object, axis: object) -> int:
+def _reduced_count(x: Boxed, axis: Axis) -> int:
     shp = np.asarray(cast(Any, _value(cast(Any, x)))).shape
     if axis is None:
         return int(np.prod(shp, dtype=np.int64))
@@ -422,13 +424,13 @@ def _reduced_count(x: object, axis: object) -> int:
 
 def _var_rule(
     trace: JVPTrace,
-    x: object,
-    axis: object = None,
-    dtype: object = None,
-    out: object = None,
+    x: Boxed,
+    axis: Axis = None,
+    dtype: DTypeLike | None = None,
+    out: Array | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-    **_: object,
+    **_: Any,
 ) -> JVPTracer:
     """``var`` is *not* linear, so it cannot reuse ``_reduce_for``. Re-express it from
     primitives -- ``var(x) = sum((x - mean(x))**2) / (n - ddof)`` -- entirely via ``bind``
@@ -447,29 +449,29 @@ def _var_rule(
 
 def _std_rule(
     trace: JVPTrace,
-    x: object,
-    axis: object = None,
-    dtype: object = None,
-    out: object = None,
+    x: Boxed,
+    axis: Axis = None,
+    dtype: DTypeLike | None = None,
+    out: Array | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-    **_: object,
+    **_: Any,
 ) -> JVPTracer:
     """``std = sqrt(var)``; re-expressed via ``bind`` so the chain rule applies."""
     v = _var_rule(trace, x, axis=axis, ddof=ddof, keepdims=keepdims)
     return cast(JVPTracer, bind(ops.d_sqrt, v))
 
 
-def _reduce_select_for(prim: Callable) -> Callable:
+def _reduce_select_for(prim: Prim) -> Rule:
     """max / min reduction: route the tangent through the selected element(s) (split on
     ties, matching the reverse-mode rule), via a normalized argmax mask."""
 
     def rule(
         trace: JVPTrace,
-        x: object,
-        axis: object = None,
+        x: Boxed,
+        axis: Axis = None,
         keepdims: bool = False,
-        **kw: object,
+        **kw: Any,
     ) -> JVPTracer:
         t = trace._raise(x)
         primal_out = bind(prim, t.primal, axis=axis, keepdims=keepdims, **kw)
@@ -483,15 +485,15 @@ def _reduce_select_for(prim: Callable) -> Callable:
             ops.d_div, bind(ops.d_sum, weighted, axis=axis, keepdims=True), count
         )
         if keepdims:
-            tangent_out: object = sel
+            tangent_out: Boxed = sel
         else:
             # Drop the kept (size-1) reduced axes so the tangent matches the
             # non-keepdims primal output shape. The input's logical shape comes from the
             # tracer's ``aval`` (works at any nesting level); ``d_reshape`` rides
             # ``bind`` so it recurses correctly.
-            in_shape = cast(tuple, t.shape)
+            in_shape = cast("tuple[int, ...]", t.shape)
             if axis is None:
-                out_shape: tuple = ()
+                out_shape: tuple[int, ...] = ()
             else:
                 axes = axis if isinstance(axis, tuple) else (axis,)
                 axes = tuple(a % len(in_shape) for a in axes)
@@ -502,17 +504,17 @@ def _reduce_select_for(prim: Callable) -> Callable:
     return rule
 
 
-def _as_float(mask: object) -> object:
+def _as_float(mask: Boxed) -> Boxed:
     """Cast a boolean mask to the working dtype so it can be summed / multiplied."""
     return bind(ops.d_add, mask, 0.0)
 
 
 # -- comparisons: a boolean mask, not differentiable; tangent is zero -------
-def _compare_for(prim: Callable) -> Callable:
+def _compare_for(prim: Prim) -> Rule:
     """A comparison yields a non-differentiable boolean array. The result carries no
     tangent, so return the raw primal (it leaves the level as a plain mask)."""
 
-    def rule(trace: JVPTrace, a: object, b: object) -> object:
+    def rule(trace: JVPTrace, a: Boxed, b: Boxed) -> Boxed:
         ta, tb = trace._raise(a), trace._raise(b)
         return bind(prim, ta.primal, tb.primal)
 
@@ -523,70 +525,70 @@ def _compare_for(prim: Callable) -> Callable:
 # Local-derivative helpers for the elementwise-unary rules (written with ops so the
 # tangent rides ``bind`` and composes/nests).
 # ---------------------------------------------------------------------------
-def _d_exp(x: object) -> object:
+def _d_exp(x: Boxed) -> Boxed:
     return bind(ops.d_exp, x)
 
 
-def _d_log(x: object) -> object:
+def _d_log(x: Boxed) -> Boxed:
     return bind(ops.d_reciprocal, x)  # 1/x
 
 
-def _d_sin(x: object) -> object:
+def _d_sin(x: Boxed) -> Boxed:
     return bind(ops.d_cos, x)
 
 
-def _d_cos(x: object) -> object:
+def _d_cos(x: Boxed) -> Boxed:
     return bind(ops.d_neg, bind(ops.d_sin, x))
 
 
-def _d_tanh(x: object) -> object:
+def _d_tanh(x: Boxed) -> Boxed:
     t = bind(ops.d_tanh, x)
     return bind(ops.d_sub, 1.0, bind(ops.d_mul, t, t))  # 1 - tanh(x)**2
 
 
-def _d_sqrt(x: object) -> object:
+def _d_sqrt(x: Boxed) -> Boxed:
     return bind(ops.d_div, 0.5, bind(ops.d_sqrt, x))  # 1/(2*sqrt(x))
 
 
-def _d_sinh(x: object) -> object:
+def _d_sinh(x: Boxed) -> Boxed:
     return bind(ops.d_cosh, x)
 
 
-def _d_cosh(x: object) -> object:
+def _d_cosh(x: Boxed) -> Boxed:
     return bind(ops.d_sinh, x)
 
 
-def _d_arctan(x: object) -> object:
+def _d_arctan(x: Boxed) -> Boxed:
     return bind(ops.d_reciprocal, bind(ops.d_add, 1.0, bind(ops.d_mul, x, x)))
 
 
-def _d_log1p(x: object) -> object:
+def _d_log1p(x: Boxed) -> Boxed:
     return bind(ops.d_reciprocal, bind(ops.d_add, 1.0, x))  # 1/(1+x)
 
 
-def _d_expm1(x: object) -> object:
+def _d_expm1(x: Boxed) -> Boxed:
     return bind(ops.d_exp, x)
 
 
-def _d_abs(x: object) -> object:
+def _d_abs(x: Boxed) -> Boxed:
     # ``np.sign`` has no differentiable primitive (it is piecewise constant), so the
     # local derivative of ``abs`` is computed on the primal value directly. ``x`` here is
     # the primal (a Var/array or a lower-level tracer); pull its value to host.
     return _xp().sign(np.asarray(cast(Any, _value(cast(Any, x)))))
 
 
-def _d_square(x: object) -> object:
+def _d_square(x: Boxed) -> Boxed:
     return bind(ops.d_mul, 2.0, x)
 
 
-def _d_reciprocal(x: object) -> object:
+def _d_reciprocal(x: Boxed) -> Boxed:
     return bind(ops.d_neg, bind(ops.d_reciprocal, bind(ops.d_mul, x, x)))  # -1/x**2
 
 
 # ---------------------------------------------------------------------------
 # Small predicates.
 # ---------------------------------------------------------------------------
-def _is_zero(t: object) -> bool:
+def _is_zero(t: Boxed) -> bool:
     """True when a tangent is statically the zero array we lift constants with (so the
     exponent-tangent term of ``pow`` can be skipped for a constant exponent)."""
     if isinstance(t, (Var, Tracer)):
@@ -597,7 +599,7 @@ def _is_zero(t: object) -> bool:
         return False
 
 
-def _process_unknown(prim: Callable) -> "NoReturn":
+def _process_unknown(prim: Prim) -> "NoReturn":
     raise NotImplementedError(
         f"jvp: no forward-mode rule for {getattr(prim, '__name__', prim)!r}; "
         "cannot differentiate it in forward mode."
@@ -607,7 +609,7 @@ def _process_unknown(prim: Callable) -> "NoReturn":
 # ---------------------------------------------------------------------------
 # Rule registry, keyed by primitive.
 # ---------------------------------------------------------------------------
-def _build_jvp_for() -> dict[object, Callable]:
+def _build_jvp_for() -> dict[Prim, Rule]:
     unary_deriv = {
         ops.d_exp: _d_exp,
         ops.d_log: _d_log,
@@ -624,7 +626,7 @@ def _build_jvp_for() -> dict[object, Callable]:
         ops.d_square: _d_square,
         ops.d_reciprocal: _d_reciprocal,
     }
-    jvp_for: dict[object, Callable] = {
+    jvp_for: dict[Prim, Rule] = {
         prim: _unary_for(deriv)(prim) for prim, deriv in unary_deriv.items()
     }
     jvp_for.update(
@@ -680,11 +682,11 @@ def _build_jvp_for() -> dict[object, Callable]:
 # ``JVPTrace.process_primitive``. ``_JVP`` denormalizes it to numpy-callable keys so the
 # coverage-parity test (``set(_JVP) == set(ops._INTERCEPT)``) holds, exactly like
 # ``batching._BATCH``.
-_JVP_FOR: dict[object, Callable] = _build_jvp_for()
+_JVP_FOR: dict[Prim, Rule] = _build_jvp_for()
 # The internal reverse-pass scatter primitive (``ops._scatter``) is not in ``_RULES`` (no
 # numpy callable maps to it), so it adds no ``_JVP`` coverage key; it gets a jvp rule here
 # directly so the differentiable gather VJP composes with a live ``jvp``.
 _JVP_FOR[ops._scatter] = ops._jvp_scatter
-_JVP: dict[object, Callable] = {
+_JVP: dict[Prim, Rule] = {
     fn: _JVP_FOR[prim] for prim, fns in ops._RULES.items() for fn in fns
 }

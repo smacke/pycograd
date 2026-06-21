@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from types import ModuleType
 from typing import Callable, Iterator, Mapping
+
+from pycograd._typing import Array, BackendArray, Index, Prim
 
 
 class Backend:
@@ -43,13 +46,13 @@ class Backend:
 
     # Tape backends only: the array module (``numpy``/``cupy``) the ``d_*`` primitives
     # compute with. ``None`` on the base and on delegate backends, which never read it.
-    array_module: object = None
+    array_module: ModuleType | None = None
 
     @property
-    def intercept(self) -> Mapping[object, Callable[..., object]]:
+    def intercept(self) -> Mapping[Prim, Prim]:
         raise NotImplementedError
 
-    def scatter_add(self, out: object, key: object, vals: object) -> None:
+    def scatter_add(self, out: BackendArray, key: Index, vals: BackendArray) -> None:
         """Scatter-add ``vals`` into ``out`` at ``key`` (tape backends only).
 
         Backs the indexing VJP (``Var.__getitem__``'s backward) where repeated indices
@@ -57,17 +60,17 @@ class Backend:
         """
         raise NotImplementedError
 
-    def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
+    def on_unmapped(self, func: Prim) -> Prim:
         raise NotImplementedError
 
-    def lift(self, array: object) -> object:
+    def lift(self, array: BackendArray) -> BackendArray:
         raise NotImplementedError
 
-    def const(self, array: object) -> object:
+    def const(self, array: BackendArray) -> BackendArray:
         """Lift ``array`` as a non-differentiated constant (frozen params, literals)."""
         return self.lift(array)
 
-    def coerce_operand(self, value: object) -> object:
+    def coerce_operand(self, value: BackendArray) -> BackendArray:
         """Coerce a binary-operator operand for this backend, or return it unchanged.
 
         Frameworks whose tensors refuse to share a Python operator with a raw numpy
@@ -78,12 +81,14 @@ class Backend:
         unchanged."""
         return value
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         raise NotImplementedError
 
     def grad_and_value(
-        self, scalar_fn: Callable[[list], object], leaves: list
-    ) -> tuple[object, list]:
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        leaves: list[BackendArray],
+    ) -> tuple[BackendArray, list[BackendArray]]:
         raise NotImplementedError
 
 

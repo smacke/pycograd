@@ -16,11 +16,11 @@ import ast
 import functools
 import inspect
 import sysconfig
-from typing import Callable
 
 import numpy as np
 import pyccolo as pyc
 
+from pycograd._typing import Boxed, Prim
 from pycograd.backends import current_backend
 from pycograd.ops import _is_mathy
 from pycograd.tensor import Var
@@ -48,7 +48,7 @@ _LIB_DIRS = tuple(
 )
 
 
-def _is_user_function(func: Callable[..., object]) -> bool:
+def _is_user_function(func: Prim) -> bool:
     """True for a plain Python function defined in user (non-library) code.
 
     The autodiff primitives (``d_*`` etc.) live in :mod:`pycograd.ops` but are only
@@ -75,9 +75,7 @@ def _is_user_function(func: Callable[..., object]) -> bool:
     return not any(filename.startswith(d) for d in _LIB_DIRS)
 
 
-def _unmapped_mathy(
-    func: Callable[..., object], fallback: Callable[..., object]
-) -> Callable[..., object]:
+def _unmapped_mathy(func: Prim, fallback: Prim) -> Prim:
     """Wrap an un-ruled numpy/math call. If a trace-stack :class:`Tracer`
     (a ``ShapedArray`` under ``eval_shape``, a ``BatchTracer`` under ``vmap``, a
     ``JVPTracer`` under ``jvp``) flows in, the active transform has no rule for ``func``,
@@ -121,9 +119,9 @@ class AutodiffTracer(pyc.BaseTracer):
     # ``instrumented`` recompiles a helper from source into a fresh function, so
     # cache each helper's instrumented version and reuse it rather than recompiling
     # on every call.
-    _helpers: dict[Callable[..., object], Callable[..., object]] = {}
+    _helpers: dict[Prim, Prim] = {}
 
-    def _instrument_helper(self, func: Callable[..., object]) -> Callable[..., object]:
+    def _instrument_helper(self, func: Prim) -> Prim:
         cached = self._helpers.get(func)
         if cached is not None:
             return cached
@@ -136,7 +134,7 @@ class AutodiffTracer(pyc.BaseTracer):
         self._helpers[func] = runner
         return runner
 
-    def resolve_call(self, func: Callable[..., object]) -> Callable[..., object]:
+    def resolve_call(self, func: Prim) -> Prim:
         """Map a callable to its autodiff-aware version.
 
         Swap an intercepted numpy/math function for its differentiable primitive;
@@ -172,18 +170,18 @@ class AutodiffTracer(pyc.BaseTracer):
 
     @pyc.register_handler(pyc.before_call)
     def handle_before_call(
-        self, func: Callable[..., object], node: object, *_: object, **__: object
-    ) -> Callable[..., object]:
+        self, func: Prim, node: ast.AST, *_: object, **__: object
+    ) -> Prim:
         return self.resolve_call(func)
 
     @pyc.register_handler(pyc.after_left_binop_arg)
-    def handle_left_binop_arg(self, ret: object, *_: object, **__: object) -> object:
+    def handle_left_binop_arg(self, ret: Boxed, *_: object, **__: object) -> Boxed:
         # Let the active backend promote a binop operand (e.g. a numpy data global
         # meeting a torch/tf tensor). numpy/jax leave it unchanged.
         return current_backend().coerce_operand(ret)
 
     @pyc.register_handler(pyc.after_right_binop_arg)
-    def handle_right_binop_arg(self, ret: object, *_: object, **__: object) -> object:
+    def handle_right_binop_arg(self, ret: Boxed, *_: object, **__: object) -> Boxed:
         return current_backend().coerce_operand(ret)
 
     # -- operator interception: route ops through the trace-level stack ---------
@@ -198,8 +196,8 @@ class AutodiffTracer(pyc.BaseTracer):
         pyc.before_binop, when=lambda node: type(node.op) in _BINOP_PRIM
     )
     def handle_before_binop(
-        self, ret: Callable[..., object], node: ast.BinOp, *_: object, **__: object
-    ) -> Callable[..., object]:
+        self, ret: Prim, node: ast.BinOp, *_: object, **__: object
+    ) -> Prim:
         prim, _raw = _BINOP_PRIM[type(node.op)]
         return lambda x, y: bind(prim, x, y)
 
@@ -207,8 +205,8 @@ class AutodiffTracer(pyc.BaseTracer):
         pyc.before_unaryop, when=lambda node: type(node.op) in _UNARYOP_PRIM
     )
     def handle_before_unaryop(
-        self, ret: Callable[..., object], node: ast.UnaryOp, *_: object, **__: object
-    ) -> Callable[..., object]:
+        self, ret: Prim, node: ast.UnaryOp, *_: object, **__: object
+    ) -> Prim:
         prim, _raw = _UNARYOP_PRIM[type(node.op)]
         return lambda x: bind(prim, x)
 
@@ -220,14 +218,14 @@ class AutodiffTracer(pyc.BaseTracer):
         when=lambda node: len(node.ops) == 1 and type(node.ops[0]) in _COMPARE_PRIM,
     )
     def handle_before_compare(
-        self, ret: Callable[..., object], node: ast.Compare, *_: object, **__: object
-    ) -> Callable[..., object]:
+        self, ret: Prim, node: ast.Compare, *_: object, **__: object
+    ) -> Prim:
         prim, _raw = _COMPARE_PRIM[type(node.ops[0])]
         return lambda x, y: bind(prim, x, y)
 
     @pyc.register_handler(pyc.before_subscript_load)
     def handle_before_subscript_load(
-        self, ret: object, node: object, *_: object, **__: object
+        self, ret: object, node: ast.AST, *_: object, **__: object
     ) -> object:
         # pyccolo replaces the *subscripted object* (then performs ``[key]`` on it), so we
         # wrap the subscripted object in a proxy whose ``__getitem__`` *may* route through
@@ -244,10 +242,10 @@ class AutodiffTracer(pyc.BaseTracer):
 
 # ``tracer.instrumented`` recompiles ``f`` from source into a fresh function, so
 # build each function's runner once and reuse it rather than recompiling per call.
-_INSTRUMENTED: dict[Callable[..., object], Callable[..., object]] = {}
+_INSTRUMENTED: dict[Prim, Prim] = {}
 
 
-def _is_already_woven(f: Callable[..., object]) -> bool:
+def _is_already_woven(f: Prim) -> bool:
     """True if ``f``'s bytecode already emits before_call -- i.e. it was instrumented
     when its defining cell/module was compiled (notably a pipescript ``|>`` pipe
     lambda). Such a function must be run *directly* under the tracer (so its existing
@@ -260,7 +258,7 @@ def _is_already_woven(f: Callable[..., object]) -> bool:
     return any(name.endswith("_PYCCOLO_EVT_EMIT") for name in code.co_names)
 
 
-def _make_runner(f: Callable[..., object]) -> Callable[..., object]:
+def _make_runner(f: Prim) -> Prim:
     """A callable that runs ``f`` with autodiff interception active.
 
     A function that isn't yet woven (an ordinary ``def`` or a plain ``lambda``,
@@ -301,7 +299,7 @@ def _make_runner(f: Callable[..., object]) -> Callable[..., object]:
     return run_directly
 
 
-def resolve_call(func: Callable[..., object]) -> Callable[..., object]:
+def resolve_call(func: Prim) -> Prim:
     """Autodiff-aware version of ``func`` (the logic ``before_call`` applies).
 
     Exposed so other call mechanisms can opt into interception -- e.g. wiring a

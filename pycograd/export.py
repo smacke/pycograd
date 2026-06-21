@@ -17,8 +17,9 @@ torch is imported only when one of these functions is called.
 """
 from __future__ import annotations
 
-from typing import Callable, Sequence, cast
+from typing import Sequence, cast
 
+from pycograd._typing import BackendArray, DTypeLike, Prim
 from pycograd.compile import compile_to
 from pycograd.dtypes import _maybe_dtype
 from pycograd.params import Param
@@ -26,7 +27,7 @@ from pycograd.tree import PyTree, tree_flatten, tree_unflatten
 
 
 def to_torch_module(
-    fn: Callable[..., object], params: PyTree, *, dtype: object = None
+    fn: Prim, params: PyTree, *, dtype: DTypeLike | None = None
 ) -> object:
     """Wrap a net ``fn(params, *inputs)`` as a ``torch.nn.Module``.
 
@@ -49,7 +50,7 @@ def to_torch_module(
         def __init__(self) -> None:
             super().__init__()
             self._treedef = treedef
-            self._slots: list[tuple[str, object]] = []
+            self._slots: list[tuple[str, str | int]] = []
             self._weights = torch.nn.ParameterList()
             for i, leaf in enumerate(leaves):
                 value = leaf.value if isinstance(leaf, Param) else leaf
@@ -64,7 +65,7 @@ def to_torch_module(
                     self._slots.append(("weight", len(self._weights)))
                     self._weights.append(torch.nn.Parameter(tensor))
 
-        def _live_leaves(self) -> list:
+        def _live_leaves(self) -> list[BackendArray]:
             return [
                 (
                     self._weights[cast(int, ref)]
@@ -74,7 +75,7 @@ def to_torch_module(
                 for kind, ref in self._slots
             ]
 
-        def forward(self, *inputs: object) -> object:
+        def forward(self, *inputs: BackendArray) -> BackendArray:
             live = tree_unflatten(self._treedef, self._live_leaves())
             return run(live, *inputs)
 
@@ -82,7 +83,7 @@ def to_torch_module(
 
 
 def export_torchscript(
-    module: object, example_inputs: Sequence[object], path: str | None = None
+    module: object, example_inputs: Sequence[BackendArray], path: str | None = None
 ) -> object:
     """Trace ``module`` (e.g. from :func:`to_torch_module`) to TorchScript.
 
@@ -98,7 +99,7 @@ def export_torchscript(
 
 
 def export_onnx(
-    module: object, example_inputs: Sequence[object], path: str, **kwargs: object
+    module: object, example_inputs: Sequence[BackendArray], path: str, **kwargs: object
 ) -> str:
     """Export ``module`` to ONNX at ``path`` (via ``torch.onnx.export``); returns ``path``.
 

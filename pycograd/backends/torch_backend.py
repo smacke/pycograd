@@ -17,21 +17,26 @@ are routed in through float32 and bf16 results back out through float32.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from types import ModuleType
+from typing import TYPE_CHECKING, Callable, Mapping
 
 import numpy as np
 
+from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
 
+if TYPE_CHECKING:
+    import torch
 
-def _torch_dtype(torch: Any, np_dtype: np.dtype) -> Any:
+
+def _torch_dtype(torch: ModuleType, np_dtype: np.dtype) -> "torch.dtype":
     """The ``torch`` dtype matching a numpy dtype (names line up: float32, bfloat16, ...)."""
     return getattr(torch, np_dtype.name)
 
 
-def _as_torch(torch: Any, x: Any) -> Any:
+def _as_torch(torch: ModuleType, x: BackendArray) -> BackendArray:
     """Convert ``x`` to a torch tensor in the active working dtype (bf16 via float32)."""
     if isinstance(x, torch.Tensor):
         return x
@@ -42,7 +47,7 @@ def _as_torch(torch: Any, x: Any) -> Any:
     return torch.as_tensor(np.asarray(x, dtype=dt))
 
 
-def _torch_to_numpy(torch: Any, t: Any) -> Any:
+def _torch_to_numpy(torch: ModuleType, t: BackendArray) -> Array:
     """A torch tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
     if isinstance(t, torch.Tensor):
         t = t.detach().cpu()
@@ -54,26 +59,26 @@ def _torch_to_numpy(torch: Any, t: Any) -> Any:
     return np.asarray(t)
 
 
-def _make_adapters(torch: Any) -> dict:
+def _make_adapters(torch: ModuleType) -> dict[str, Prim]:
     """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set."""
 
-    def as_t(x: Any) -> Any:
+    def as_t(x: BackendArray) -> BackendArray:
         return _as_torch(torch, x)
 
-    def unary(name: str) -> Callable[..., object]:
+    def unary(name: str) -> Prim:
         fn = getattr(torch, name)
         return lambda x: fn(as_t(x))
 
-    def matmul(a: Any, b: Any) -> object:
+    def matmul(a: BackendArray, b: BackendArray) -> BackendArray:
         return torch.matmul(as_t(a), as_t(b))
 
-    def maximum(a: object, b: object) -> object:
+    def maximum(a: BackendArray, b: BackendArray) -> BackendArray:
         return torch.maximum(as_t(a), as_t(b))
 
-    def minimum(a: object, b: object) -> object:
+    def minimum(a: BackendArray, b: BackendArray) -> BackendArray:
         return torch.minimum(as_t(a), as_t(b))
 
-    def where(cond: object, a: object, b: object) -> object:
+    def where(cond: BackendArray, a: BackendArray, b: BackendArray) -> BackendArray:
         c = (
             cond
             if isinstance(cond, torch.Tensor)
@@ -81,15 +86,17 @@ def _make_adapters(torch: Any) -> dict:
         )
         return torch.where(c, as_t(a), as_t(b))
 
-    def clip(x: object, a_min: object = None, a_max: object = None) -> object:
+    def clip(
+        x: BackendArray, a_min: BackendArray = None, a_max: BackendArray = None
+    ) -> BackendArray:
         return torch.clamp(as_t(x), min=a_min, max=a_max)
 
-    def reduce(name: str) -> Callable[..., object]:
+    def reduce(name: str) -> Prim:
         fn = getattr(torch, name)
 
         def _r(
-            x: object, axis: object = None, keepdims: bool = False, **_: object
-        ) -> object:
+            x: BackendArray, axis: Axis = None, keepdims: bool = False, **_: object
+        ) -> BackendArray:
             if axis is None:
                 return fn(as_t(x))
             return fn(as_t(x), dim=axis, keepdim=keepdims)
@@ -97,55 +104,55 @@ def _make_adapters(torch: Any) -> dict:
         return _r
 
     def variance(
-        x: object,
-        axis: object = None,
-        dtype: object = None,
-        out: object = None,
+        x: BackendArray,
+        axis: Axis = None,
+        dtype: DTypeLike | None = None,
+        out: BackendArray = None,
         ddof: int = 0,
         keepdims: bool = False,
         **_: object,
-    ) -> object:
+    ) -> BackendArray:
         if axis is None:
             return torch.var(as_t(x), correction=ddof)
         return torch.var(as_t(x), dim=axis, correction=ddof, keepdim=keepdims)
 
     def std(
-        x: object,
-        axis: object = None,
-        dtype: object = None,
-        out: object = None,
+        x: BackendArray,
+        axis: Axis = None,
+        dtype: DTypeLike | None = None,
+        out: BackendArray = None,
         ddof: int = 0,
         keepdims: bool = False,
         **_: object,
-    ) -> object:
+    ) -> BackendArray:
         if axis is None:
             return torch.std(as_t(x), correction=ddof)
         return torch.std(as_t(x), dim=axis, correction=ddof, keepdim=keepdims)
 
-    def transpose(x: object, axes: Any = None) -> object:
+    def transpose(x: BackendArray, axes: tuple[int, ...] | None = None) -> BackendArray:
         t = as_t(x)
         return t.permute(*(axes if axes is not None else range(t.ndim - 1, -1, -1)))
 
-    def reshape(x: object, *shape: Any) -> object:
+    def reshape(x: BackendArray, *shape: Shape) -> BackendArray:
         newshape = shape[0] if len(shape) == 1 else shape
         if isinstance(newshape, int):
             newshape = (newshape,)
         return torch.reshape(as_t(x), tuple(newshape))
 
-    def expand_dims(x: object, axis: int) -> object:
+    def expand_dims(x: BackendArray, axis: int) -> BackendArray:
         return torch.unsqueeze(as_t(x), axis)
 
-    def concatenate(seq: Any, axis: int = 0) -> object:
+    def concatenate(seq: BackendArray, axis: int = 0) -> BackendArray:
         return torch.cat([as_t(s) for s in seq], dim=axis)
 
-    def stack(seq: Any, axis: int = 0) -> object:
+    def stack(seq: BackendArray, axis: int = 0) -> BackendArray:
         return torch.stack([as_t(s) for s in seq], dim=axis)
 
-    def listwise(name: str) -> Callable[..., object]:
+    def listwise(name: str) -> Prim:
         fn = getattr(torch, name)
         return lambda seq: fn([as_t(s) for s in seq])
 
-    by_name: dict = {
+    by_name: dict[str, Prim] = {
         "abs": unary("abs"),
         "square": unary("square"),
         "reciprocal": unary("reciprocal"),
@@ -191,7 +198,7 @@ def _make_adapters(torch: Any) -> dict:
     return by_name
 
 
-def _unmapped(func: Callable[..., object], is_tensor: Callable[[object], bool]):
+def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
     name = getattr(func, "__name__", repr(func))
 
     def _wrapped(*args: object, **kwargs: object) -> object:
@@ -221,35 +228,37 @@ class TorchBackend(Backend):
             if getattr(fn, "__name__", None) in adapters
         }
 
-    def _as_tensor(self, x: Any) -> Any:
+    def _as_tensor(self, x: BackendArray) -> BackendArray:
         return _as_torch(self._torch, x)
 
     @property
-    def intercept(self) -> Mapping[object, Callable[..., object]]:
+    def intercept(self) -> Mapping[Prim, Prim]:
         return self._intercept
 
-    def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
+    def on_unmapped(self, func: Prim) -> Prim:
         return _unmapped(func, lambda x: isinstance(x, self._torch.Tensor))
 
-    def lift(self, array: object) -> object:
+    def lift(self, array: BackendArray) -> BackendArray:
         return _as_torch(self._torch, array)
 
-    def const(self, array: object) -> object:
+    def const(self, array: BackendArray) -> BackendArray:
         return _as_torch(self._torch, array)
 
-    def coerce_operand(self, value: object) -> object:
+    def coerce_operand(self, value: BackendArray) -> BackendArray:
         # Promote a numpy constant (e.g. a data global) so it can share an operator
         # with a torch tensor; leave python scalars and existing tensors untouched.
         if isinstance(value, (np.ndarray, np.generic)):
             return _as_torch(self._torch, value)
         return value
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         return _torch_to_numpy(self._torch, tensor)
 
     def grad_and_value(
-        self, scalar_fn: Callable[[list], object], leaves: list
-    ) -> tuple[object, list]:
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        leaves: list[BackendArray],
+    ) -> tuple[BackendArray, list[BackendArray]]:
         torch = self._torch
         ts = [_as_torch(torch, leaf).requires_grad_(True) for leaf in leaves]
         out = self._as_tensor(scalar_fn(ts)).reshape(())

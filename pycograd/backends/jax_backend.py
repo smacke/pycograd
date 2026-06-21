@@ -12,10 +12,12 @@ won't ``jit`` -- static nets (the common case) are fine.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from types import ModuleType
+from typing import Callable, Mapping
 
 import numpy as np
 
+from pycograd._typing import Array, BackendArray, Prim
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
@@ -24,9 +26,9 @@ from pycograd.ops import _INTERCEPT
 _NAME_OVERRIDE = {"atan": "arctan"}
 
 
-def _build_intercept(jnp: Any) -> dict:
+def _build_intercept(jnp: ModuleType) -> dict[Prim, Prim]:
     """Map every numpy/math callable pycograd differentiates to its ``jnp`` twin."""
-    table: dict = {}
+    table: dict[Prim, Prim] = {}
     for fn in _INTERCEPT:
         name = getattr(fn, "__name__", None)
         if name is None:
@@ -37,7 +39,7 @@ def _build_intercept(jnp: Any) -> dict:
     return table
 
 
-def _unmapped(func: Callable[..., object], is_tensor: Callable[[object], bool]):
+def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
     """Wrap a mathy call with no jnp twin: raise clearly if a live tensor flows in."""
     name = getattr(func, "__name__", repr(func))
 
@@ -71,25 +73,27 @@ class JaxBackend(Backend):
         return isinstance(x, (self._jax.Array, self._jax.core.Tracer))
 
     @property
-    def intercept(self) -> Mapping[object, Callable[..., object]]:
+    def intercept(self) -> Mapping[Prim, Prim]:
         return self._intercept
 
-    def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
+    def on_unmapped(self, func: Prim) -> Prim:
         return _unmapped(func, self._is_tensor)
 
-    def lift(self, array: object) -> object:
+    def lift(self, array: BackendArray) -> BackendArray:
         return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
-    def const(self, array: object) -> object:
+    def const(self, array: BackendArray) -> BackendArray:
         return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         # Preserves dtype, including bfloat16 (jax's bf16 is the ml_dtypes numpy dtype).
         return np.asarray(tensor)
 
     def grad_and_value(
-        self, scalar_fn: Callable[[list], object], leaves: list
-    ) -> tuple[object, list]:
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        leaves: list[BackendArray],
+    ) -> tuple[BackendArray, list[BackendArray]]:
         jax, jnp = self._jax, self._jnp
         arrs = [jnp.asarray(np.asarray(leaf, dtype=current_dtype())) for leaf in leaves]
 

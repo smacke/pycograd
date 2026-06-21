@@ -16,7 +16,7 @@ from typing import Any, Callable, cast
 
 import numpy as np
 
-from pycograd._typing import Array, ArrayLike, Index, Operand
+from pycograd._typing import Array, ArrayLike, Boxed, DTypeLike, Index, Operand, Prim
 from pycograd.backends import current_backend
 from pycograd.dtypes import current_dtype, resolve_dtype
 
@@ -90,7 +90,7 @@ def _unbroadcast(
     return grad.reshape(out_shape)
 
 
-def _logical_shape(x: object) -> tuple[int, ...]:
+def _logical_shape(x: Boxed) -> tuple[int, ...]:
     """The shape of a cotangent that may be a ``Var`` (``.value.shape``) or a level
     tracer (``.shape``)."""
     if isinstance(x, Var):
@@ -98,7 +98,7 @@ def _logical_shape(x: object) -> tuple[int, ...]:
     return tuple(getattr(x, "shape"))  # a Tracer exposes a logical shape
 
 
-def _d_unbroadcast(grad: object, shape: tuple[int, ...]) -> object:
+def _d_unbroadcast(grad: Boxed, shape: tuple[int, ...]) -> Boxed:
     """A *differentiable* ``_unbroadcast``: sum a cotangent ``Var`` over broadcast axes so
     it matches ``shape``, built from ``d_sum`` + ``d_reshape`` (which themselves ride
     ``bind``), so the cotangent graph stays differentiable.
@@ -166,7 +166,7 @@ class Var:
         value: ArrayLike,
         _parents: tuple[Var, ...] = (),
         *,
-        dtype: object = None,
+        dtype: DTypeLike | None = None,
     ) -> None:
         xp = _xp()
         dt = current_dtype() if dtype is None else resolve_dtype(dtype)
@@ -180,7 +180,7 @@ class Var:
         # with ``_parents``; ``_vjp_params`` are its static keyword args. When present, the
         # differentiable backward looks up ``ops._VJP_FOR[_vjp_prim]`` to build each
         # operand's cotangent as a tape-connected ``Var`` (rather than mutating ``.grad``).
-        self._vjp_prim: object = None
+        self._vjp_prim: Prim | None = None
         self._vjp_operands: tuple[Var, ...] = ()
         self._vjp_params: dict[str, Any] = {}
 
@@ -189,7 +189,7 @@ class Var:
         self,
         value: ArrayLike,
         grad_fn: Callable[[Array, Array], Array],
-        prim: object = None,
+        prim: Prim | None = None,
     ) -> Var:
         out = Var(value, _parents=(self,))
 
@@ -208,7 +208,7 @@ class Var:
         other: Operand,
         value_fn: Callable[[Array, Array], Array],
         grad_fn: Callable[[Array, Array, Array], tuple[Array, Array]],
-        prim: object = None,
+        prim: Prim | None = None,
     ) -> Var:
         other = _lift(other)
         out = Var(value_fn(self.value, other.value), _parents=(self, other))
@@ -348,7 +348,7 @@ class Var:
         return out
 
     # -- numpy-style methods -------------------------------------------------
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> Callable[..., Var]:
         # Provide numpy's array-method surface (``x.sum(...)``, ``x.mean(...)``,
         # ``x.reshape(...)``, ``x.clip(...)``, ...) generically rather than enumerating
         # each: route a numpy function name we have a VJP rule for to its
@@ -490,13 +490,13 @@ class Var:
         # level and the cotangent graph carries second-order information.
         tracer_for = _hof_tracer_for()
 
-        def _connected(node: Var) -> object:
+        def _connected(node: Var) -> Boxed:
             return tracer_for.get(id(node), node)
 
-        cot: dict[int, object] = {}
+        cot: dict[int, Boxed] = {}
         # The seed cotangent is a constant (zero tangent at the enclosing level), so a
         # plain ``Var`` suffices; ``bind``-riding VJP ops lift it as needed.
-        seed: object = _lift(
+        seed: Boxed = _lift(
             _xp().ones_like(self.value) if cotangent is None else cotangent
         )
         cot[id(self)] = seed
@@ -527,7 +527,7 @@ class Var:
 
 def _record_vjp(
     out: Var,
-    prim: object,
+    prim: Prim,
     operands: tuple[Var, ...],
     params: dict[str, Any] | None = None,
 ) -> Var:

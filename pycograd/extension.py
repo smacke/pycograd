@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from pycograd._typing import Boxed, Prim
 from pycograd.params import frozen as _frozen
 from pycograd.params import tied as _tied
 from pycograd.tensor import Var
@@ -42,7 +43,7 @@ _PIPESCRIPT_MISSING_MSG = (
 )
 
 
-def _autodiff_hook(func: Any, value: Any) -> Any:
+def _autodiff_hook(func: Prim, value: Boxed) -> Prim:
     """A ``PipelineTracer`` application hook: when a ``Var`` flows into a pipe,
     resolve the applied function to its autodiff-aware form (numpy/math swap, or
     on-demand helper instrumentation). Defined at module scope so it has a stable

@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from typing import Any, Iterator, cast
+from typing import Any, Hashable, Iterator, cast
 
 from pycograd import _dims
 from pycograd._dims import Dim
 
 
-def _as_atom(x: object) -> tuple:
+def _as_atom(x: int | Dim) -> tuple:
     """Classify a dim as ``("int", v)``, ``("sym", key, name)``, or ``("expr",)``."""
     if isinstance(x, Dim):
         s = x.as_symbol()
@@ -37,16 +37,16 @@ class ConstraintEnv:
     """Union-find over symbol keys with at most one concrete value per class."""
 
     def __init__(self) -> None:
-        self.parent: dict = {}  # key -> parent key
-        self.value: dict = {}  # root key -> concrete int
-        self.name: dict = {}  # key -> rendered name
+        self.parent: dict[Hashable, Hashable] = {}  # key -> parent key
+        self.value: dict[Hashable, int] = {}  # root key -> concrete int
+        self.name: dict[Hashable, str] = {}  # key -> rendered name
 
-    def _add(self, key: object, name: str) -> None:
+    def _add(self, key: Hashable, name: str) -> None:
         if key not in self.parent:
             self.parent[key] = key
             self.name[key] = name
 
-    def _find(self, key: object) -> object:
+    def _find(self, key: Hashable) -> Hashable:
         root = key
         while self.parent[root] != root:
             root = self.parent[root]
@@ -55,12 +55,12 @@ class ConstraintEnv:
         return root
 
     @staticmethod
-    def _solvable(key: object) -> bool:
+    def _solvable(key: Hashable) -> bool:
         # Caller-declared input dims have string keys; data-dependent symbols (nonzero,
         # bcast, slice) have tuple keys and are never bound/merged.
         return isinstance(key, str)
 
-    def assert_eq(self, a: object, b: object) -> bool:
+    def assert_eq(self, a: int | Dim, b: int | Dim) -> bool:
         """Record ``a == b``; return ``False`` if that is a provable contradiction."""
         ta, tb = _as_atom(a), _as_atom(b)
         if ta[0] == "int" and tb[0] == "int":
@@ -103,10 +103,10 @@ class ConstraintEnv:
             self.value[r1] = v2
         return True
 
-    def mapping(self) -> dict:
+    def mapping(self) -> dict[Hashable, int | Dim]:
         """A substitution mapping each known symbol key to its concrete value (if its
         class is pinned) or to its class representative symbol (if merged)."""
-        m: dict = {}
+        m: dict[Hashable, int | Dim] = {}
         for key in self.parent:
             root = self._find(key)
             v = self.value.get(root)
@@ -139,7 +139,7 @@ def active_env() -> "ConstraintEnv | None":
     return _env.get()
 
 
-def register_eq(a: object, b: object) -> bool:
+def register_eq(a: int | Dim, b: int | Dim) -> bool:
     """Register ``a == b`` with the active env (if any); ``False`` on a provable
     contradiction. With no active env, falls back to the concrete-only check."""
     env = _env.get()

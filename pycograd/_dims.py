@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from typing import Any, Iterator, cast
+from typing import Any, Hashable, Iterator, cast
 
 import numpy as np
 
@@ -61,7 +61,7 @@ class Symbol(_Atom):
 
     __slots__ = ("key", "name")
 
-    def __init__(self, key: object, name: "str | None" = None) -> None:
+    def __init__(self, key: Hashable, name: "str | None" = None) -> None:
         self.key = key
         self.name = name if name is not None else _name_of(key)
 
@@ -86,7 +86,7 @@ class FloorDiv(_Atom):
 
     __slots__ = ("num", "den")
 
-    def __init__(self, num: object, den: object) -> None:
+    def __init__(self, num: int | Dim, den: int | Dim) -> None:
         self.num = num
         self.den = den
 
@@ -115,7 +115,7 @@ class FloorDiv(_Atom):
 # ---------------------------------------------------------------------------
 # Polynomial helpers (operate on the ``monomial -> coeff`` dicts).
 # ---------------------------------------------------------------------------
-def _as_poly(x: object) -> dict | None:
+def _as_poly(x: int | Dim) -> dict | None:
     if isinstance(x, Dim):
         return x._poly
     if _is_int(x):
@@ -177,7 +177,7 @@ class Dim:
         self._hash = hash(frozenset(poly.items()))
 
     # -- arithmetic ----------------------------------------------------------
-    def __add__(self, o: object) -> int | Dim:
+    def __add__(self, o: int | Dim) -> int | Dim:
         q = _as_poly(o)
         return NotImplemented if q is None else _make(_add_poly(self._poly, q))
 
@@ -186,25 +186,25 @@ class Dim:
     def __neg__(self) -> int | Dim:
         return _make({m: -c for m, c in self._poly.items()})
 
-    def __sub__(self, o: object) -> int | Dim:
+    def __sub__(self, o: int | Dim) -> int | Dim:
         q = _as_poly(o)
         if q is None:
             return NotImplemented
         return _make(_add_poly(self._poly, {m: -c for m, c in q.items()}))
 
-    def __rsub__(self, o: object) -> int | Dim:
+    def __rsub__(self, o: int | Dim) -> int | Dim:
         q = _as_poly(o)
         if q is None:
             return NotImplemented
         return _make(_add_poly({m: -c for m, c in self._poly.items()}, q))
 
-    def __mul__(self, o: object) -> int | Dim:
+    def __mul__(self, o: int | Dim) -> int | Dim:
         q = _as_poly(o)
         return NotImplemented if q is None else _make(_mul_poly(self._poly, q))
 
     __rmul__ = __mul__
 
-    def __floordiv__(self, o: object) -> int | Dim:
+    def __floordiv__(self, o: int | Dim) -> int | Dim:
         if _is_int(o):
             d = int(cast(Any, o))
             if d == 0:
@@ -218,13 +218,13 @@ class Dim:
             return _opaque_floordiv(self, o)
         return NotImplemented
 
-    def __rfloordiv__(self, o: object) -> int | Dim:
+    def __rfloordiv__(self, o: int | Dim) -> int | Dim:
         if _is_int(o):
             oi = int(cast(Any, o))
             return 0 if oi == 0 else _opaque_floordiv(oi, self)
         return NotImplemented
 
-    def __mod__(self, o: object) -> int | Dim:
+    def __mod__(self, o: int | Dim) -> int | Dim:
         # a % b == a - (a // b) * b; divisible cases collapse to 0.
         q = self // o
         return self - q * cast(Any, o)
@@ -245,7 +245,7 @@ class Dim:
         return self._hash
 
     # -- substitution / inspection -------------------------------------------
-    def subs(self, mapping: "dict") -> int | Dim:
+    def subs(self, mapping: "dict[Hashable, int | Dim]") -> int | Dim:
         """Replace symbols whose ``key`` is in ``mapping`` with the mapped value (an
         int or another dim) and re-evaluate the polynomial. Unmapped symbols stay."""
         total: int | Dim = 0
@@ -270,9 +270,9 @@ class Dim:
             return None
         return (atom.key, atom.name)
 
-    def symbol_keys(self) -> set:
+    def symbol_keys(self) -> set[Hashable]:
         """The set of distinct symbol keys appearing anywhere in this expression."""
-        keys: set = set()
+        keys: set[Hashable] = set()
         for mono in self._poly:
             for atom, _ in mono:
                 _collect_keys(atom, keys)
@@ -288,15 +288,15 @@ class Dim:
     __repr__ = __str__
 
 
-def _opaque_floordiv(num: object, den: object) -> int | Dim:
+def _opaque_floordiv(num: int | Dim, den: int | Dim) -> int | Dim:
     return _make({((FloorDiv(num, den), 1),): 1})
 
 
-def _val_subs(x: object, mapping: dict) -> "int | Dim":
+def _val_subs(x: int | Dim, mapping: dict[Hashable, int | Dim]) -> "int | Dim":
     return x.subs(mapping) if isinstance(x, Dim) else cast("int | Dim", x)
 
 
-def _atom_subs(atom: _Atom, mapping: dict) -> "int | Dim":
+def _atom_subs(atom: _Atom, mapping: dict[Hashable, int | Dim]) -> "int | Dim":
     if isinstance(atom, Symbol):
         if atom.key in mapping:
             return mapping[atom.key]
@@ -305,7 +305,7 @@ def _atom_subs(atom: _Atom, mapping: dict) -> "int | Dim":
     return _val_subs(fd.num, mapping) // _val_subs(fd.den, mapping)
 
 
-def _collect_keys(atom: _Atom, keys: set) -> None:
+def _collect_keys(atom: _Atom, keys: set[Hashable]) -> None:
     if isinstance(atom, Symbol):
         keys.add(atom.key)
         return
@@ -334,7 +334,7 @@ def _fmt_term(mono: Monomial, c: int) -> str:
     return f"{c}*{body}"
 
 
-def symbol(key: object, name: "str | None" = None) -> Dim:
+def symbol(key: Hashable, name: "str | None" = None) -> Dim:
     """A symbolic dimension identified by the hashable ``key`` (equal keys are the same
     symbol). ``name`` overrides the rendered text -- used for caller-declared input
     dims like ``symbol("B", name="B")``; internal symbols leave it ``None`` to get an
@@ -362,7 +362,7 @@ def naming_scope() -> Iterator[None]:
         _naming.reset(token)
 
 
-def _name_of(key: object) -> str:
+def _name_of(key: Hashable) -> str:
     """Assign (or reuse) a name for ``key`` from the active scope's counter."""
     reg = _naming.get()
     names, ctr = reg if reg is not None else (_GLOBAL_NAMES, _GLOBAL_CTR)
@@ -375,22 +375,22 @@ def _name_of(key: object) -> str:
 # ---------------------------------------------------------------------------
 # Numeric helpers the shape rules call (symbol-aware, int fast paths).
 # ---------------------------------------------------------------------------
-def has_symbol(shape: tuple) -> bool:
+def has_symbol(shape: tuple[int | Dim, ...]) -> bool:
     return any(isinstance(d, Dim) for d in shape)
 
 
-def prod_dims(shape: tuple) -> int | Dim:
+def prod_dims(shape: tuple[int | Dim, ...]) -> int | Dim:
     """The product of a shape's dims -- a plain int unless any dim is symbolic."""
     shape = tuple(shape)
     if not has_symbol(shape):
-        return int(np.prod(shape, dtype=np.int64)) if shape else 1
+        return int(np.prod(cast(Any, shape), dtype=np.int64)) if shape else 1
     acc: int | Dim = 1
     for d in shape:
         acc = acc * d
     return acc
 
 
-def provably_unequal(a: object, b: object) -> bool:
+def provably_unequal(a: int | Dim, b: int | Dim) -> bool:
     """True only when both dims are concrete ints and differ -- the safe gate for a
     contract check: a symbolic dim is never *proven* unequal, so it never raises."""
     if isinstance(a, Dim) or isinstance(b, Dim):
@@ -398,7 +398,7 @@ def provably_unequal(a: object, b: object) -> bool:
     return _is_int(a) and _is_int(b) and a != b
 
 
-def broadcast_dim(a: object, b: object) -> int | Dim:
+def broadcast_dim(a: int | Dim, b: int | Dim) -> int | Dim:
     """Broadcast two dims. Concrete ``1`` yields the other; a concrete ``>1`` pins a
     symbolic partner; two distinct symbolics yield an interned ``bcast`` symbol."""
     if isinstance(a, Dim) or isinstance(b, Dim):
@@ -419,12 +419,12 @@ def broadcast_dim(a: object, b: object) -> int | Dim:
     raise ValueError(f"cannot broadcast dims {a} and {b}")
 
 
-def broadcast_shapes(*shapes: tuple) -> tuple:
+def broadcast_shapes(*shapes: tuple[int | Dim, ...]) -> tuple[int | Dim, ...]:
     """Right-aligned broadcast tolerant of symbolic dims. Falls back to numpy (and
     its exact error) when every shape is concrete."""
     shapes = tuple(tuple(s) for s in shapes)
     if not any(has_symbol(s) for s in shapes):
-        return tuple(int(d) for d in np.broadcast_shapes(*shapes))
+        return tuple(int(d) for d in np.broadcast_shapes(*cast(Any, shapes)))
     ndim = max((len(s) for s in shapes), default=0)
     out: list = [1] * ndim
     for s in shapes:
@@ -434,7 +434,7 @@ def broadcast_shapes(*shapes: tuple) -> tuple:
     return tuple(out)
 
 
-def slice_dim(dim: object, s: slice) -> int | Dim:
+def slice_dim(dim: int | Dim, s: slice) -> int | Dim:
     """Length of ``range``-applied ``s`` over a dimension. Concrete when ``dim`` is an
     int; otherwise resolved symbolically for the common slices, else a fresh symbol."""
     if not isinstance(dim, Dim):

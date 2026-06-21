@@ -17,13 +17,26 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Callable, Iterable, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, cast
 
 import numpy as np
 
-from pycograd._typing import Array, Axis, Index, Operand, Shape
+from pycograd._typing import (
+    Array,
+    Axis,
+    BindArg,
+    Boxed,
+    DTypeLike,
+    Index,
+    Operand,
+    Prim,
+    Shape,
+)
 from pycograd.backends import current_backend
 from pycograd.tensor import Var, _lift, _record_vjp, _unbroadcast, _xp
+
+if TYPE_CHECKING:
+    from pycograd.forward import JVPTrace, JVPTracer
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +119,7 @@ def d_reciprocal(x: Operand) -> Var:
 # Elementwise binary / selection.
 # ---------------------------------------------------------------------------
 def _elementwise_max(
-    a: Operand, b: Operand, pick_a: Callable[..., Array], prim: object
+    a: Operand, b: Operand, pick_a: Callable[..., Array], prim: Prim
 ) -> Var:
     a, b = _lift(a), _lift(b)
     out = Var(pick_a(a.value, b.value), _parents=(a, b))
@@ -214,7 +227,7 @@ def d_ne(a: Operand, b: Operand) -> Array:
     return _lift(a) != b
 
 
-def d_getitem(x: Operand, key: object) -> Var:
+def d_getitem(x: Operand, key: Index) -> Var:
     return _lift(x)[key]
 
 
@@ -285,11 +298,11 @@ def d_mean(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
 def d_var(
     x: Operand,
     axis: Axis = None,
-    dtype: object = None,
-    out: object = None,
+    dtype: DTypeLike | None = None,
+    out: Array | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-    **_: object,
+    **_: Any,
 ) -> Var:
     # Composed from mean/centering/square -- gradient flows for free; the numpy
     # signature order (a, axis, dtype, out, ddof, keepdims) is mirrored so
@@ -303,11 +316,11 @@ def d_var(
 def d_std(
     x: Operand,
     axis: Axis = None,
-    dtype: object = None,
-    out: object = None,
+    dtype: DTypeLike | None = None,
+    out: Array | None = None,
     ddof: int = 0,
     keepdims: bool = False,
-    **_: object,
+    **_: Any,
 ) -> Var:
     return d_var(x, axis=axis, ddof=ddof, keepdims=keepdims) ** 0.5
 
@@ -317,7 +330,7 @@ def _reduce_select(
     axis: Axis,
     keepdims: bool,
     reducer: Callable[..., Array],
-    prim: object,
+    prim: Prim,
 ) -> Var:
     # max/min: the gradient flows only to the selected element(s), split on ties.
     x, xp = _lift(x), _xp()
@@ -512,7 +525,7 @@ def d_dstack(seq: Sequence[Operand]) -> Var:
 # Each differentiable primitive is listed once alongside every numpy/math
 # callable that should route to it (e.g. np.exp and math.exp share d_exp); the
 # flat lookup the tracer uses is denormalized from this below.
-_RULES: dict[Callable[..., object], tuple[object, ...]] = {
+_RULES: dict[Prim, tuple[Prim, ...]] = {
     # operator primitives -- no numpy callable swaps to these (operators are not
     # numpy functions), so their tuples are empty: they contribute no ``_INTERCEPT``
     # key (coverage parity with the numpy-keyed tables is preserved) but are still
@@ -577,9 +590,7 @@ _RULES: dict[Callable[..., object], tuple[object, ...]] = {
     d_dstack: (np.dstack,),
 }
 
-_INTERCEPT: dict[object, Callable[..., object]] = {
-    fn: impl for impl, fns in _RULES.items() for fn in fns
-}
+_INTERCEPT: dict[Prim, Prim] = {fn: impl for impl, fns in _RULES.items() for fn in fns}
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +612,7 @@ _INTERCEPT: dict[object, Callable[..., object]] = {
 # *primals* and treat it as a CONSTANT (the ``forward.py`` convention), giving the correct
 # a.e. zero second derivative through the kink.
 # ---------------------------------------------------------------------------
-def _b(prim: Callable[..., object], *args: object, **kw: object) -> object:
+def _b(prim: Prim, *args: BindArg, **kw: Any) -> Boxed:
     from pycograd.trace import bind
 
     return bind(prim, *args, **kw)
@@ -616,7 +627,7 @@ def _const_like(arr: Array) -> Var:
 # Local-derivative helpers for the elementwise-unary VJPs, written with ``_b`` (``bind``)
 # so each tangent rides the enclosing level. ``primal`` is the level-connected operand;
 # ``f'(primal)`` times the upstream cotangent is the operand cotangent.
-def _vjp_unary_derivs() -> dict[object, Callable[[object], object]]:
+def _vjp_unary_derivs() -> dict[Prim, Callable[[Boxed], Boxed]]:
     return {
         d_exp: lambda a: _b(d_exp, a),
         d_log: lambda a: _b(d_reciprocal, a),
@@ -634,45 +645,85 @@ def _vjp_unary_derivs() -> dict[object, Callable[[object], object]]:
     }
 
 
-def _vjp_unary_for(prim: Callable[..., Var]) -> Callable[..., list[object]]:
+def _vjp_unary_for(prim: Callable[..., Var]) -> Callable[..., list[Boxed]]:
     derivs = _VJP_UNARY_DERIVS
 
-    def rule(primals, operands, params, g):  # type: ignore[no-untyped-def]
+    def rule(
+        primals: tuple[Var, ...],
+        operands: tuple[Boxed, ...],
+        params: dict[str, Any],
+        g: Boxed,
+    ) -> list[Boxed]:
         (a,) = operands
         return [_b(d_mul, g, derivs[prim](a))]
 
     return rule
 
 
-def _vjp_abs(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_abs(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     # sign(primal) is a piecewise-constant derivative -> a stop-gradient constant.
     (p,) = primals
     return [_b(d_mul, g, _const_like(_xp().sign(p.value)))]
 
 
-def _vjp_add(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_add(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     return [g, g]
 
 
-def _vjp_sub(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_sub(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     return [g, _b(d_neg, g)]
 
 
-def _vjp_neg(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_neg(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     return [_b(d_neg, g)]
 
 
-def _vjp_mul(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_mul(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     a, b = operands
     return [_b(d_mul, g, b), _b(d_mul, g, a)]
 
 
-def _vjp_div(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_div(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     a, b = operands
     return [_b(d_div, g, b), _b(d_neg, _b(d_div, _b(d_mul, g, a), _b(d_mul, b, b)))]
 
 
-def _vjp_pow(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_pow(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     # Only the base-operand cotangent: ``Var.__pow__`` rides ``d_pow`` only for a constant
     # exponent (a ``Var`` exponent is lowered to exp/log), so the exponent has no gradient.
     # The exponent stays a *raw scalar/array* (not a ``Var``) so ``d_pow`` keeps the power
@@ -684,12 +735,17 @@ def _vjp_pow(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [ga, None]
 
 
-def _swap_last2(x: object, ndim: int) -> object:
+def _swap_last2(x: Boxed, ndim: int) -> Boxed:
     axes = tuple(range(ndim - 2)) + (ndim - 1, ndim - 2)
     return _b(d_transpose, x, axes)
 
 
-def _vjp_matmul(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_matmul(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     a, b = operands
     pa, pb = primals
     na, nb = pa.value.ndim, pb.value.ndim
@@ -713,7 +769,12 @@ def _vjp_matmul(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [_b(_matmul, g, _swap_last2(b, nb)), _b(_matmul, _swap_last2(a, na), g)]
 
 
-def _vjp_getitem(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_getitem(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     # The reverse VJP of a gather is a scatter-add into a zero buffer; that scatter (the
     # internal ``_scatter`` primitive) is linear in ``g`` and rides ``bind``, and its *own*
     # VJP is another gather (no new scatter primitive needed) -- so a second-order pass
@@ -723,7 +784,7 @@ def _vjp_getitem(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [_b(_scatter, g, key, p.value.shape, p.value.dtype)]
 
 
-def _scatter(g: Operand, key: object, shape: tuple[int, ...], dtype: object) -> Var:
+def _scatter(g: Operand, key: Index, shape: tuple[int, ...], dtype: DTypeLike) -> Var:
     """Scatter-add ``g`` into a zero buffer of ``shape`` at ``key`` (the reverse VJP of a
     gather). An internal primitive: linear in ``g``, with a JVP rule (``d scatter(g) =
     scatter(dg)``) and a differentiable VJP (a gather at ``key``), so it composes with a
@@ -743,7 +804,13 @@ def _scatter(g: Operand, key: object, shape: tuple[int, ...], dtype: object) -> 
     return out
 
 
-def _jvp_scatter(trace, g, key, shape, dtype):  # type: ignore[no-untyped-def]
+def _jvp_scatter(
+    trace: "JVPTrace",
+    g: Boxed,
+    key: Index,
+    shape: tuple[int, ...],
+    dtype: DTypeLike,
+) -> "JVPTracer":
     """JVP of the internal scatter: it is linear, so the tangent scatters the same way."""
     from pycograd.trace import bind
 
@@ -755,19 +822,29 @@ def _jvp_scatter(trace, g, key, shape, dtype):  # type: ignore[no-untyped-def]
     return JVPTracer(trace, primal_out, tangent_out)
 
 
-def _vjp_scatter(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_scatter(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     # VJP of scatter-add is a gather of the cotangent at the same key.
     return [_b(d_getitem, g, params["key"])]
 
 
-def _expand_dims_multi(g: object, axis: int | tuple[int, ...]) -> object:
+def _expand_dims_multi(g: Boxed, axis: int | tuple[int, ...]) -> Boxed:
     axes = axis if isinstance(axis, tuple) else (axis,)
     for ax in sorted(axes):
         g = _b(d_expand_dims, g, ax)
     return g
 
 
-def _vjp_sum(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_sum(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     (p,) = primals
     axis = params.get("axis")
     keepdims = params.get("keepdims", False)
@@ -776,30 +853,50 @@ def _vjp_sum(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [_b(d_broadcast_to, g, p.value.shape)]
 
 
-def _vjp_reshape(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_reshape(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     (p,) = primals
     return [_b(d_reshape, g, p.value.shape)]
 
 
-def _vjp_broadcast_to(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_broadcast_to(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     from pycograd.tensor import _d_unbroadcast
 
     (p,) = primals
     return [_d_unbroadcast(g, p.value.shape)]
 
 
-def _vjp_transpose(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_transpose(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     axes = params.get("axes")
     if axes is None:
         return [_b(d_transpose, g)]
     return [_b(d_transpose, g, tuple(int(a) for a in np.argsort(axes)))]
 
 
-def _vjp_concatenate(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_concatenate(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     axis = params.get("axis", 0)
     ndim = primals[0].value.ndim
     ax = axis % ndim
-    out: list[object] = []
+    out: list[Boxed] = []
     start = 0
     for p in primals:
         end = start + p.value.shape[ax]
@@ -809,7 +906,12 @@ def _vjp_concatenate(primals, operands, params, g):  # type: ignore[no-untyped-d
     return out
 
 
-def _vjp_reduce_select(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_reduce_select(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     (p,) = primals
     axis = params.get("axis")
     keepdims = params.get("keepdims", False)
@@ -822,7 +924,12 @@ def _vjp_reduce_select(primals, operands, params, g):  # type: ignore[no-untyped
     return [_b(d_mul, g, _const_like(mask))]
 
 
-def _vjp_select(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_select(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     # max/min of two operands: mask (from primals) is a stop-gradient constant.
     pa, _pb = primals
     out_val = params["out_value"]
@@ -830,7 +937,12 @@ def _vjp_select(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [_b(d_mul, g, _const_like(mask)), _b(d_mul, g, _const_like(1.0 - mask))]
 
 
-def _vjp_where(primals, operands, params, g):  # type: ignore[no-untyped-def]
+def _vjp_where(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
     pa, _pb = primals
     cond = params["cond"]
     xp = _xp()
@@ -839,8 +951,8 @@ def _vjp_where(primals, operands, params, g):  # type: ignore[no-untyped-def]
     return [_b(d_mul, g, cmask), _b(d_mul, g, omask)]
 
 
-def _build_vjp_for() -> dict[object, Callable[..., list[object]]]:
-    vjp_for: dict[object, Callable[..., list[object]]] = {
+def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
+    vjp_for: dict[Prim, Callable[..., list[Boxed]]] = {
         prim: _vjp_unary_for(cast(Callable[..., Var], prim))
         for prim in _VJP_UNARY_DERIVS
     }
@@ -872,11 +984,11 @@ def _build_vjp_for() -> dict[object, Callable[..., list[object]]]:
     return vjp_for
 
 
-_VJP_UNARY_DERIVS: dict[object, Callable[[object], object]] = _vjp_unary_derivs()
-_VJP_FOR: dict[object, Callable[..., list[object]]] = _build_vjp_for()
+_VJP_UNARY_DERIVS: dict[Prim, Callable[[Boxed], Boxed]] = _vjp_unary_derivs()
+_VJP_FOR: dict[Prim, Callable[..., list[Boxed]]] = _build_vjp_for()
 
 
-def _vjp_contributions(v: Var, g: object, operands: tuple[object, ...]) -> list[object]:
+def _vjp_contributions(v: Var, g: Boxed, operands: tuple[Boxed, ...]) -> list[Boxed]:
     """Per-parent cotangent contributions for node ``v`` given its cotangent ``g``.
 
     ``operands`` are the level-connected operands (a ``JVPTracer`` wrapping each primal
@@ -911,7 +1023,7 @@ def _contains_var(values: Iterable[object]) -> bool:
     return False
 
 
-def _is_mathy(func: Callable[..., object]) -> bool:
+def _is_mathy(func: Prim) -> bool:
     # numpy ufuncs / numpy functions / the math module are the calls that bypass
     # our operator overloading and silently drop gradients; builtins like abs/sum
     # work through dunder dispatch and must NOT be flagged.
@@ -921,10 +1033,10 @@ def _is_mathy(func: Callable[..., object]) -> bool:
     return module == "math" or module.startswith("numpy")
 
 
-_WRAPPERS: dict[Callable[..., object], Callable[..., object]] = {}
+_WRAPPERS: dict[Prim, Prim] = {}
 
 
-def _warn_wrapper(func: Callable[..., object]) -> Callable[..., object]:
+def _warn_wrapper(func: Prim) -> Prim:
     wrapper = _WRAPPERS.get(func)
     if wrapper is not None:
         return wrapper

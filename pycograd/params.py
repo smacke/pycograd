@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, cast
 
 import numpy as np
 
-from pycograd._typing import Array, ArrayLike, Index, Operand
+from pycograd._typing import Array, ArrayLike, Index, Operand, Prim
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, _warn_wrapper
 from pycograd.tensor import Var, _is_numeric, _value
@@ -45,7 +45,7 @@ class Param:
 
     value: Array
     trainable: bool = True
-    tie: object = None
+    tie: Hashable | None = None
     # Stamped by the ``params{...}`` DSL with the block that declared this param,
     # so ``value_and_grad`` can reject a weight also passed in by hand.
     origin: object = None
@@ -74,7 +74,7 @@ class _TieRef:
 
     __slots__ = ("target",)
 
-    def __init__(self, target: object) -> None:
+    def __init__(self, target: Operand | Param) -> None:
         self.target = target
 
 
@@ -83,10 +83,10 @@ class _Tied:
     ``tied[w]`` (inside a ``params(...)`` block) ties to the sibling parameter ``w``
     by reference -- just the name, with no restatement of its initializer."""
 
-    def __call__(self, key: object, value: ArrayLike) -> Param:
+    def __call__(self, key: Hashable, value: ArrayLike) -> Param:
         return Param(np.asarray(value, dtype=current_dtype()), tie=key)
 
-    def __getitem__(self, ref: object) -> _TieRef:
+    def __getitem__(self, ref: Operand | Param) -> _TieRef:
         return _TieRef(ref)
 
 
@@ -159,35 +159,35 @@ class Weight:
         return cast(Array, self._live())
 
     # -- operators: forward to the live value, unwrapping proxy operands ----------
-    def __matmul__(self, o: object) -> Operand:
+    def __matmul__(self, o: Operand) -> Operand:
         return self._arr() @ _as_arr(o)
 
-    def __rmatmul__(self, o: object) -> Operand:
+    def __rmatmul__(self, o: Operand) -> Operand:
         return _as_arr(o) @ self._arr()
 
-    def __add__(self, o: object) -> Operand:
+    def __add__(self, o: Operand) -> Operand:
         return self._arr() + _as_arr(o)
 
     __radd__ = __add__
 
-    def __sub__(self, o: object) -> Operand:
+    def __sub__(self, o: Operand) -> Operand:
         return self._arr() - _as_arr(o)
 
-    def __rsub__(self, o: object) -> Operand:
+    def __rsub__(self, o: Operand) -> Operand:
         return _as_arr(o) - self._arr()
 
-    def __mul__(self, o: object) -> Operand:
+    def __mul__(self, o: Operand) -> Operand:
         return self._arr() * _as_arr(o)
 
     __rmul__ = __mul__
 
-    def __truediv__(self, o: object) -> Operand:
+    def __truediv__(self, o: Operand) -> Operand:
         return self._arr() / _as_arr(o)
 
-    def __rtruediv__(self, o: object) -> Operand:
+    def __rtruediv__(self, o: Operand) -> Operand:
         return _as_arr(o) / self._arr()
 
-    def __pow__(self, o: object) -> Operand:
+    def __pow__(self, o: Operand) -> Operand:
         return self._arr() ** _as_arr(o)
 
     def __neg__(self) -> Operand:
@@ -214,7 +214,7 @@ class Weight:
 
     # -- numpy dispatch: route a ufunc / array-function over a bare weight --------
     def __array_ufunc__(
-        self, ufunc: object, method: str, *inputs: object, **kwargs: object
+        self, ufunc: Prim, method: str, *inputs: object, **kwargs: Any
     ) -> object:
         if method != "__call__":
             return NotImplemented
@@ -222,19 +222,15 @@ class Weight:
             prim = _INTERCEPT.get(ufunc)
             if prim is not None:
                 return prim(*[_unwrap(i) for i in inputs], **kwargs)
-            return _warn_wrapper(cast("Callable[..., object]", ufunc))(
-                *[_deep_unwrap(i) for i in inputs], **kwargs
-            )
-        return cast("Callable[..., object]", ufunc)(
-            *[_deep_unwrap(i) for i in inputs], **kwargs
-        )
+            return _warn_wrapper(ufunc)(*[_deep_unwrap(i) for i in inputs], **kwargs)
+        return ufunc(*[_deep_unwrap(i) for i in inputs], **kwargs)
 
     def __array_function__(
         self,
-        func: Callable[..., object],
-        types: object,
+        func: Prim,
+        types: Iterable[type],
         args: tuple[object, ...],
-        kwargs: dict[str, object],
+        kwargs: dict[str, Any],
     ) -> object:
         if _any_recording(args):
             prim = _INTERCEPT.get(func)
@@ -337,7 +333,7 @@ class ParamDict(dict):
                     del g[key]
             self._scope = None
 
-    def grad(self, objective: Callable[[], object]) -> tuple[Array, ParamDict]:
+    def grad(self, objective: Callable[[], PyTree]) -> tuple[Array, ParamDict]:
         """Run ``objective`` (a no-arg callable returning a scalar, built from this
         model) with the weights bound to ``Var``s, backprop, and return
         ``(value, grads)`` where ``grads`` is a ``ParamDict`` of gradients (``None``
@@ -346,7 +342,7 @@ class ParamDict(dict):
         from pycograd.tracer import _INSTRUMENTED, _make_runner
         from pycograd.transforms import _wrap_leaf
 
-        tie_vars: dict[object, Var] = {}
+        tie_vars: dict[Hashable, Var] = {}
         live: dict[str, object] = {}
         grad_vars: dict[str, Var | None] = {}
         for key in self:
@@ -421,7 +417,7 @@ def params(spec: dict[str, PyTree] | None = None, **named: PyTree) -> ParamDict:
         arr = value.value if isinstance(value, Param) else value
         if isinstance(arr, np.ndarray):
             declarer.setdefault(id(arr), name)
-    tie_keys: dict[str, object] = {}  # target name -> shared tie sentinel
+    tie_keys: dict[str, Hashable] = {}  # target name -> shared tie sentinel
 
     def wrap(v: PyTree, key: str | None = None) -> PyTree:
         if isinstance(v, _TieRef):

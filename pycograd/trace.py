@@ -31,9 +31,14 @@ import ast
 import contextlib
 import contextvars
 import operator
-from typing import Any, Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from pycograd import ops
+from pycograd._typing import BindArg, Boxed, Index, Prim
+
+if TYPE_CHECKING:
+    from pycograd._dims import Dim
+    from pycograd.shapes import ShapeDtypeStruct
 
 
 # ---------------------------------------------------------------------------
@@ -72,15 +77,15 @@ class Trace:
     def __init__(self, main: MainTrace) -> None:
         self.main = main
 
-    def pure(self, val: object) -> object:
+    def pure(self, val: Boxed) -> Boxed:
         raise NotImplementedError
 
-    def lift(self, val: object) -> object:
+    def lift(self, val: Boxed) -> Boxed:
         raise NotImplementedError
 
     def process_primitive(
-        self, prim: Callable[..., object], args: Sequence[object], params: dict
-    ) -> object:
+        self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
+    ) -> Boxed:
         """Process ``prim`` over its *raw* call arguments at this level.
 
         ``args`` are the operands exactly as ``bind`` received them (not pre-raised);
@@ -104,16 +109,16 @@ class Tracer:
     _trace: Trace
 
     @property
-    def aval(self) -> object:
+    def aval(self) -> "ShapeDtypeStruct":
         raise NotImplementedError
 
     @property
-    def shape(self) -> object:
-        return self.aval.shape  # type: ignore[attr-defined]
+    def shape(self) -> "tuple[int | Dim, ...]":
+        return self.aval.shape
 
     @property
     def ndim(self) -> int:
-        return len(self.aval.shape)  # type: ignore[attr-defined]
+        return len(self.aval.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +135,14 @@ class EvalTrace(Trace):
     stack just adds a uniform entry point above it.
     """
 
-    def pure(self, val: object) -> object:
+    def pure(self, val: Boxed) -> Boxed:
         return val
 
     lift = pure
 
     def process_primitive(
-        self, prim: Callable[..., object], args: Sequence[object], params: dict
-    ) -> object:
+        self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
+    ) -> Boxed:
         return prim(*args, **params)
 
 
@@ -165,14 +170,14 @@ class ReverseTrace(Trace):
     the :class:`Trace` interface.
     """
 
-    def pure(self, val: object) -> object:  # pragma: no cover - never selected
+    def pure(self, val: Boxed) -> Boxed:  # pragma: no cover - never selected
         return val
 
     lift = pure
 
     def process_primitive(  # pragma: no cover - never selected
-        self, prim: Callable[..., object], args: Sequence[object], params: dict
-    ) -> object:
+        self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
+    ) -> Boxed:
         return prim(*args, **params)
 
 
@@ -225,7 +230,7 @@ def new_main(
         trace_stack.reset(token)
 
 
-def _iter_tracers(args: Sequence[object]) -> "list[Tracer]":
+def _iter_tracers(args: Sequence[BindArg]) -> "list[Tracer]":
     """The :class:`Tracer` operands among ``args``, recursing one level into lists/tuples
     (so a batched operand inside a ``concatenate``/``stack`` sequence, or a batched index
     key, still raises the trace level)."""
@@ -238,7 +243,7 @@ def _iter_tracers(args: Sequence[object]) -> "list[Tracer]":
     return out
 
 
-def find_top_trace(args: Sequence[object]) -> Trace:
+def find_top_trace(args: Sequence[BindArg]) -> Trace:
     """The highest-level interpreter among ``args`` (the base ``EvalTrace`` if none).
 
     Only :class:`Tracer` operands carry a level; raw arrays / ``Var``s are level 0, so
@@ -254,7 +259,7 @@ def find_top_trace(args: Sequence[object]) -> Trace:
     return top.trace_type(top)
 
 
-def full_raise(trace: Trace, val: object) -> object:
+def full_raise(trace: Trace, val: Boxed) -> Boxed:
     """Lift ``val`` into ``trace``'s level.
 
     A value already at this level passes through; a :class:`Tracer` from a lower level
@@ -282,7 +287,7 @@ def full_raise(trace: Trace, val: object) -> object:
 # base-level values through the tape; the raw operator is invoked verbatim when no value
 # the stack manages is present (plain numbers/arrays, the abstract ``ShapedArray``), so
 # their own dunders run and their behavior is unchanged.
-_BINOP_PRIM: dict[type, tuple[Callable[..., object], Callable[..., object]]] = {
+_BINOP_PRIM: dict[type, tuple[Prim, Prim]] = {
     ast.Add: (ops.d_add, operator.add),
     ast.Sub: (ops.d_sub, operator.sub),
     ast.Mult: (ops.d_mul, operator.mul),
@@ -291,11 +296,11 @@ _BINOP_PRIM: dict[type, tuple[Callable[..., object], Callable[..., object]]] = {
     ast.MatMult: (ops._matmul, operator.matmul),
 }
 
-_UNARYOP_PRIM: dict[type, tuple[Callable[..., object], Callable[..., object]]] = {
+_UNARYOP_PRIM: dict[type, tuple[Prim, Prim]] = {
     ast.USub: (ops.d_neg, operator.neg),
 }
 
-_COMPARE_PRIM: dict[type, tuple[Callable[..., object], Callable[..., object]]] = {
+_COMPARE_PRIM: dict[type, tuple[Prim, Prim]] = {
     ast.Lt: (ops.d_lt, operator.lt),
     ast.LtE: (ops.d_le, operator.le),
     ast.Gt: (ops.d_gt, operator.gt),
@@ -305,7 +310,7 @@ _COMPARE_PRIM: dict[type, tuple[Callable[..., object], Callable[..., object]]] =
 }
 
 # ast op type -> differentiable primitive (the ``_OP_PRIM`` table the plan names).
-_OP_PRIM: dict[type, Callable[..., object]] = {
+_OP_PRIM: dict[type, Prim] = {
     **{op: prim for op, (prim, _) in _BINOP_PRIM.items()},
     **{op: prim for op, (prim, _) in _UNARYOP_PRIM.items()},
     **{op: prim for op, (prim, _) in _COMPARE_PRIM.items()},
@@ -315,7 +320,7 @@ _OP_PRIM: dict[type, Callable[..., object]] = {
 }
 
 # The reverse map a managed-or-not fall-through needs: primitive -> raw operator.
-_RAW_OPERATOR: dict[Callable[..., object], Callable[..., object]] = {
+_RAW_OPERATOR: dict[Prim, Prim] = {
     prim: raw
     for table in (_BINOP_PRIM, _UNARYOP_PRIM, _COMPARE_PRIM)
     for prim, raw in table.values()
@@ -343,10 +348,10 @@ class _SubscriptProxy:
 
     __slots__ = ("_obj",)
 
-    def __init__(self, obj: object) -> None:
+    def __init__(self, obj: Boxed) -> None:
         self._obj = obj
 
-    def __getitem__(self, key: object) -> object:
+    def __getitem__(self, key: Index) -> Boxed:
         from pycograd.tensor import Var
 
         if isinstance(self._obj, Var) or _iter_tracers(
@@ -356,7 +361,7 @@ class _SubscriptProxy:
         return self._obj[key]  # type: ignore[index]
 
 
-def _is_managed(val: object) -> bool:
+def _is_managed(val: BindArg) -> bool:
     """True for a value the base level (``EvalTrace``) drives through a ``d_*`` operator
     primitive: a :class:`~pycograd.tensor.Var`.
 
@@ -375,7 +380,7 @@ def _is_managed(val: object) -> bool:
 # ---------------------------------------------------------------------------
 # bind: the single entry point every (intercepted) operation flows through.
 # ---------------------------------------------------------------------------
-def bind(prim: Callable[..., object], *args: object, **params: Any) -> object:
+def bind(prim: Prim, *args: BindArg, **params: Any) -> Boxed:
     """Dispatch ``prim`` over ``args`` through the trace-level stack.
 
     Find the top trace among the operands (searching one level into sequences, so a

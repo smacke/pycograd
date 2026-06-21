@@ -17,16 +17,18 @@ attention nets that matmul rank-2 weights compile cleanly.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from types import ModuleType
+from typing import Callable, Mapping
 
 import numpy as np
 
+from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT
 
 
-def _as_tf(tf: Any, x: Any) -> Any:
+def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
     """Convert ``x`` to a tf tensor in the active working dtype (bf16 via float32)."""
     if tf.is_tensor(x) or isinstance(x, tf.Variable):
         return x
@@ -37,7 +39,7 @@ def _as_tf(tf: Any, x: Any) -> Any:
     return tf.constant(np.asarray(x, dtype=dt))
 
 
-def _tf_to_numpy(tf: Any, t: Any) -> Any:
+def _tf_to_numpy(tf: ModuleType, t: BackendArray) -> Array:
     """A tf tensor back to numpy, preserving bfloat16 via ``ml_dtypes`` (float32 bridge)."""
     if tf.is_tensor(t) or isinstance(t, tf.Variable):
         if t.dtype == tf.bfloat16:
@@ -48,14 +50,14 @@ def _tf_to_numpy(tf: Any, t: Any) -> Any:
     return np.asarray(t)
 
 
-def _make_adapters(tf: Any) -> dict:
-    def as_t(x: Any) -> Any:
+def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
+    def as_t(x: BackendArray) -> BackendArray:
         return _as_tf(tf, x)
 
-    def unary(fn: Callable[..., object]) -> Callable[..., object]:
+    def unary(fn: Prim) -> Prim:
         return lambda x: fn(as_t(x))
 
-    def matmul(a: Any, b: Any) -> object:
+    def matmul(a: BackendArray, b: BackendArray) -> BackendArray:
         a, b = as_t(a), as_t(b)
         ar, br = len(a.shape), len(b.shape)
         if ar == 1 and br == 1:
@@ -66,16 +68,18 @@ def _make_adapters(tf: Any) -> dict:
             return tf.linalg.matvec(b, a, transpose_a=True)
         return tf.matmul(a, b)
 
-    def maximum(a: object, b: object) -> object:
+    def maximum(a: BackendArray, b: BackendArray) -> BackendArray:
         return tf.maximum(as_t(a), as_t(b))
 
-    def minimum(a: object, b: object) -> object:
+    def minimum(a: BackendArray, b: BackendArray) -> BackendArray:
         return tf.minimum(as_t(a), as_t(b))
 
-    def where(cond: object, a: object, b: object) -> object:
+    def where(cond: BackendArray, a: BackendArray, b: BackendArray) -> BackendArray:
         return tf.where(cond, as_t(a), as_t(b))
 
-    def clip(x: object, a_min: object = None, a_max: object = None) -> object:
+    def clip(
+        x: BackendArray, a_min: BackendArray = None, a_max: BackendArray = None
+    ) -> BackendArray:
         out = as_t(x)
         if a_min is not None:
             out = tf.maximum(out, as_t(a_min))
@@ -83,15 +87,15 @@ def _make_adapters(tf: Any) -> dict:
             out = tf.minimum(out, as_t(a_max))
         return out
 
-    def reduce(fn: Callable[..., object]) -> Callable[..., object]:
+    def reduce(fn: Prim) -> Prim:
         def _r(
-            x: object, axis: object = None, keepdims: bool = False, **_: object
-        ) -> object:
+            x: BackendArray, axis: Axis = None, keepdims: bool = False, **_: object
+        ) -> BackendArray:
             return fn(as_t(x), axis=axis, keepdims=keepdims)
 
         return _r
 
-    def _count(x: Any, axis: object) -> int:
+    def _count(x: BackendArray, axis: Axis) -> int:
         shape = x.shape
         if axis is None:
             return int(np.prod(shape))
@@ -99,14 +103,14 @@ def _make_adapters(tf: Any) -> dict:
         return int(np.prod([shape[a] for a in axes]))
 
     def variance(
-        x: object,
-        axis: object = None,
-        dtype: object = None,
-        out: object = None,
+        x: BackendArray,
+        axis: Axis = None,
+        dtype: DTypeLike | None = None,
+        out: BackendArray = None,
         ddof: int = 0,
         keepdims: bool = False,
         **_: object,
-    ) -> object:
+    ) -> BackendArray:
         x = as_t(x)
         m = tf.reduce_mean(x, axis=axis, keepdims=True)
         c = x - m
@@ -114,36 +118,36 @@ def _make_adapters(tf: Any) -> dict:
         return ssq / (_count(x, axis) - ddof)
 
     def std(
-        x: object,
-        axis: object = None,
-        dtype: object = None,
-        out: object = None,
+        x: BackendArray,
+        axis: Axis = None,
+        dtype: DTypeLike | None = None,
+        out: BackendArray = None,
         ddof: int = 0,
         keepdims: bool = False,
         **_: object,
-    ) -> object:
+    ) -> BackendArray:
         return tf.sqrt(variance(x, axis=axis, ddof=ddof, keepdims=keepdims))
 
-    def transpose(x: object, axes: object = None) -> object:
+    def transpose(x: BackendArray, axes: Axis = None) -> BackendArray:
         return tf.transpose(as_t(x), perm=axes)
 
-    def reshape(x: object, *shape: Any) -> object:
+    def reshape(x: BackendArray, *shape: Shape) -> BackendArray:
         newshape = shape[0] if len(shape) == 1 else shape
         if isinstance(newshape, int):
             newshape = (newshape,)
         return tf.reshape(as_t(x), tuple(newshape))
 
-    def expand_dims(x: object, axis: int) -> object:
+    def expand_dims(x: BackendArray, axis: int) -> BackendArray:
         return tf.expand_dims(as_t(x), axis)
 
-    def concatenate(seq: Any, axis: int = 0) -> object:
+    def concatenate(seq: BackendArray, axis: int = 0) -> BackendArray:
         return tf.concat([as_t(s) for s in seq], axis=axis)
 
-    def stack(seq: Any, axis: int = 0) -> object:
+    def stack(seq: BackendArray, axis: int = 0) -> BackendArray:
         return tf.stack([as_t(s) for s in seq], axis=axis)
 
     m = tf.math
-    by_name: dict = {
+    by_name: dict[str, Prim] = {
         "exp": unary(tf.exp),
         "log": unary(m.log),
         "sin": unary(tf.sin),
@@ -182,7 +186,7 @@ def _make_adapters(tf: Any) -> dict:
     return by_name
 
 
-def _unmapped(func: Callable[..., object], is_tensor: Callable[[object], bool]):
+def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
     name = getattr(func, "__name__", repr(func))
 
     def _wrapped(*args: object, **kwargs: object) -> object:
@@ -216,33 +220,35 @@ class TFBackend(Backend):
         tf = self._tf
         return tf.is_tensor(x) or isinstance(x, tf.Variable)
 
-    def _as_tensor(self, x: Any) -> Any:
+    def _as_tensor(self, x: BackendArray) -> BackendArray:
         return _as_tf(self._tf, x)
 
     @property
-    def intercept(self) -> Mapping[object, Callable[..., object]]:
+    def intercept(self) -> Mapping[Prim, Prim]:
         return self._intercept
 
-    def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
+    def on_unmapped(self, func: Prim) -> Prim:
         return _unmapped(func, self._is_tensor)
 
-    def lift(self, array: object) -> object:
+    def lift(self, array: BackendArray) -> BackendArray:
         return _as_tf(self._tf, array)
 
-    def const(self, array: object) -> object:
+    def const(self, array: BackendArray) -> BackendArray:
         return _as_tf(self._tf, array)
 
-    def coerce_operand(self, value: object) -> object:
+    def coerce_operand(self, value: BackendArray) -> BackendArray:
         if isinstance(value, (np.ndarray, np.generic)):
             return _as_tf(self._tf, value)
         return value
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         return _tf_to_numpy(self._tf, tensor)
 
     def grad_and_value(
-        self, scalar_fn: Callable[[list], object], leaves: list
-    ) -> tuple[object, list]:
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        leaves: list[BackendArray],
+    ) -> tuple[BackendArray, list[BackendArray]]:
         tf = self._tf
         ts = [tf.Variable(_as_tf(tf, leaf)) for leaf in leaves]
         with tf.GradientTape() as tape:

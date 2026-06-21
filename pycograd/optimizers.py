@@ -79,7 +79,7 @@ class Optimizer:
     def __init__(self, lr: LearningRate) -> None:
         self.lr: LearningRate = lr
         self.t: int = 0  # 1-based step count after the first step()
-        self._state: list[object] | None = None
+        self._state: list[State] | None = None
 
     # --- overridden per optimizer -----------------------------------------
     def _init_state(self, value: Array) -> State:

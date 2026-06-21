@@ -19,13 +19,17 @@ batched arrays and ``backward()`` differentiates it with no vmap-specific backwa
 """
 from __future__ import annotations
 
-from typing import Any, Callable, NoReturn, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, NoReturn, Sequence, cast
 
 import numpy as np
 
 from pycograd import ops
+from pycograd._typing import Axis, BindArg, Boxed, Index, Prim, Rule, Shape
 from pycograd.tensor import Var, _value
 from pycograd.trace import Trace, Tracer, bind, full_raise
+
+if TYPE_CHECKING:
+    from pycograd.shapes import ShapeDtypeStruct
 
 
 # ---------------------------------------------------------------------------
@@ -44,13 +48,13 @@ class BatchTracer(Tracer):
     __slots__ = ("_trace", "value", "bdim")
     __array_ufunc__ = None
 
-    def __init__(self, trace: "BatchTrace", value: object, bdim: int | None) -> None:
+    def __init__(self, trace: "BatchTrace", value: Boxed, bdim: int | None) -> None:
         self._trace = trace
         self.value = value
         self.bdim = bdim
 
     @property
-    def aval(self) -> object:
+    def aval(self) -> "ShapeDtypeStruct":
         # The logical shape/dtype seen by user code: the physical shape minus the batch
         # axis. Reported via a ShapeDtypeStruct so ``.shape``/``.ndim`` work.
         from pycograd.shapes import ShapeDtypeStruct
@@ -70,14 +74,14 @@ class BatchTracer(Tracer):
         return int(np.prod(cast(Any, self.shape), dtype=np.int64))
 
     @property
-    def T(self) -> object:
+    def T(self) -> Boxed:
         return bind(ops.d_transpose, self)
 
-    def __getitem__(self, key: object) -> object:
+    def __getitem__(self, key: Index) -> Boxed:
         return bind(ops.d_getitem, self, key)
 
     # -- numpy-method surface (x.sum(...), x.reshape(...), x.mean(...)) --------
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> "Callable[..., Boxed]":
         # Route a numpy method name we have a primitive for through ``bind`` so the
         # method call (``x.sum(axis=0)``) vectorizes and nests exactly like the free
         # function ``np.sum(x, axis=0)``. Mirrors ``Var.__getattr__`` but goes through
@@ -91,7 +95,7 @@ class BatchTracer(Tracer):
         if prim is None:
             raise AttributeError(name)
 
-        def _method(*a: object, **k: object) -> object:
+        def _method(*a: BindArg, **k: Any) -> Boxed:
             return bind(prim, self, *a, **k)
 
         return _method
@@ -107,22 +111,22 @@ class BatchTrace(Trace):
     """One ``vmap`` level: process each primitive by moving batch axes to the front,
     running the existing per-primitive batch rule, and tagging the result ``bdim=0``."""
 
-    def pure(self, val: object) -> BatchTracer:
+    def pure(self, val: Boxed) -> BatchTracer:
         return BatchTracer(self, val, None)
 
-    def lift(self, val: object) -> BatchTracer:
+    def lift(self, val: Boxed) -> BatchTracer:
         # A value from a lower level enters this level unbatched.
         return BatchTracer(self, val, None)
 
     def process_primitive(
-        self, prim: Callable[..., object], args: Sequence[object], params: dict
-    ) -> object:
+        self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
+    ) -> Boxed:
         rule = _RULE_FOR.get(prim)
         if rule is None:
             _process_unmapped(prim)
         return rule(self, *args, **params)
 
-    def _raise(self, val: object) -> "BatchTracer":
+    def _raise(self, val: Boxed) -> "BatchTracer":
         """Lift one operand into this level: a tracer from a lower level (or a constant)
         becomes an unbatched ``BatchTracer``; one already at this level passes through.
         """
@@ -132,18 +136,22 @@ class BatchTrace(Trace):
 # ---------------------------------------------------------------------------
 # Physical-array helpers.
 # ---------------------------------------------------------------------------
-def _phys_shape(inner: object) -> tuple:
+def _phys_shape(inner: Boxed) -> tuple[int, ...]:
     arr = inner.value if isinstance(inner, Var) else inner
     return tuple(np.shape(cast(Any, arr)))
 
 
-def _phys_dtype(inner: object) -> np.dtype:
+def _phys_dtype(inner: Boxed) -> np.dtype:
     arr = inner.value if isinstance(inner, Var) else inner
-    dt = arr.dtype if hasattr(arr, "dtype") else np.asarray(cast(Any, arr)).dtype
+    dt = (
+        cast(Any, arr).dtype
+        if hasattr(arr, "dtype")
+        else np.asarray(cast(Any, arr)).dtype
+    )
     return np.dtype(dt)
 
 
-def _move_bdim_to_front(t: BatchTracer) -> object:
+def _move_bdim_to_front(t: BatchTracer) -> Boxed:
     """The physical value with its batch axis moved to position 0 (``None`` -> unchanged
     physical value).
 
@@ -181,11 +189,11 @@ def _logical_ndim(t: BatchTracer) -> int:
 # Because the body calls the underlying ``d_*`` primitive (which itself flows through
 # ``bind``, one level down), nesting composes automatically.
 # ---------------------------------------------------------------------------
-def _result(trace: BatchTrace, value: object, bdim: int | None) -> BatchTracer:
+def _result(trace: BatchTrace, value: Boxed, bdim: int | None) -> BatchTracer:
     return BatchTracer(trace, value, bdim)
 
 
-def _insert_leading_logical(v: Any, pad: int, batched: bool) -> object:
+def _insert_leading_logical(v: Boxed, pad: int, batched: bool) -> Boxed:
     """Insert ``pad`` size-1 axes at the front of the *logical* shape (after batch)."""
     if pad <= 0:
         return v
@@ -197,7 +205,7 @@ def _insert_leading_logical(v: Any, pad: int, batched: bool) -> object:
 
 # -- elementwise ------------------------------------------------------------
 def _elementwise_rule(
-    trace: BatchTrace, prim: Callable, *operands: object, **kwargs: object
+    trace: BatchTrace, prim: Prim, *operands: Boxed, **kwargs: Any
 ) -> BatchTracer:
     tracers = [trace._raise(o) for o in operands]
     if not any(t.bdim is not None for t in tracers):
@@ -211,15 +219,15 @@ def _elementwise_rule(
     return _result(trace, bind(prim, *aligned, **kwargs), 0)
 
 
-def _elementwise_for(prim: Callable) -> Callable:
-    def rule(trace: BatchTrace, *operands: object, **kwargs: object) -> BatchTracer:
+def _elementwise_for(prim: Prim) -> Rule:
+    def rule(trace: BatchTrace, *operands: Boxed, **kwargs: Any) -> BatchTracer:
         return _elementwise_rule(trace, prim, *operands, **kwargs)
 
     return rule
 
 
 # -- reductions -------------------------------------------------------------
-def _shift_axis(axis: object, logical_ndim: int) -> object:
+def _shift_axis(axis: Axis, logical_ndim: int) -> Axis:
     """Map a logical reduce axis to the physical axis (batch at 0)."""
     if axis is None:
         return tuple(range(1, logical_ndim + 1))  # all logical axes, not the batch
@@ -228,13 +236,13 @@ def _shift_axis(axis: object, logical_ndim: int) -> object:
     return shifted if isinstance(axis, tuple) else shifted[0]
 
 
-def _reduce_for(prim: Callable) -> Callable:
+def _reduce_for(prim: Prim) -> Rule:
     def rule(
         trace: BatchTrace,
-        x: object,
-        axis: object = None,
+        x: Boxed,
+        axis: Axis = None,
         keepdims: bool = False,
-        **kw: object,
+        **kw: Any,
     ) -> BatchTracer:
         t = trace._raise(x)
         if t.bdim is None:
@@ -249,7 +257,9 @@ def _reduce_for(prim: Callable) -> Callable:
 
 
 # -- transpose --------------------------------------------------------------
-def _transpose_rule(trace: BatchTrace, x: object, axes: object = None) -> BatchTracer:
+def _transpose_rule(
+    trace: BatchTrace, x: Boxed, axes: tuple[int, ...] | None = None
+) -> BatchTracer:
     t = trace._raise(x)
     if t.bdim is None:
         return _result(trace, bind(ops.d_transpose, t.value, cast(Any, axes)), None)
@@ -265,7 +275,7 @@ def _transpose_rule(trace: BatchTrace, x: object, axes: object = None) -> BatchT
 
 
 # -- expand_dims ------------------------------------------------------------
-def _expand_dims_rule(trace: BatchTrace, x: object, axis: int) -> BatchTracer:
+def _expand_dims_rule(trace: BatchTrace, x: Boxed, axis: int) -> BatchTracer:
     t = trace._raise(x)
     if t.bdim is None:
         return _result(trace, bind(ops.d_expand_dims, t.value, axis), None)
@@ -276,7 +286,7 @@ def _expand_dims_rule(trace: BatchTrace, x: object, axis: int) -> BatchTracer:
 
 
 # -- reshape ----------------------------------------------------------------
-def _reshape_rule(trace: BatchTrace, x: object, *shape: object) -> BatchTracer:
+def _reshape_rule(trace: BatchTrace, x: Boxed, *shape: Shape) -> BatchTracer:
     t = trace._raise(x)
     if t.bdim is None:
         return _result(trace, bind(ops.d_reshape, t.value, *shape), None)
@@ -292,7 +302,7 @@ def _reshape_rule(trace: BatchTrace, x: object, *shape: object) -> BatchTracer:
 
 
 # -- broadcast_to -----------------------------------------------------------
-def _broadcast_to_rule(trace: BatchTrace, x: object, shape: object) -> BatchTracer:
+def _broadcast_to_rule(trace: BatchTrace, x: Boxed, shape: Shape) -> BatchTracer:
     t = trace._raise(x)
     target = tuple(shape) if isinstance(shape, (tuple, list)) else (cast(int, shape),)
     if t.bdim is None:
@@ -303,7 +313,7 @@ def _broadcast_to_rule(trace: BatchTrace, x: object, shape: object) -> BatchTrac
 
 
 # -- matmul -----------------------------------------------------------------
-def _matmul_rule(trace: BatchTrace, a: object, b: object) -> BatchTracer:
+def _matmul_rule(trace: BatchTrace, a: Boxed, b: Boxed) -> BatchTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     ba, bb = ta.bdim is not None, tb.bdim is not None
     if not (ba or bb):
@@ -338,7 +348,7 @@ def _matmul_rule(trace: BatchTrace, a: object, b: object) -> BatchTracer:
     return _result(trace, out, 0)
 
 
-def _lead1(v: object) -> object:
+def _lead1(v: Boxed) -> Boxed:
     """Prepend a size-1 axis (numpy then broadcasts it over the batch in matmul); kept on
     the tape (via ``bind``) so the shared-operand gradient is summed over the batch and
     nesting recurses correctly."""
@@ -348,7 +358,7 @@ def _lead1(v: object) -> object:
 
 
 # -- getitem (incl. batched gather) -----------------------------------------
-def _getitem_rule(trace: BatchTrace, x: object, key: object) -> BatchTracer:
+def _getitem_rule(trace: BatchTrace, x: Boxed, key: Index) -> BatchTracer:
     tx = trace._raise(x)
     keys = key if isinstance(key, tuple) else (key,)
     if any(isinstance(k, BatchTracer) and k.bdim is not None for k in keys):
@@ -363,7 +373,7 @@ def _getitem_rule(trace: BatchTrace, x: object, key: object) -> BatchTracer:
     return _result(trace, bind(ops.d_getitem, v, skip), 0)
 
 
-def _peel_x(v: object) -> "tuple[object, list[BatchTrace]]":
+def _peel_x(v: Boxed) -> "tuple[Boxed, list[BatchTrace]]":
     """Peel a (possibly nested) batched ``x`` down to its bottom ``Var``/array, moving
     each level's batch axis to the front as it goes, and record the trace at each level
     (outermost first). The returned bottom value has all ``nb`` batch axes leading, in
@@ -379,14 +389,16 @@ def _peel_x(v: object) -> "tuple[object, list[BatchTrace]]":
     return v, traces
 
 
-def _peel_to_array(v: object) -> "np.ndarray":
+def _peel_to_array(v: Boxed) -> "np.ndarray":
     """Materialize a (non-differentiable) index value to a concrete numpy array with its
     batch axes leading (outermost first)."""
     bottom, _ = _peel_x(v)
     return np.asarray(cast(Any, _value(cast(Any, bottom))))
 
 
-def _batched_gather(trace: BatchTrace, tx: BatchTracer, keys: tuple) -> BatchTracer:
+def _batched_gather(
+    trace: BatchTrace, tx: BatchTracer, keys: tuple[Index, ...]
+) -> BatchTracer:
     """``x[idx]`` with a per-example integer-array index. Indexes the first logical axis
     of ``x`` with each example's own indices, via advanced indexing paired with an
     ``arange`` over every batch axis; the gather rides ``ops.d_getitem`` so its
@@ -419,7 +431,7 @@ def _batched_gather(trace: BatchTrace, tx: BatchTracer, keys: tuple) -> BatchTra
         # come entirely from the per-example index. ``idx_arr`` has its batch axes leading
         # (outermost first), so ``x[idx]`` already has bdim=0 per key level; re-wrap one
         # ``bdim=0`` level per key batch level (innermost first).
-        out: object = gathered
+        out: Boxed = gathered
         for tr in reversed(key_traces):
             out = BatchTracer(tr, out, 0)
         return cast(BatchTracer, out)
@@ -432,12 +444,12 @@ def _batched_gather(trace: BatchTrace, tx: BatchTracer, keys: tuple) -> BatchTra
 
 
 # -- concatenate / stack ----------------------------------------------------
-def _unwrap(s: object) -> object:
+def _unwrap(s: Boxed) -> Boxed:
     return s.value if isinstance(s, BatchTracer) else s
 
 
-def _join_for(op: Callable, new_axis: bool) -> Callable:
-    def rule(trace: BatchTrace, seq: Sequence, axis: int = 0) -> BatchTracer:
+def _join_for(op: Prim, new_axis: bool) -> Rule:
+    def rule(trace: BatchTrace, seq: Sequence[Boxed], axis: int = 0) -> BatchTracer:
         tracers = [trace._raise(s) for s in seq]
         if not any(t.bdim is not None for t in tracers):
             return _result(trace, bind(op, [t.value for t in tracers], axis=axis), None)
@@ -457,8 +469,8 @@ def _join_for(op: Callable, new_axis: bool) -> Callable:
     return rule
 
 
-def _unmapped_join_for(name: str) -> Callable:
-    def rule(trace: BatchTrace, seq: Sequence, **kw: object) -> BatchTracer:
+def _unmapped_join_for(name: str) -> Rule:
+    def rule(trace: BatchTrace, seq: Sequence[Boxed], **kw: Any) -> BatchTracer:
         tracers = [trace._raise(s) for s in seq]
         if not any(t.bdim is not None for t in tracers):
             return _result(
@@ -471,7 +483,7 @@ def _unmapped_join_for(name: str) -> Callable:
     return rule
 
 
-def _process_unmapped(prim: Callable) -> "NoReturn":
+def _process_unmapped(prim: Prim) -> "NoReturn":
     raise NotImplementedError(
         f"vmap: no batching rule for {getattr(prim, '__name__', prim)!r}; "
         "cannot vectorize it. Rewrite the net using ops pycograd has a rule for."
@@ -481,7 +493,7 @@ def _process_unmapped(prim: Callable) -> "NoReturn":
 # ---------------------------------------------------------------------------
 # Rule registry, keyed by primitive.
 # ---------------------------------------------------------------------------
-def _build_rule_for() -> dict[object, Callable]:
+def _build_rule_for() -> dict[Prim, Rule]:
     unary = (
         ops.d_exp,
         ops.d_log,
@@ -498,7 +510,7 @@ def _build_rule_for() -> dict[object, Callable]:
         ops.d_square,
         ops.d_reciprocal,
     )
-    rule_for: dict[object, Callable] = {p: _elementwise_for(p) for p in unary}
+    rule_for: dict[Prim, Rule] = {p: _elementwise_for(p) for p in unary}
     rule_for.update(
         {
             ops.d_add: _elementwise_for(ops.d_add),
@@ -543,7 +555,7 @@ def _build_rule_for() -> dict[object, Callable]:
 # ``_RULE_FOR`` is keyed by *primitive* (incl. the operator primitives), consulted by
 # ``BatchTrace.process_primitive``. ``_BATCH`` denormalizes it to numpy-callable keys so
 # the coverage-parity test (``set(_BATCH) == set(ops._INTERCEPT)``) still holds.
-_RULE_FOR: dict[object, Callable] = _build_rule_for()
-_BATCH: dict[object, Callable] = {
+_RULE_FOR: dict[Prim, Rule] = _build_rule_for()
+_BATCH: dict[Prim, Rule] = {
     fn: _RULE_FOR[prim] for prim, fns in ops._RULES.items() for fn in fns
 }

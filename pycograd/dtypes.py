@@ -25,6 +25,8 @@ from typing import Any, Iterator, Optional, cast
 
 import numpy as np
 
+from pycograd._typing import DTypeLike
+
 # The active working dtype, per execution context. ``None`` means "use the default
 # float64" -- resolved lazily so merely importing pycograd forces no choice.
 _DTYPE: contextvars.ContextVar[Optional[np.dtype]] = contextvars.ContextVar(
@@ -59,7 +61,7 @@ def _bfloat16() -> np.dtype:
     return np.dtype(ml_dtypes.bfloat16)
 
 
-def resolve_dtype(spec: object) -> np.dtype:
+def resolve_dtype(spec: DTypeLike | None) -> np.dtype:
     """Resolve a dtype spec to a concrete (floating) numpy dtype.
 
     ``spec`` may be ``None`` (-> float64, the default working dtype), a numpy dtype or
@@ -99,7 +101,7 @@ def current_dtype() -> np.dtype:
 
 
 @contextlib.contextmanager
-def dtype(spec: object) -> Iterator[np.dtype]:
+def dtype(spec: DTypeLike | None) -> Iterator[np.dtype]:
     """Run the enclosed tape in a given working dtype (``"float32"``, ``"bf16"``, ...).
 
     Inside the block, every ``Var``, lifted leaf, parameter, and gradient is created in
@@ -121,7 +123,7 @@ def dtype(spec: object) -> Iterator[np.dtype]:
 
 
 @contextlib.contextmanager
-def _maybe_dtype(spec: object) -> Iterator[None]:
+def _maybe_dtype(spec: DTypeLike | None) -> Iterator[None]:
     """Apply :func:`dtype` for ``spec``, or do nothing when ``spec is None``.
 
     The ``dtype=`` keyword on the transforms passes ``None`` to mean "inherit", so a

@@ -19,11 +19,12 @@ from typing import Callable, Mapping
 
 import numpy as np
 
+from pycograd._typing import Array, BackendArray, Prim
 from pycograd.backends import Backend
 from pycograd.shapes import _ABSTRACT, ShapedArray
 
 
-def _unmapped(func: Callable[..., object]) -> Callable[..., object]:
+def _unmapped(func: Prim) -> Prim:
     """Wrap a mathy call with no shape rule: raise clearly if an aval flows in."""
     name = getattr(func, "__name__", repr(func))
 
@@ -44,25 +45,27 @@ class AbstractBackend(Backend):
     name = "abstract"
 
     @property
-    def intercept(self) -> Mapping[object, Callable[..., object]]:
+    def intercept(self) -> Mapping[Prim, Prim]:
         return _ABSTRACT
 
-    def on_unmapped(self, func: Callable[..., object]) -> Callable[..., object]:
+    def on_unmapped(self, func: Prim) -> Prim:
         return _unmapped(func)
 
-    def lift(self, array: object) -> ShapedArray:
+    def lift(self, array: BackendArray) -> ShapedArray:
         arr = np.asarray(array)
         return ShapedArray(arr.shape, arr.dtype)
 
-    def const(self, array: object) -> ShapedArray:
+    def const(self, array: BackendArray) -> ShapedArray:
         return self.lift(array)
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         raise NotImplementedError(
             "the abstract backend has no data to convert; read .shape/.dtype instead"
         )
 
     def grad_and_value(
-        self, scalar_fn: Callable[[list], object], leaves: list
-    ) -> tuple[object, list]:
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        leaves: list[BackendArray],
+    ) -> tuple[BackendArray, list[BackendArray]]:
         raise NotImplementedError("the abstract backend computes shapes, not gradients")

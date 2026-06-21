@@ -21,6 +21,7 @@ from __future__ import annotations
 import cupy
 import cupyx
 
+from pycograd._typing import Array, BackendArray, Index
 from pycograd.backends.numpy_backend import NumpyBackend
 from pycograd.dtypes import current_dtype
 from pycograd.tensor import Var
@@ -30,16 +31,16 @@ class CupyBackend(NumpyBackend):
     name = "cupy"
     array_module = cupy
 
-    def scatter_add(self, out: object, key: object, vals: object) -> None:
+    def scatter_add(self, out: BackendArray, key: Index, vals: BackendArray) -> None:
         # cupy has no ``cupy.add.at``; cupyx.scatter_add is the GPU scatter-add.
         cupyx.scatter_add(out, key, vals)
 
-    def lift(self, array: object) -> Var:
+    def lift(self, array: BackendArray) -> Var:
         return Var(cupy.asarray(array, dtype=current_dtype()))  # host -> device
 
-    def const(self, array: object) -> object:
+    def const(self, array: BackendArray) -> BackendArray:
         return cupy.asarray(array, dtype=current_dtype())
 
-    def to_numpy(self, tensor: object) -> object:
+    def to_numpy(self, tensor: BackendArray) -> Array:
         value = tensor.value if isinstance(tensor, Var) else tensor
         return cupy.asnumpy(value)  # device -> host (no-op for a numpy array)
