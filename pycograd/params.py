@@ -22,7 +22,7 @@ import numpy as np
 from pycograd._typing import Array, ArrayLike, Index, Operand, Prim
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, _warn_wrapper
-from pycograd.tensor import Var, _is_numeric, _value
+from pycograd.tensor import Var, _is_numeric, _value, grad_recording
 
 if TYPE_CHECKING:
     from pycograd.tree import PyTree
@@ -360,8 +360,11 @@ class ParamDict(dict):
             _INSTRUMENTED[objective] = runner
         prev = getattr(self, "_live", None)
         self._live = live
+        # ``grad_recording`` lets an ambient ``vmap(forward)(X)`` inside ``objective`` keep
+        # its output on the tape even though the weights arrive by closure, not as args.
         try:
-            out = runner()
+            with grad_recording():
+                out = runner()
         finally:
             self._live = prev
         if isinstance(out, Var):

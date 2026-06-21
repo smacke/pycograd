@@ -10,9 +10,10 @@ dependency on ``ops`` (which imports ``Var`` from here).
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
-from typing import Any, Callable, cast
+from typing import Any, Callable, Iterator, cast
 
 import numpy as np
 
@@ -134,6 +135,34 @@ def _unwrap_weight(x: Operand) -> Var | ArrayLike:
     from pycograd.params import Weight
 
     return x._live() if isinstance(x, Weight) else x
+
+
+# Reverse-mode "grad in progress" depth. A reverse differentiation (``value_and_grad`` /
+# ``grad`` / ``ParamDict.grad``) brackets the forward pass it records with
+# ``grad_recording()``. ``vmap`` reads this: when it runs *inside* a live grad pass -- e.g.
+# the objective of ``weights.grad`` calls ``vmap(forward)(X)`` with the weights captured
+# ambiently rather than passed as mapped arguments -- ``vmap`` cannot see those weight
+# ``Var``s among its args, so it would materialize its output to a plain array and sever
+# the weight gradient. The flag tells it to keep results on the tape instead (the same
+# behavior as nesting under an outer transform). It does *not* fire for ``vmap(grad(g))``,
+# where each inner ``grad`` has already returned before ``vmap`` finishes.
+_GRAD_DEPTH = 0
+
+
+@contextlib.contextmanager
+def grad_recording() -> "Iterator[None]":
+    """Mark a reverse-mode grad pass as in progress for its dynamic extent."""
+    global _GRAD_DEPTH
+    _GRAD_DEPTH += 1
+    try:
+        yield
+    finally:
+        _GRAD_DEPTH -= 1
+
+
+def grad_is_recording() -> bool:
+    """True while a reverse-mode grad pass is recording (see :func:`grad_recording`)."""
+    return _GRAD_DEPTH > 0
 
 
 def _value(x: Operand) -> ArrayLike:

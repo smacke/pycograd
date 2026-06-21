@@ -18,7 +18,15 @@ from pycograd._typing import Array, ArrayLike, Boxed, Operand
 from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
-from pycograd.tensor import Var, _is_array, _is_numeric, _lift, _value, _xp
+from pycograd.tensor import (
+    Var,
+    _is_array,
+    _is_numeric,
+    _lift,
+    _value,
+    _xp,
+    grad_is_recording,
+)
 from pycograd.trace import ReverseTrace, Tracer, _get_stack, bind, new_main
 from pycograd.tracer import _INSTRUMENTED, _make_runner
 from pycograd.tree import (
@@ -389,9 +397,14 @@ def vmap(
 
             out = runner(*call_args)
 
+            # Running inside a live reverse-mode grad pass (e.g. the objective of
+            # ``weights.grad`` calling ``vmap(forward)(X)`` with ambient weights) means the
+            # weight ``Var``s arrived by closure, not as mapped args, so ``nested`` was not
+            # set from them -- keep the output on the tape so the weight gradient survives.
+            keep_tape = nested or grad_is_recording()
             out_leaves, out_def = tree_flatten(cast(PyTree, out))
             finished = [
-                _finish_vmap_leaf(leaf, level, batch, out_axes, nested)
+                _finish_vmap_leaf(leaf, level, batch, out_axes, keep_tape)
                 for leaf in out_leaves
             ]
             return tree_unflatten(out_def, cast("list[Leaf]", finished))

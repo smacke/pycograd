@@ -303,11 +303,12 @@ def resolve_call(func: Prim) -> Prim:
     """Autodiff-aware version of ``func`` (the logic ``before_call`` applies).
 
     Exposed so other call mechanisms can opt into interception -- e.g. wiring a
-    pipescript pipe hook so ``x |> np.exp`` differentiates when ``x`` is a Var::
+    pipescript pipe hook so ``x |> np.exp`` differentiates when ``x`` is a ``Var`` (the
+    base reverse-mode level) or a ``Tracer`` (a ``vmap``/``jvp``/``eval_shape`` level)::
 
         from pipescript.tracers.pipeline_tracer import PipelineTracer
         PipelineTracer.application_hooks.append(
-            lambda f, v: resolve_call(f) if isinstance(v, Var) else f
+            lambda f, v: resolve_call(f) if isinstance(v, (Var, Tracer)) else f
         )
     """
     return AutodiffTracer.instance().resolve_call(func)

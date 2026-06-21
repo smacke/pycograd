@@ -31,6 +31,7 @@ from pycograd._typing import Boxed, Prim
 from pycograd.params import frozen as _frozen
 from pycograd.params import tied as _tied
 from pycograd.tensor import Var
+from pycograd.trace import Tracer
 from pycograd.tracer import resolve_call
 
 # The DSL essentials a ``params{...}`` block references by name. ``params`` is
@@ -44,11 +45,20 @@ _PIPESCRIPT_MISSING_MSG = (
 
 
 def _autodiff_hook(func: Prim, value: Boxed) -> Prim:
-    """A ``PipelineTracer`` application hook: when a ``Var`` flows into a pipe,
-    resolve the applied function to its autodiff-aware form (numpy/math swap, or
-    on-demand helper instrumentation). Defined at module scope so it has a stable
-    identity for idempotent registration and clean removal."""
-    return resolve_call(func) if isinstance(value, Var) else func
+    """A ``PipelineTracer`` application hook: when a managed value flows into a *bare*
+    function pipe stage (``x |> relu``), resolve the applied function to its autodiff-
+    aware form (numpy/math swap, or on-demand helper instrumentation) so the call routes
+    through the trace stack instead of hitting the raw value.
+
+    A ``Var`` is the base-level (reverse-mode) case. A :class:`~pycograd.trace.Tracer`
+    -- a ``vmap`` ``BatchTracer``, a ``jvp`` ``JVPTracer``, or an ``eval_shape``
+    ``ShapedArray`` -- is a higher trace level: resolving here is what lets a bare pipe
+    stage vectorize/differentiate under those transforms too (without it the staged
+    function runs un-instrumented and its inner ``np.*`` meets a raw tracer, e.g.
+    ``BatchTracer does not support ufuncs``). A plain array/number is left alone, so pure
+    inference keeps the fast path. Defined at module scope for a stable identity (idempotent
+    registration, clean removal)."""
+    return resolve_call(func) if isinstance(value, (Var, Tracer)) else func
 
 
 def load_ipython_extension(shell: Any) -> None:

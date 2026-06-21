@@ -8,7 +8,7 @@ against finite differences.
 """
 import numpy as np
 
-from pycograd import grad, value_and_grad, vmap
+from pycograd import grad, params, value_and_grad, vmap
 from pycograd.transforms import per_example_grad
 
 
@@ -548,3 +548,62 @@ def test_per_example_grad_still_works():
     g = per_example_grad(per_sample_sq)(X)
     assert g.shape == X.shape
     assert np.allclose(g, 2 * X, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# vmap composed with ambient-weight grad (``weights.grad`` of a ``vmap`` forward)
+# ---------------------------------------------------------------------------
+# The weights arrive through a closure (the ``with weights:`` proxies), not as mapped
+# args, so vmap never sees their ``Var``s. Two seams make the gradient survive: a live
+# grad pass keeps the vmap output on the tape (``grad_is_recording``), and ``full_raise``
+# resolves a ``Weight`` proxy that meets a ``BatchTracer`` to its live ``Var``. The
+# data ``X`` and the per-example forward live at module scope so the recompiled-on-
+# instrumentation objective resolves them as globals (a local would be dropped).
+_AMBIENT_X = _rng(0).standard_normal((5, 2))
+
+
+def _ambient_per_example(x):
+    return np.sum(x @ aw + ab)  # noqa: F821 -- aw/ab injected by ``with weights:``
+
+
+def _ambient_vmap_objective():
+    return np.sum(vmap(_ambient_per_example)(_AMBIENT_X))
+
+
+def test_grad_flows_through_vmap_with_ambient_weights():
+    weights = params(aw=np.arange(6.0).reshape(2, 3) * 0.1, ab=np.zeros(3))
+    with weights:
+        value, grads = weights.grad(_ambient_vmap_objective)
+
+    # Oracle: the identical scalar differentiated wrt explicit-arg weights (no vmap).
+    def ref(p):
+        return np.sum(np.sum(_AMBIENT_X @ p["aw"] + p["ab"], axis=1))
+
+    rvalue, (rgrads,) = value_and_grad(ref)(weights)
+    np.testing.assert_allclose(float(value), float(rvalue), rtol=1e-10)
+    np.testing.assert_allclose(grads["aw"], rgrads["aw"], rtol=1e-9)
+    np.testing.assert_allclose(grads["ab"], rgrads["ab"], rtol=1e-9)
+    # the gradient must actually be non-trivial (regression: it came back all-zero)
+    assert np.linalg.norm(grads["aw"]) > 1e-6
+
+
+# ---------------------------------------------------------------------------
+# the pipescript application hook resolves a bare ``|> fn`` stage under any trace
+# ---------------------------------------------------------------------------
+def test_autodiff_hook_resolves_for_batch_tracer_not_plain():
+    # Regression: a bare function pipe stage (``x |> relu``) under vmap used to run the
+    # staged function un-instrumented, because the hook only fired for a ``Var`` -- a
+    # ``BatchTracer`` then met a raw ufunc inside it. The hook must resolve for any tracer.
+    from pycograd.batching import BatchTrace, BatchTracer
+    from pycograd.extension import _autodiff_hook
+    from pycograd.tensor import Var
+    from pycograd.trace import new_main
+
+    # plain array: leave the function untouched (pure-inference fast path)
+    assert _autodiff_hook(np.exp, np.array([1.0])) is np.exp
+    # base-level Var: resolve (np.exp -> its differentiable primitive)
+    assert _autodiff_hook(np.exp, Var(np.array([1.0]))) is not np.exp
+    # vmap BatchTracer: must resolve too (the fix)
+    with new_main(BatchTrace) as main:
+        bt = BatchTracer(BatchTrace(main), Var(np.zeros(3)), 0)
+        assert _autodiff_hook(np.exp, bt) is not np.exp

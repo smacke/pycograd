@@ -266,7 +266,19 @@ def full_raise(trace: Trace, val: Boxed) -> Boxed:
     is ``lift``ed; a constant is made ``pure``. (At the base level both are identities,
     so this is a no-op in Phase 1; it is the seam higher levels use to insert an
     unbatched ``bdim=None`` operand.)
+
+    A transparent ``Weight`` proxy (an ambient parameter) is resolved to its live value
+    first: when such a proxy meets a :class:`Tracer` (e.g. a ``vmap`` ``BatchTracer``),
+    the *Tracer's* operator dunder wins Python's dispatch and routes the raw proxy into
+    :func:`bind` before the proxy can unwrap itself, so a higher-level rule's
+    ``trace._raise`` would otherwise wrap the proxy instead of its Var/array. (The base
+    ``EvalTrace`` bypasses ``full_raise``; there ``_lift``/``_unwrap_weight`` resolve it.)
     """
+    # Deferred import (params imports from tensor/this module): dodge an import cycle.
+    from pycograd.params import Weight
+
+    if isinstance(val, Weight):
+        val = val._live()
     if not isinstance(val, Tracer):
         return trace.pure(val)
     level = trace.main.level
