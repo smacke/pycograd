@@ -18,6 +18,7 @@ from pycograd import (  # noqa: E402
     ParamDict,
     Var,
     Weight,
+    d_sigmoid,
     detach,
     frozen,
     grad,
@@ -34,9 +35,12 @@ from pycograd.examples.models import (  # noqa: E402
     _init_deep,
     _init_mlp,
     _init_mlp_tree,
+    _init_rwkv,
+    _init_rwkv_block,
     _init_transformer,
     _mlp_accuracy,
     _mlp_tree_accuracy,
+    _rwkv_accuracy,
     _transformer_accuracy,
     attention,
     cross_entropy,
@@ -46,9 +50,15 @@ from pycograd.examples.models import (  # noqa: E402
     logistic_loss,
     mlp_loss,
     mlp_tree_loss,
+    rwkv_block,
+    rwkv_init_state,
+    rwkv_lm,
+    rwkv_loss,
+    rwkv_step,
     softmax,
     transformer_block,
     transformer_loss,
+    wkv,
 )
 
 # Module-level data so target functions reference globals (not closures), which
@@ -583,6 +593,98 @@ def test_transformer_classifier_trains():
     params, history = gradient_descent(transformer_loss, params, lr=0.2, steps=250)
     assert history[-1] < history[0]
     assert _transformer_accuracy(params) >= 0.9
+
+
+# --- RWKV: fused sigmoid primitive + the recurrent net ----------------------
+# ``d_sigmoid`` always returns a ``Var`` (even on a plain array), so the finite-diff
+# oracle -- which evaluates ``f`` on bare arrays -- can't drive it directly; we check
+# the fused primitive against its closed-form derivative instead. Scalarize with ``@``
+# (a ``Var`` operator) so the reduction rides the tape rather than ``np.sum``.
+_SIG_W = np.array([0.4, -1.3, 0.9, 2.1, -0.7])
+
+
+def sigmoid_dot(x):
+    return d_sigmoid(x) @ _SIG_W
+
+
+def sigmoid_chain(x):
+    return d_sigmoid(d_sigmoid(x)) @ _SIG_W[:3]
+
+
+def test_sigmoid_primitive_gradient():
+    x = np.array([0.0, 1.0, -2.0, 3.0, -0.5])
+    val, (g,) = value_and_grad(sigmoid_dot)(x)
+    s = 1.0 / (1.0 + np.exp(-x))
+    assert np.allclose(np.asarray(val), s @ _SIG_W)  # forward value
+    assert np.allclose(g, _SIG_W * s * (1 - s))  # d/dx (w . sigmoid(x)) = w s(1-s)
+
+
+def test_sigmoid_primitive_chained():
+    x = np.array([0.5, -0.5, 2.0])
+    _, (g,) = value_and_grad(sigmoid_chain)(x)
+    s1 = 1.0 / (1.0 + np.exp(-x))
+    s2 = 1.0 / (1.0 + np.exp(-s1))
+    assert np.allclose(g, _SIG_W[:3] * s2 * (1 - s2) * s1 * (1 - s1))
+
+
+def wkv_sum(w, u, k, v):
+    return np.sum(wkv(w, u, k, v))
+
+
+def test_wkv_gradient():
+    rng = np.random.default_rng(0)
+    d, t = 2, 3
+    w = np.abs(rng.standard_normal(d))  # decay is exp(time_decay) >= 0
+    u = rng.standard_normal(d)
+    k = rng.standard_normal((t, d))
+    v = rng.standard_normal((t, d))
+    _assert_grads_match(wkv_sum, (w, u, k, v), atol=1e-4)
+
+
+_RWKV_BLK = _init_rwkv_block(np.random.default_rng(7), d_model=4)
+
+
+def rwkv_block_sq(x):
+    return np.sum(rwkv_block(x, _RWKV_BLK) ** 2)
+
+
+def test_rwkv_block_gradient():
+    x = np.random.default_rng(8).standard_normal((5, 4))
+    _assert_grads_match(rwkv_block_sq, (x,), atol=1e-4)
+
+
+def test_rwkv_language_model_trains():
+    from pycograd.tree import tree_map
+
+    params = _init_rwkv(np.random.default_rng(0), vocab=12, d_model=8, n_blocks=2)
+    first = last = None
+    for _ in range(80):
+        loss, grads = value_and_grad(rwkv_loss)(*params)
+        first = float(loss) if first is None else first
+        last = float(loss)
+        params = tuple(
+            tree_map(lambda p, g: p - 0.3 * g, arg, grad)
+            for arg, grad in zip(params, grads)
+        )
+    assert last < first
+    assert _rwkv_accuracy(*params) == 1.0  # tiny corpus is memorized
+
+
+def test_rwkv_recurrent_matches_parallel():
+    # The O(1)-per-token recurrent form must reproduce the parallel (unrolled) form
+    # that training differentiates, token for token.
+    rng = np.random.default_rng(2)
+    d, nb = 8, 2
+    top, blocks = _init_rwkv(rng, vocab=12, d_model=d, n_blocks=nb)
+    ids = np.arange(6) % 12
+    onehot = np.eye(12)[ids]
+    parallel = np.asarray(rwkv_lm(onehot, top, blocks))
+    state = rwkv_init_state(d, nb)
+    rows = []
+    for t in range(len(ids)):
+        logits, state = rwkv_step(int(ids[t]), top, blocks, state)
+        rows.append(logits)
+    assert np.allclose(parallel, np.stack(rows), atol=1e-9)
 
 
 # --- end-to-end: logistic regression ----------------------------------------

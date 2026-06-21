@@ -75,6 +75,26 @@ def d_sqrt(x: Operand) -> Var:
     return x._unary(v, lambda a, g: g / (2 * v), d_sqrt)
 
 
+def d_sigmoid(x: Operand) -> Var:
+    # Logistic sigmoid 1 / (1 + exp(-x)). A fused primitive rather than a numpy
+    # composition: there is no ``np.sigmoid`` to intercept, so this is tape-only
+    # (no ``_RULES`` entry) and the local derivative reuses the cached output --
+    # sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x)).
+    #
+    # Because it has no numpy name, user code calls ``d_sigmoid`` directly rather than
+    # reaching it through call interception. Under an enclosing transform the operand is
+    # a higher-level tracer (a jvp/vmap ``Tracer``, not a base ``Var``); dispatch it
+    # through ``bind`` so the registered jvp/vmap/abstract rule runs, exactly as an
+    # intercepted ``np.*`` call would. A base ``Var``/array falls through to the kernel.
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(x, Tracer):
+        return cast(Var, bind(d_sigmoid, x))
+    x, xp = _lift(x), _xp()
+    v = xp.reciprocal(1.0 + xp.exp(-x.value))
+    return x._unary(v, lambda a, g: g * v * (1 - v), d_sigmoid)
+
+
 def d_abs(x: Operand) -> Var:
     x, xp = _lift(x), _xp()
     return x._unary(xp.abs(x.value), lambda a, g: g * xp.sign(a), d_abs)
@@ -635,6 +655,9 @@ def _vjp_unary_derivs() -> dict[Prim, Callable[[Boxed], Boxed]]:
         d_cos: lambda a: _b(d_neg, _b(d_sin, a)),
         d_tanh: lambda a: _b(d_sub, 1.0, _b(d_mul, _b(d_tanh, a), _b(d_tanh, a))),
         d_sqrt: lambda a: _b(d_div, 0.5, _b(d_sqrt, a)),
+        d_sigmoid: lambda a: _b(
+            d_mul, _b(d_sigmoid, a), _b(d_sub, 1.0, _b(d_sigmoid, a))
+        ),
         d_sinh: lambda a: _b(d_cosh, a),
         d_cosh: lambda a: _b(d_sinh, a),
         d_arctan: lambda a: _b(d_reciprocal, _b(d_add, 1.0, _b(d_mul, a, a))),

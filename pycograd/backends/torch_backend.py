@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT
+from pycograd.ops import _INTERCEPT, d_sigmoid
 
 if TYPE_CHECKING:
     import torch
@@ -187,6 +187,7 @@ def _make_adapters(torch: ModuleType) -> dict[str, Prim]:
         "cos",
         "tanh",
         "sqrt",
+        "sigmoid",
         "sinh",
         "cosh",
         "arctan",
@@ -228,6 +229,11 @@ class TorchBackend(Backend):
             for fn in _INTERCEPT
             if getattr(fn, "__name__", None) in adapters
         }
+        # ``d_sigmoid`` is a tape-only primitive (no numpy callable, so it is absent
+        # from ``_INTERCEPT``); map the primitive itself to torch.sigmoid so a direct
+        # ``d_sigmoid`` call lowers instead of running its xp-based body (xp is None
+        # under a delegate backend).
+        self._intercept[d_sigmoid] = adapters["sigmoid"]
 
     def _as_tensor(self, x: BackendArray) -> BackendArray:
         return _as_torch(self._torch, x)

@@ -550,6 +550,11 @@ def _d_sqrt(x: Boxed) -> Boxed:
     return bind(ops.d_div, 0.5, bind(ops.d_sqrt, x))  # 1/(2*sqrt(x))
 
 
+def _d_sigmoid(x: Boxed) -> Boxed:
+    s = bind(ops.d_sigmoid, x)
+    return bind(ops.d_mul, s, bind(ops.d_sub, 1.0, s))  # sigmoid(x)*(1-sigmoid(x))
+
+
 def _d_sinh(x: Boxed) -> Boxed:
     return bind(ops.d_cosh, x)
 
@@ -617,6 +622,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
         ops.d_cos: _d_cos,
         ops.d_tanh: _d_tanh,
         ops.d_sqrt: _d_sqrt,
+        ops.d_sigmoid: _d_sigmoid,
         ops.d_sinh: _d_sinh,
         ops.d_cosh: _d_cosh,
         ops.d_arctan: _d_arctan,

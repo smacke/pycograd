@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT
+from pycograd.ops import _INTERCEPT, d_sigmoid
 
 
 def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
@@ -154,6 +154,7 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
         "cos": unary(tf.cos),
         "tanh": unary(tf.tanh),
         "sqrt": unary(tf.sqrt),
+        "sigmoid": unary(m.sigmoid),
         "sinh": unary(tf.sinh),
         "cosh": unary(tf.cosh),
         "arctan": unary(tf.atan),
@@ -216,6 +217,9 @@ class TFBackend(Backend):
             for fn in _INTERCEPT
             if getattr(fn, "__name__", None) in adapters
         }
+        # ``d_sigmoid`` is tape-only (no numpy callable in ``_INTERCEPT``); map the
+        # primitive directly to tf.math.sigmoid so a direct call lowers.
+        self._intercept[d_sigmoid] = adapters["sigmoid"]
 
     def _is_tensor(self, x: object) -> bool:
         tf = self._tf

@@ -20,7 +20,7 @@ import numpy as np
 from pycograd._typing import Array, BackendArray, Prim
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT
+from pycograd.ops import _INTERCEPT, d_sigmoid
 
 # math.* names that don't exist verbatim on jnp.
 _NAME_OVERRIDE = {"atan": "arctan"}
@@ -62,6 +62,7 @@ class JaxBackend(Backend):
 
     def __init__(self) -> None:
         import jax
+        import jax.nn
         import jax.numpy as jnp
 
         # Match pycograd's float64 tape so gradients agree to tight tolerance.
@@ -69,6 +70,10 @@ class JaxBackend(Backend):
         self._jax = jax
         self._jnp = jnp
         self._intercept = _build_intercept(jnp)
+        # ``d_sigmoid`` is tape-only (no numpy callable, so ``_build_intercept``
+        # skips it); map the primitive directly to jax.nn.sigmoid so a direct call
+        # lowers instead of running its xp-based body.
+        self._intercept[d_sigmoid] = jax.nn.sigmoid
 
     def _is_tensor(self, x: object) -> bool:
         return isinstance(x, (self._jax.Array, self._jax.core.Tracer))

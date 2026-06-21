@@ -765,6 +765,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
         ops.d_cos,
         ops.d_tanh,
         ops.d_sqrt,
+        ops.d_sigmoid,
         ops.d_sinh,
         ops.d_cosh,
         ops.d_arctan,

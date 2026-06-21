@@ -20,7 +20,7 @@ import pytest
 
 import pycograd.compile as C
 import pycograd.transforms as T
-from pycograd import frozen
+from pycograd import d_sigmoid, frozen
 from pycograd.examples import models as M
 from pycograd.tree import tree_leaves
 
@@ -77,6 +77,15 @@ _CASES = [
         lambda: (_rng(0).standard_normal(2), 0.0),
         {"jax", "torch"},
     ),
+    (
+        # The RWKV recurrence (token-shift + the numerically-stable WKV scan) lowers
+        # to all three frameworks: the one-hot embedding keeps it free of the fancy
+        # integer indexing tf can't compile.
+        "rwkv",
+        M.rwkv_loss,
+        lambda: M._init_rwkv(_rng(3), vocab=len(M._CHAR_VOCAB), d_model=8, n_blocks=1),
+        {"jax", "torch", "tf"},
+    ),
 ]
 
 _PARITY_PARAMS = [
@@ -104,6 +113,22 @@ def test_forward_and_grad_parity(cid, fn, argf, backend):
     for a, b in zip(rf, cf):
         assert a.shape == b.shape
         assert np.allclose(a, b, atol=1e-8, rtol=1e-6), f"{cid}/{backend} grad"
+
+
+def _sigmoid_loss(x):
+    # Exercises the tape-only ``d_sigmoid`` primitive's compile lowering: it has no
+    # numpy callable, so each backend maps the primitive itself to its native sigmoid.
+    return np.sum(d_sigmoid(x) ** 2)
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_sigmoid_primitive_lowers(backend):
+    pytest.importorskip(_FRAMEWORK_MODULE[backend])
+    x = np.linspace(-3.0, 3.0, 7)
+    ref_v, (ref_g,) = T.value_and_grad(_sigmoid_loss)(x)
+    cmp_v, (cmp_g,) = C.value_and_grad(_sigmoid_loss, backend=backend)(x)
+    assert np.allclose(ref_v, cmp_v, atol=1e-9)
+    assert np.allclose(np.asarray(ref_g), np.asarray(cmp_g), atol=1e-8)
 
 
 @pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
@@ -165,6 +190,32 @@ def test_backend_imports_framework_only_on_demand():
 def _dsl_mlp_forward(x):
     h = np.maximum(0.0, x @ ew1 + eb1)  # noqa: F821  (ambient weights)
     return h @ ew2 + eb2  # noqa: F821
+
+
+# Applies an intercepted *unary* numpy function (np.exp) directly to a bare ambient
+# weight. Under a compile backend pyccolo swaps np.exp before the proxy's
+# __array_ufunc__ can resolve it, so resolve_call must coerce the bare weight itself.
+def _dsl_unary_on_weight():
+    return np.sum(np.exp(ewd) * (_DSLX @ ew1))  # noqa: F821  (ambient weights)
+
+
+_DSLX = np.array([[0.5, -1.0], [2.0, 0.3]])
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_ambient_unary_on_bare_weight_compiles(backend):
+    pytest.importorskip(_FRAMEWORK_MODULE[backend])
+    from pycograd import params
+
+    weights = params(
+        ewd=_rng(1).standard_normal(16), ew1=_rng(2).standard_normal((2, 16))
+    )
+    with weights:
+        v_np, g_np = weights.grad(_dsl_unary_on_weight)
+        v_be, g_be = weights.grad(_dsl_unary_on_weight, backend=backend)
+    assert np.allclose(v_np, v_be, atol=1e-9)
+    for k in weights:
+        assert np.allclose(np.asarray(g_np[k]), np.asarray(g_be[k]), atol=1e-8)
 
 
 def test_paramdict_to_torch_module_from_dsl_and_exports(tmp_path):

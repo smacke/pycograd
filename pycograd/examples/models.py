@@ -40,7 +40,9 @@ _X, _y = _make_data()
 
 def sigmoid(z: Tensor) -> Tensor:
     # A plain helper with no autodiff rule -- differentiated by instrumenting it
-    # on demand when ``logistic_loss`` calls it.
+    # on demand when ``logistic_loss`` calls it. (The fused ``d_sigmoid`` primitive
+    # is the traced-path equivalent; this composition stays array-in/array-out so
+    # plain-array inference -- accuracy, text generation -- keeps working too.)
     return 1.0 / (1.0 + np.exp(-z))
 
 
@@ -330,6 +332,286 @@ def _init_transformer(
 def _transformer_accuracy(params: tuple[Array, ...]) -> float:
     preds = [int(np.argmax(_seq_logits(x, *params))) for x in _SEQS]
     return float(np.mean(np.array(preds) == _SEQ_LABELS))
+
+
+# ---------------------------------------------------------------------------
+# RWKV: a recurrent architecture that trains in a parallel (unrolled-over-time)
+# form and runs inference in an O(1)-per-token recurrent form. Like the layers
+# above, every piece is a plain helper instrumented on demand -- the whole thing
+# is built from ``exp`` / ``maximum`` / ``sigmoid`` / matmul / indexing, so it
+# differentiates, batches under ``vmap``, and compiles to torch/jax/tf unchanged.
+# ---------------------------------------------------------------------------
+def token_shift(x: Tensor) -> Tensor:
+    # Shift a ``(T, D)`` sequence one step in time: row ``t`` becomes the previous
+    # token, with a zero vector standing in for "the token before the first".
+    # ``x[:1] * 0.0`` makes that zero row without reading ``x``'s shape, so the
+    # whole thing is concatenate + slice -- composable under every transform.
+    zero = x[:1] * 0.0
+    return cast(Tensor, np.concatenate([zero, x[:-1]], axis=0))
+
+
+def wkv(w: Tensor, u: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    # The WKV kernel: a softmax-weighted running average of the values ``v``,
+    # where weights decay by ``exp(-w)`` per step and the current step gets a
+    # ``u`` "bonus". Carried in the numerically-stable form used by RWKV (the
+    # "max trick"): running numerator/denominator ``alpha``/``beta`` normalized by
+    # a running max exponent ``eps`` so ``exp`` never overflows. ``w``/``u`` are
+    # ``(D,)``; ``k``/``v`` are ``(T, D)``.
+    alpha = u * 0.0  # zeros shaped like one channel vector, dtype from ``u``
+    beta = u * 0.0
+    eps = u * 0.0
+    outs = []
+    for t in range(k.shape[0]):
+        kt, vt = k[t], v[t]
+        # Output at ``t`` folds the current (k, v) in with the bonus ``u``.
+        tau = np.maximum(u + kt, eps)
+        e1 = np.exp(eps - tau)
+        e2 = np.exp(u + kt - tau)
+        outs.append((e1 * alpha + e2 * vt) / (e1 * beta + e2))
+        # Advance the state by one step: decay ``eps`` by ``w``, fold in (k, v).
+        eps2 = np.maximum(eps - w, kt)
+        a1 = np.exp(eps - w - eps2)
+        a2 = np.exp(kt - eps2)
+        alpha = a1 * alpha + a2 * vt
+        beta = a1 * beta + a2
+        eps = eps2
+    return cast(Tensor, np.stack(outs, axis=0))
+
+
+def rwkv_time_mixing(
+    x: Tensor,
+    last_x: Tensor,
+    time_decay: Tensor,
+    time_first: Tensor,
+    mix_k: Tensor,
+    mix_v: Tensor,
+    mix_r: Tensor,
+    wk: Tensor,
+    wv: Tensor,
+    wr: Tensor,
+    wo: Tensor,
+) -> Tensor:
+    # "Attention" block: per-channel token-shift mixing into key/value/receptance,
+    # a sigmoid receptance gate over the WKV output, then an output projection.
+    xk = x * mix_k + last_x * (1.0 - mix_k)
+    xv = x * mix_v + last_x * (1.0 - mix_v)
+    xr = x * mix_r + last_x * (1.0 - mix_r)
+    k = xk @ wk
+    v = xv @ wv
+    sr = sigmoid(xr @ wr)
+    out = wkv(np.exp(time_decay), time_first, k, v) * sr
+    return cast(Tensor, out @ wo)
+
+
+def rwkv_channel_mixing(
+    x: Tensor,
+    last_x: Tensor,
+    mix_k: Tensor,
+    mix_r: Tensor,
+    wk: Tensor,
+    wr: Tensor,
+    wv: Tensor,
+) -> Tensor:
+    # Feed-forward block: token-shift mixing, a squared-ReLU hidden layer, and a
+    # sigmoid receptance gate.
+    xk = x * mix_k + last_x * (1.0 - mix_k)
+    xr = x * mix_r + last_x * (1.0 - mix_r)
+    k = relu(xk @ wk)
+    return cast(Tensor, sigmoid(xr @ wr) * ((k * k) @ wv))
+
+
+# A block's parameters as one flat ``name -> tensor`` dict (LayerNorm gains/biases
+# plus ``att_*`` time-mixing and ``ffn_*`` channel-mixing weights).
+RWKVBlockParams = dict[str, Tensor]
+
+
+def rwkv_block(x: Tensor, p: RWKVBlockParams) -> Tensor:
+    # Pre-norm residual block: x -> x + time_mixing(LN(x)); x -> x + ffn(LN(x)).
+    xn = layer_norm(x, p["ln1_g"], p["ln1_b"])
+    x = x + rwkv_time_mixing(
+        xn,
+        token_shift(xn),
+        p["att_time_decay"],
+        p["att_time_first"],
+        p["att_mix_k"],
+        p["att_mix_v"],
+        p["att_mix_r"],
+        p["att_wk"],
+        p["att_wv"],
+        p["att_wr"],
+        p["att_wo"],
+    )
+    xn2 = layer_norm(x, p["ln2_g"], p["ln2_b"])
+    x = x + rwkv_channel_mixing(
+        xn2,
+        token_shift(xn2),
+        p["ffn_mix_k"],
+        p["ffn_mix_r"],
+        p["ffn_wk"],
+        p["ffn_wr"],
+        p["ffn_wv"],
+    )
+    return x
+
+
+def rwkv_lm(
+    onehot: Tensor,
+    top: dict[str, Tensor],
+    blocks: list[RWKVBlockParams],
+) -> Tensor:
+    # Char-level language model. The input is one-hot ``(T, V)`` token rows, so the
+    # embedding is a plain ``onehot @ emb`` matmul -- exactly an embedding lookup,
+    # but expressed without fancy indexing so the whole model lowers to torch/jax/tf
+    # alike. Pre-norm the embeddings, run the RWKV blocks, final LayerNorm, then
+    # project to per-token vocab logits.
+    x = onehot @ top["emb"]  # (T, D)
+    x = layer_norm(x, top["ln0_g"], top["ln0_b"])
+    for block in blocks:
+        x = rwkv_block(x, block)
+    x = layer_norm(x, top["ln_out_g"], top["ln_out_b"])
+    return cast(Tensor, x @ top["head_w"] + top["head_b"])
+
+
+# A tiny char corpus so the model below is unit-testable (next-char prediction).
+def _make_char_data() -> tuple[Array, Array, str]:
+    text = "pycograd rwkv "
+    vocab = sorted(set(text))
+    stoi = {c: i for i, c in enumerate(vocab)}
+    ids = np.array([stoi[c] for c in text], dtype=np.int64)
+    onehot = np.eye(len(vocab))[ids]
+    return ids, onehot, "".join(vocab)
+
+
+_CHAR_IDS, _CHAR_OH, _CHAR_VOCAB = _make_char_data()
+
+
+# The model is a ``(top, blocks)`` pair -- both clean ``name -> tensor`` pytrees,
+# so ``value_and_grad`` differentiates it without a mixed-type container.
+RWKVParams = tuple[dict[str, Tensor], list[RWKVBlockParams]]
+
+
+def _init_rwkv_block(rng: np.random.Generator, d_model: int) -> dict[str, Array]:
+    s = 0.1
+    rn = rng.standard_normal
+    z, o = np.zeros(d_model), np.ones(d_model)
+    return {
+        "ln1_g": o.copy(),
+        "ln1_b": z.copy(),
+        "ln2_g": o.copy(),
+        "ln2_b": z.copy(),
+        "att_time_decay": z.copy(),
+        "att_time_first": z.copy(),
+        "att_mix_k": rng.random(d_model),
+        "att_mix_v": rng.random(d_model),
+        "att_mix_r": rng.random(d_model),
+        "att_wk": s * rn((d_model, d_model)),
+        "att_wv": s * rn((d_model, d_model)),
+        "att_wr": s * rn((d_model, d_model)),
+        "att_wo": s * rn((d_model, d_model)),
+        "ffn_mix_k": rng.random(d_model),
+        "ffn_mix_r": rng.random(d_model),
+        "ffn_wk": s * rn((d_model, 4 * d_model)),
+        "ffn_wr": s * rn((d_model, d_model)),
+        "ffn_wv": s * rn((4 * d_model, d_model)),
+    }
+
+
+def _init_rwkv(
+    rng: np.random.Generator, vocab: int, d_model: int = 8, n_blocks: int = 1
+) -> RWKVParams:
+    s = 0.1
+    rn = rng.standard_normal
+    top: dict[str, Array] = {
+        "emb": s * rn((vocab, d_model)),
+        "ln0_g": np.ones(d_model),
+        "ln0_b": np.zeros(d_model),
+        "ln_out_g": np.ones(d_model),
+        "ln_out_b": np.zeros(d_model),
+        "head_w": s * rn((d_model, vocab)),
+        "head_b": np.zeros(vocab),
+    }
+    blocks = [_init_rwkv_block(rng, d_model) for _ in range(n_blocks)]
+    return cast(RWKVParams, (top, blocks))
+
+
+# ``top`` and ``blocks`` are passed as two positional pytrees (not one tuple) so the
+# plain ``gradient_descent`` helper -- which steps ``loss_fn(*params)`` argument by
+# argument -- trains the model directly.
+def rwkv_loss(top: dict[str, Tensor], blocks: list[RWKVBlockParams]) -> Operand:
+    # Mean next-char cross-entropy: predict chars 1..T from the prefix 0..T-1.
+    logits = rwkv_lm(_CHAR_OH[:-1], top, blocks)
+    targets = _CHAR_OH[1:]
+    return -np.mean(np.sum(targets * np.log(softmax_last(logits) + 1e-12), axis=-1))
+
+
+def _rwkv_accuracy(top: dict[str, Tensor], blocks: list[RWKVBlockParams]) -> float:
+    logits = rwkv_lm(_CHAR_OH[:-1], top, blocks)
+    preds = np.argmax(np.asarray(logits), axis=-1)
+    return float(np.mean(preds == _CHAR_IDS[1:]))
+
+
+# Per-block recurrent state for O(1)-per-token inference: the previous token's
+# normed inputs (the token-shift carry) plus the WKV running numerator/denominator
+# and max-exponent.
+RWKVState = list[dict[str, Array]]
+
+
+def rwkv_init_state(d_model: int, n_blocks: int) -> RWKVState:
+    z = np.zeros(d_model)
+    return [
+        {
+            "att_x": z.copy(),
+            "alpha": z.copy(),
+            "beta": z.copy(),
+            "eps": z.copy(),
+            "ffn_x": z.copy(),
+        }
+        for _ in range(n_blocks)
+    ]
+
+
+def rwkv_step(
+    token: int, top: dict[str, Array], blocks: list[RWKVBlockParams], state: RWKVState
+) -> tuple[Array, RWKVState]:
+    # The recurrent form: process one token given the carried ``state``, returning
+    # next-token logits and the advanced state. Equivalent token-for-token to the
+    # parallel ``rwkv_lm`` (verified in the tests) but O(1) memory per step, which is
+    # what makes RWKV cheap to sample from. Plain-numpy inference -- no tape.
+    x = np.asarray(top["emb"])[token]
+    x = layer_norm(x, top["ln0_g"], top["ln0_b"])
+    new_state: RWKVState = []
+    for p, st in zip(blocks, state):
+        xn = layer_norm(x, p["ln1_g"], p["ln1_b"])
+        lx = st["att_x"]
+        k = (xn * p["att_mix_k"] + lx * (1 - p["att_mix_k"])) @ p["att_wk"]
+        v = (xn * p["att_mix_v"] + lx * (1 - p["att_mix_v"])) @ p["att_wv"]
+        r = sigmoid((xn * p["att_mix_r"] + lx * (1 - p["att_mix_r"])) @ p["att_wr"])
+        w, u = np.exp(p["att_time_decay"]), p["att_time_first"]
+        alpha, beta, eps = st["alpha"], st["beta"], st["eps"]
+        tau = np.maximum(u + k, eps)
+        e1, e2 = np.exp(eps - tau), np.exp(u + k - tau)
+        wkv_t = (e1 * alpha + e2 * v) / (e1 * beta + e2)
+        eps2 = np.maximum(eps - w, k)
+        a1, a2 = np.exp(eps - w - eps2), np.exp(k - eps2)
+        x = x + (wkv_t * r) @ p["att_wo"]
+
+        xn2 = layer_norm(x, p["ln2_g"], p["ln2_b"])
+        fx = st["ffn_x"]
+        fk = relu((xn2 * p["ffn_mix_k"] + fx * (1 - p["ffn_mix_k"])) @ p["ffn_wk"])
+        fr = sigmoid((xn2 * p["ffn_mix_r"] + fx * (1 - p["ffn_mix_r"])) @ p["ffn_wr"])
+        x = x + fr * ((fk * fk) @ p["ffn_wv"])
+
+        new_state.append(
+            {
+                "att_x": np.asarray(xn),
+                "alpha": a1 * alpha + a2 * v,
+                "beta": a1 * beta + a2,
+                "eps": eps2,
+                "ffn_x": np.asarray(xn2),
+            }
+        )
+    x = layer_norm(x, top["ln_out_g"], top["ln_out_b"])
+    return np.asarray(x @ top["head_w"] + top["head_b"]), new_state
 
 
 def sin_sq(x: Tensor) -> Operand:

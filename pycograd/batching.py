@@ -219,6 +219,19 @@ def _elementwise_rule(
     return _result(trace, bind(prim, *aligned, **kwargs), 0)
 
 
+def _pow_rule(trace: BatchTrace, a: Boxed, b: Boxed, **kwargs: Any) -> BatchTracer:
+    # ``d_pow``'s exponent is a *constant* by convention: ``Var.__pow__`` routes only a
+    # constant exponent through ``d_pow`` (a ``Var`` exponent is lowered to ``exp(b*log a)``
+    # first), and ``_vjp_pow`` reads it as a raw value. The generic elementwise rule would
+    # ``_raise`` the exponent to a tracer too, so the base-level ``d_pow`` would see a ``Var``
+    # exponent and take the ``exp(b*log a)`` branch -- nan for a negative base. Keep the
+    # exponent raw and batch only the base, so the safe power path is preserved.
+    ta = trace._raise(a)
+    if ta.bdim is None:
+        return _result(trace, bind(ops.d_pow, ta.value, b, **kwargs), None)
+    return _result(trace, bind(ops.d_pow, _move_bdim_to_front(ta), b, **kwargs), 0)
+
+
 def _elementwise_for(prim: Prim) -> Rule:
     def rule(trace: BatchTrace, *operands: Boxed, **kwargs: Any) -> BatchTracer:
         return _elementwise_rule(trace, prim, *operands, **kwargs)
@@ -501,6 +514,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
         ops.d_cos,
         ops.d_tanh,
         ops.d_sqrt,
+        ops.d_sigmoid,
         ops.d_sinh,
         ops.d_cosh,
         ops.d_arctan,
@@ -518,7 +532,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_mul: _elementwise_for(ops.d_mul),
             ops.d_div: _elementwise_for(ops.d_div),
             ops.d_neg: _elementwise_for(ops.d_neg),
-            ops.d_pow: _elementwise_for(ops.d_pow),
+            ops.d_pow: _pow_rule,  # exponent stays constant; see _pow_rule
             ops.d_lt: _elementwise_for(ops.d_lt),
             ops.d_le: _elementwise_for(ops.d_le),
             ops.d_gt: _elementwise_for(ops.d_gt),

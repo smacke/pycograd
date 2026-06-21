@@ -9,6 +9,7 @@ against finite differences.
 import numpy as np
 
 from pycograd import grad, params, value_and_grad, vmap
+from pycograd.examples import models as M
 from pycograd.transforms import per_example_grad
 
 
@@ -201,6 +202,26 @@ def test_per_example_grad_matches_loop():
     # d/dx (x . x) = 2x, per sample
     assert g.shape == X.shape
     assert np.allclose(g, 2 * X, atol=1e-6)
+
+
+def pow_sq(x):
+    return x**2  # a *constant* exponent -- must stay on the safe power path under vmap
+
+
+def pow_sum(x):
+    return np.sum(x**3)
+
+
+def test_vmap_pow_constant_exponent_negative_base():
+    # Regression: the generic elementwise batch rule lifted ``d_pow``'s exponent to a
+    # tracer, flipping ``x**k`` onto ``exp(k*log x)`` -- nan for a negative base. The
+    # dedicated ``_pow_rule`` keeps the exponent constant, so both forward and gradient
+    # are finite and correct for negative bases.
+    X = np.array([[-1.0, 2.0], [-3.0, 0.5], [1.5, -2.0]])
+    _check(pow_sq, (X,))  # forward matches the loop oracle (no nan)
+    g = per_example_grad(pow_sum)(X)
+    assert np.all(np.isfinite(g))
+    assert np.allclose(g, 3 * X**2, atol=1e-6)  # d/dx sum(x**3) = 3x**2, per sample
 
 
 # ---------------------------------------------------------------------------
@@ -607,3 +628,33 @@ def test_autodiff_hook_resolves_for_batch_tracer_not_plain():
     with new_main(BatchTrace) as main:
         bt = BatchTracer(BatchTrace(main), Var(np.zeros(3)), 0)
         assert _autodiff_hook(np.exp, bt) is not np.exp
+
+
+# ---------------------------------------------------------------------------
+# RWKV: the recurrence + token-shift must vectorize over a batch of sequences
+# (the recurrent loop reads ``k.shape[0]`` -- the *logical* per-example length --
+# so it unrolls correctly under a batch level).
+# ---------------------------------------------------------------------------
+_RWKV_BLK = M._init_rwkv_block(_rng(1), 4)
+
+
+def rwkv_block_fwd(x):  # x: (T, 4) one sequence
+    return M.rwkv_block(x, _RWKV_BLK)
+
+
+def rwkv_block_energy(x):
+    return np.sum(M.rwkv_block(x, _RWKV_BLK) ** 2)
+
+
+def test_vmap_rwkv_block_forward():
+    _check(rwkv_block_fwd, (_rng(2).standard_normal((5, 6, 4)),))
+
+
+def test_vmap_rwkv_block_per_sample_grad():
+    X = _rng(3).standard_normal((5, 6, 4))
+    got = per_example_grad(rwkv_block_energy)(X)
+    ref = np.stack(
+        [np.asarray(grad(rwkv_block_energy)(X[i])[0]) for i in range(len(X))]
+    )
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref, atol=1e-6)

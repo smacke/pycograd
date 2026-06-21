@@ -21,7 +21,7 @@ import numpy as np
 import pyccolo as pyc
 
 from pycograd._typing import Boxed, Prim
-from pycograd.backends import current_backend
+from pycograd.backends import Backend, current_backend
 from pycograd.ops import _is_mathy
 from pycograd.tensor import Var
 from pycograd.trace import (
@@ -161,6 +161,14 @@ class AutodiffTracer(pyc.BaseTracer):
             # level, so a single top-level ``grad`` stays on the direct path.
             if num_transform_levels() > 0:
                 return functools.partial(bind, replacement)
+            if backend.is_delegate:
+                # On a compile backend an intercepted call (``np.exp(w)``) may receive a
+                # bare ``Weight`` proxy directly as an operand -- pyccolo swapped the call
+                # before the proxy's ``__array_ufunc__`` could resolve it. Binops coerce via
+                # the binop-arg handlers; mirror that here so a unary ``np.*`` over a bare
+                # weight resolves it to the live backend tensor too (no-op when no proxy is
+                # present, so the dict-param compile path is unchanged).
+                return _delegating_call(replacement, backend)
             return replacement
         if _is_user_function(func):
             return self._instrument_helper(func)
@@ -238,6 +246,29 @@ class AutodiffTracer(pyc.BaseTracer):
         if isinstance(ret, Var) or isinstance(ret, np.ndarray):
             return _SubscriptProxy(ret)
         return ret
+
+
+def _delegating_call(replacement: Prim, backend: Backend) -> Prim:
+    """Wrap a delegate-backend replacement so it resolves bare ``Weight`` operands.
+
+    Only rewrites the args when a proxy is actually present (directly or nested in a
+    list/tuple, as in ``np.concatenate([w1, w2])``); otherwise it calls ``replacement``
+    with the original args, so the dict-param compile path is byte-for-byte unchanged.
+    The resolution mirrors :func:`pycograd.params._delegate_dispatch`."""
+
+    def call(*args: object, **kwargs: object) -> object:
+        from pycograd.params import Weight, _deep_unwrap
+
+        def _has_weight(x: object) -> bool:
+            return isinstance(x, Weight) or (
+                isinstance(x, (list, tuple)) and any(_has_weight(e) for e in x)
+            )
+
+        if any(_has_weight(a) for a in args):
+            args = tuple(backend.coerce_operand(_deep_unwrap(a)) for a in args)
+        return replacement(*args, **kwargs)
+
+    return call
 
 
 # ``tracer.instrumented`` recompiles ``f`` from source into a fresh function, so

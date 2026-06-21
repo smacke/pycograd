@@ -8,7 +8,7 @@ Functions are defined at MODULE level so pyccolo can re-instrument them from sou
 """
 import numpy as np
 
-from pycograd import grad, jacfwd, jvp, vmap
+from pycograd import d_sigmoid, grad, jacfwd, jvp, vmap
 from pycograd.forward import _JVP
 
 
@@ -71,6 +71,22 @@ def vec_out(x):
 
 def double_tanh(x):
     return np.tanh(x) * 2.0
+
+
+# The fused ``d_sigmoid`` primitive returns a ``Var`` even on a plain array, so the
+# finite-diff oracle can't drive it -- check its forward-mode tangent (elementwise,
+# no reduction) against the closed form sigmoid'(x) = s(1-s).
+def f_sigmoid(x):
+    return d_sigmoid(x)
+
+
+def test_jvp_sigmoid_primitive():
+    x = np.array([0.5, -1.0, 2.0])
+    v = np.array([1.0, 0.5, -0.3])
+    primal, tangent = jvp(f_sigmoid, (x,), (v,))
+    s = 1.0 / (1.0 + np.exp(-x))
+    assert np.allclose(np.asarray(primal), s)
+    assert np.allclose(np.asarray(tangent), s * (1 - s) * v)
 
 
 # A fixed tangent direction (module-level so pyccolo can re-instrument the closure-free
