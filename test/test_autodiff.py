@@ -997,6 +997,16 @@ def proxy_loss():
     return cross_entropy(proxy_forward(_PX), _PY)
 
 
+# Module-level so the pyccolo-instrumented runner (recompiled from source) can see the
+# counter as a global -- a closure over a test-local would be lost on recompile.
+_jit_trace_calls = {"n": 0}
+
+
+def _counting_proxy_loss():
+    _jit_trace_calls["n"] += 1
+    return proxy_loss()
+
+
 def _softmax_ce_fd(W, B, h=1e-6):
     def raw(Wm, Bm):
         z = _PX @ Wm + Bm
@@ -1086,6 +1096,68 @@ def test_with_weights_grad_matches_finite_diff():
     gW, gB = _softmax_ce_fd(_PW, _PB)
     assert np.allclose(grads.w, gW, atol=1e-5)  # gradient by attribute
     assert np.allclose(grads["b"], gB, atol=1e-5)
+
+
+_AMBIENT_BACKEND_MODULE = {"jax": "jax", "torch": "torch", "tf": "tensorflow"}
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_with_weights_grad_backend_matches_numpy_tape(backend):
+    # The ambient objective compiled onto a framework must agree, leaf-for-leaf, with the
+    # numpy tape -- which test_with_weights_grad_matches_finite_diff pins to finite diffs.
+    pytest.importorskip(_AMBIENT_BACKEND_MODULE[backend])
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        ref_v, ref_g = weights.grad(proxy_loss)  # numpy tape
+        cmp_v, cmp_g = weights.grad(proxy_loss, backend=backend)  # framework autodiff
+    assert isinstance(cmp_g, ParamDict)
+    assert np.allclose(float(ref_v), float(cmp_v), atol=1e-9, rtol=1e-7)
+    for key in weights:
+        assert np.allclose(np.asarray(cmp_g[key]), np.asarray(ref_g[key]), atol=1e-8)
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_with_weights_grad_jit_matches_and_reuses(backend):
+    # jit=True must agree with the numpy tape and stay correct across repeated calls
+    # (the compiled gradient is cached on the model and reused).
+    pytest.importorskip(_AMBIENT_BACKEND_MODULE[backend])
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        ref_v, ref_g = weights.grad(proxy_loss)
+        v1, g1 = weights.grad(proxy_loss, backend=backend, jit=True)
+        v2, g2 = weights.grad(proxy_loss, backend=backend, jit=True)  # reuses the cache
+    assert getattr(weights, "_compiled_grad", None)  # a compiled step was cached
+    assert np.allclose(float(ref_v), float(v1), atol=1e-9, rtol=1e-7)
+    assert np.allclose(float(v1), float(v2))
+    for key in weights:
+        assert np.allclose(np.asarray(g1[key]), np.asarray(ref_g[key]), atol=1e-8)
+        assert np.allclose(np.asarray(g2[key]), np.asarray(ref_g[key]), atol=1e-8)
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_with_weights_grad_jit_traces_once(backend):
+    # jit= captures the net once and reuses it (jax.jit / tf.function / torch make_fx +
+    # torch.compile), so the objective body runs a small constant number of times instead
+    # of once per call -- proving real compilation, not eager re-execution per step.
+    pytest.importorskip(_AMBIENT_BACKEND_MODULE[backend])
+    _jit_trace_calls["n"] = 0
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        for _ in range(5):
+            weights.grad(_counting_proxy_loss, backend=backend, jit=True)
+    assert (
+        _jit_trace_calls["n"] <= 2
+    ), f"{backend} re-traced {_jit_trace_calls['n']}x across 5 jit calls"
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_with_weights_grad_backend_frozen_leaf_is_none(backend):
+    pytest.importorskip(_AMBIENT_BACKEND_MODULE[backend])
+    weights = params(w=_PW.copy(), b=frozen(_PB.copy()))  # freeze the bias
+    with weights:
+        _, grads = weights.grad(proxy_loss, backend=backend)
+    assert grads["b"] is None  # frozen -> no gradient, same as the numpy tape
+    assert grads["w"] is not None
 
 
 def test_step_updates_in_place_and_skips_frozen():

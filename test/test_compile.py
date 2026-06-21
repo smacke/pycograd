@@ -160,6 +160,47 @@ def test_backend_imports_framework_only_on_demand():
     assert out == "ok"
 
 
+# An ambient-DSL forward: references weights injected by `with weights:`. Module-level so
+# the pyccolo-instrumented compile runner (recompiled from source) sees them as globals.
+def _dsl_mlp_forward(x):
+    h = np.maximum(0.0, x @ ew1 + eb1)  # noqa: F821  (ambient weights)
+    return h @ ew2 + eb2  # noqa: F821
+
+
+def test_paramdict_to_torch_module_from_dsl_and_exports(tmp_path):
+    torch = pytest.importorskip("torch")
+    from pycograd import frozen, params
+    from pycograd.export import export_torchscript
+
+    r = _rng(1)
+    weights = params(
+        ew1=0.3 * r.standard_normal((2, 16)),
+        eb1=np.zeros(16),
+        ew2=0.3 * r.standard_normal((16, 3)),
+        eb2=frozen(np.zeros(3)),  # a frozen leaf -> a non-trainable buffer
+    )
+    X = _rng(0).standard_normal((20, 2))
+    xb = torch.as_tensor(X)
+    path = str(tmp_path / "dsl_mlp.pt")
+    # Build, run, and trace within `with weights:` (forward reads the injected proxies).
+    with weights:
+        module = weights.to_torch_module(_dsl_mlp_forward)
+        ref = _dsl_mlp_forward(X)  # numpy forward (ambient weights resolve to numpy)
+        out = module(xb)
+        assert np.allclose(out.detach().numpy(), ref, atol=1e-9)
+        # frozen leaf is a buffer, not a Parameter: 3 trainable tensors, not 4
+        assert sum(1 for _ in module.parameters()) == 3
+        out.sum().backward()  # a real, trainable nn.Module
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters()
+        )
+        export_torchscript(module, (xb,), path)
+    # The exported TorchScript carries the captured graph -- runs with no pycograd in scope.
+    assert np.allclose(
+        torch.jit.load(path)(xb).detach().numpy(), out.detach().numpy(), atol=1e-6
+    )
+
+
 def test_to_torch_module_forward_and_trains():
     torch = pytest.importorskip("torch")
     from pycograd.export import to_torch_module

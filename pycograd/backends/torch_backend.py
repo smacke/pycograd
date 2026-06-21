@@ -18,7 +18,7 @@ are routed in through float32 and bf16 results back out through float32.
 from __future__ import annotations
 
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping, cast
 
 import numpy as np
 
@@ -216,6 +216,7 @@ def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
 
 class TorchBackend(Backend):
     name = "torch"
+    is_delegate = True
 
     def __init__(self) -> None:
         import torch
@@ -270,3 +271,50 @@ class TorchBackend(Backend):
         else:
             grads = []
         return _torch_to_numpy(torch, out), [_torch_to_numpy(torch, g) for g in grads]
+
+    def compile_grad(
+        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+    ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        # torch.compile can't trace *through* pyccolo's dispatch directly -- Dynamo drops
+        # the ``activate()`` contextvar, so a binop falls through to a numpy op on a grad
+        # tensor. Instead we capture the value+grad graph ONCE the way jax/tf do: run the
+        # net eagerly under ``torch.func.grad_and_value`` (functional autodiff -- forward and
+        # backward) inside ``make_fx``, which records it into a clean ATen ``GraphModule``
+        # with no pyccolo / contextvar left. ``torch.compile`` then optimizes that graph, and
+        # every step reuses it. (``torch.jit.trace`` can't be used here: it would run the
+        # backward during tracing and freeze the first step's gradients as constants.)
+        torch = self._torch
+        state: dict[str, object] = {"fn": None}
+
+        def build(example: list[BackendArray]) -> object:
+            from torch.func import grad_and_value
+            from torch.fx.experimental.proxy_tensor import make_fx
+
+            graph = make_fx(grad_and_value(scalar_fn))(example)
+            try:
+                return torch.compile(graph)
+            except Exception:
+                return graph  # the captured graph already avoids per-step re-tracing
+
+        def run(
+            leaves: list[BackendArray],
+        ) -> tuple[BackendArray, list[BackendArray]]:
+            ts = [_as_torch(torch, x) for x in leaves]
+            if not ts:
+                out = self._as_tensor(scalar_fn(ts)).reshape(())
+                return _torch_to_numpy(torch, out), []
+            fn = state["fn"]
+            if fn is None:
+                try:
+                    fn = build(ts)
+                except Exception:
+                    fn = "eager"  # robust fallback: correct, just not compiled
+                state["fn"] = fn
+            if fn == "eager":
+                return self.grad_and_value(scalar_fn, leaves)
+            grads, value = cast(Callable, fn)(ts)  # grad_and_value -> (grads, value)
+            return _torch_to_numpy(torch, value), [
+                _torch_to_numpy(torch, g) for g in grads
+            ]
+
+        return run

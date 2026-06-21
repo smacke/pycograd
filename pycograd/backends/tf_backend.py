@@ -204,6 +204,7 @@ def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
 
 class TFBackend(Backend):
     name = "tf"
+    is_delegate = True
 
     def __init__(self) -> None:
         import tensorflow as tf
@@ -256,3 +257,38 @@ class TFBackend(Backend):
         grads = tape.gradient(out, ts) if ts else []
         grads = [g if g is not None else tf.zeros_like(t) for g, t in zip(grads, ts)]
         return _tf_to_numpy(tf, out), [_tf_to_numpy(tf, g) for g in grads]
+
+    def compile_grad(
+        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+    ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        # Stage the tape into a static graph with tf.function: it traces the net once
+        # (keyed by the leaves' shapes/dtypes) and reruns the graph thereafter. autograph
+        # is off -- the net is already lowered by pyccolo, and AutoGraph's source rewrite
+        # both fails on it and is unnecessary.
+        tf = self._tf
+
+        @tf.function(autograph=False)
+        def step(
+            tensors: list[BackendArray],
+        ) -> tuple[BackendArray, list[BackendArray]]:
+            with tf.GradientTape() as tape:
+                for t in tensors:
+                    tape.watch(t)
+                out = self._as_tensor(scalar_fn(tensors))
+            grads = tape.gradient(out, tensors)
+            grads = [
+                g if g is not None else tf.zeros_like(t) for g, t in zip(grads, tensors)
+            ]
+            return out, grads
+
+        def run(
+            leaves: list[BackendArray],
+        ) -> tuple[BackendArray, list[BackendArray]]:
+            ts = [_as_tf(tf, x) for x in leaves]
+            if not ts:
+                out = self._as_tensor(scalar_fn(ts))
+                return _tf_to_numpy(tf, out), []
+            out, grads = step(ts)
+            return _tf_to_numpy(tf, out), [_tf_to_numpy(tf, g) for g in grads]
+
+        return run

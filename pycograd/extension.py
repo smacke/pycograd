@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any
 
 from pycograd._typing import Boxed, Prim
+from pycograd.backends import active_backend_or_none
 from pycograd.params import frozen as _frozen
 from pycograd.params import tied as _tied
 from pycograd.tensor import Var
@@ -57,8 +58,19 @@ def _autodiff_hook(func: Prim, value: Boxed) -> Prim:
     function runs un-instrumented and its inner ``np.*`` meets a raw tracer, e.g.
     ``BatchTracer does not support ufuncs``). A plain array/number is left alone, so pure
     inference keeps the fast path. Defined at module scope for a stable identity (idempotent
-    registration, clean removal)."""
-    return resolve_call(func) if isinstance(value, (Var, Tracer)) else func
+    registration, clean removal).
+
+    Under an active *delegate* backend (a ``compile_to`` / ``weights.grad(backend=...)`` of
+    an ambient net), the piped value is the backend's own tensor -- neither a ``Var`` nor a
+    ``Tracer`` -- so we resolve there too, otherwise a bare ``|> relu`` runs un-instrumented
+    and its ``np.maximum`` meets a raw framework tensor (e.g. numpy on a grad tensor).
+    """
+    if isinstance(value, (Var, Tracer)):
+        return resolve_call(func)
+    be = active_backend_or_none()
+    if be is not None and be.is_delegate:
+        return resolve_call(func)
+    return func
 
 
 def load_ipython_extension(shell: Any) -> None:

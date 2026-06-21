@@ -19,7 +19,16 @@ from typing import TYPE_CHECKING, Any, Callable, Hashable, Iterable, cast
 
 import numpy as np
 
-from pycograd._typing import Array, ArrayLike, Index, Operand, Prim
+from pycograd._typing import (
+    Array,
+    ArrayLike,
+    BackendArray,
+    DTypeLike,
+    Index,
+    Operand,
+    Prim,
+)
+from pycograd.backends import active_backend_or_none
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, _warn_wrapper
 from pycograd.tensor import Var, _is_numeric, _value, grad_recording
@@ -118,6 +127,30 @@ def _deep_unwrap(x: object) -> object:
     return x
 
 
+# Sentinel: "no delegate backend is active, fall through to the normal dispatch".
+_NO_DELEGATE = object()
+
+
+def _delegate_dispatch(
+    func: Prim, args: tuple[object, ...], kwargs: dict[str, object]
+) -> object:
+    """Route a numpy ufunc / array-function over a bare weight onto the active *delegate*
+    backend, mirroring the recording branch's ``_INTERCEPT`` routing -- but with operands
+    coerced onto the backend. Eager forwards don't need this (their binops/calls already
+    route through the tracer seam), but *graph capture* does: ``make_fx``'s proxy mode
+    dispatches ``proxy @ weight`` through ``__array_ufunc__``, where the default branch
+    would hand a grad tensor to a raw numpy op. Returns :data:`_NO_DELEGATE` when no
+    delegate backend is active, so the ``Var``-tape / plain-numpy dispatch is unchanged.
+    """
+    be = active_backend_or_none()
+    if be is None or not be.is_delegate:
+        return _NO_DELEGATE
+    operands = [be.coerce_operand(_deep_unwrap(a)) for a in args]
+    repl = be.intercept.get(func)
+    fn = repl if repl is not None else be.on_unmapped(func)
+    return fn(*operands, **kwargs)
+
+
 def _any_recording(obj: object) -> bool:
     """True if a numpy call over ``obj`` should record -- i.e. some operand
     resolves to a ``Var`` (training), vs. plain arrays (inference)."""
@@ -156,7 +189,15 @@ class Weight:
     # mypy can't express "whichever it is, it has @/+/...", so we view it as an
     # ndarray for typing -- the runtime op dispatches correctly to Var either way.
     def _arr(self) -> Array:
-        return cast(Array, self._live())
+        live = self._live()
+        # Under a delegate backend with no grad binding (a forward-only ``compile_to`` of an
+        # ambient net), the weight resolves to its raw numpy value; lift it onto the backend
+        # so ``backend_input @ weight`` works. No-op on the numpy tape (no backend active)
+        # and on the grad path (``_live`` already holds a backend tensor).
+        be = active_backend_or_none()
+        if be is not None and be.is_delegate:
+            return cast(Array, be.coerce_operand(live))
+        return cast(Array, live)
 
     # -- operators: forward to the live value, unwrapping proxy operands ----------
     def __matmul__(self, o: Operand) -> Operand:
@@ -218,6 +259,9 @@ class Weight:
     ) -> object:
         if method != "__call__":
             return NotImplemented
+        delegate = _delegate_dispatch(ufunc, inputs, kwargs)
+        if delegate is not _NO_DELEGATE:
+            return delegate
         if _any_recording(inputs):
             prim = _INTERCEPT.get(ufunc)
             if prim is not None:
@@ -232,6 +276,9 @@ class Weight:
         args: tuple[object, ...],
         kwargs: dict[str, Any],
     ) -> object:
+        delegate = _delegate_dispatch(func, args, kwargs)
+        if delegate is not _NO_DELEGATE:
+            return delegate
         if _any_recording(args):
             prim = _INTERCEPT.get(func)
             if prim is not None:
@@ -333,12 +380,34 @@ class ParamDict(dict):
                     del g[key]
             self._scope = None
 
-    def grad(self, objective: Callable[[], PyTree]) -> tuple[Array, ParamDict]:
+    def grad(
+        self,
+        objective: Callable[[], PyTree],
+        *,
+        backend: "str | None" = None,
+        dtype: "DTypeLike | None" = None,
+        jit: bool = False,
+    ) -> tuple[Array, ParamDict]:
         """Run ``objective`` (a no-arg callable returning a scalar, built from this
         model) with the weights bound to ``Var``s, backprop, and return
         ``(value, grads)`` where ``grads`` is a ``ParamDict`` of gradients (``None``
         at frozen weights). Tied weights share one gradient. Trainable leaves only;
-        nest by calling per sub-tree."""
+        nest by calling per sub-tree.
+
+        With ``backend=`` (``"torch"`` / ``"jax"`` / ``"tf"``) the same ambient objective
+        is instead run on that framework and differentiated by *its* autodiff -- the
+        compile twin of the numpy-tape path, with identical ``frozen`` / ``tied`` / ``None``
+        semantics. ``dtype`` selects the working precision the leaves are lifted in.
+        No framework is imported until a non-numpy ``backend`` is named.
+
+        ``jit=True`` (jax only; ignored elsewhere) compiles the gradient **once** and
+        reuses it across calls, so a training loop traces the net a single time instead of
+        every step. Cached per ``(objective, leaf structure)`` on this model; valid only
+        while the objective's non-weight inputs (e.g. data captured by closure) stay fixed
+        -- so it fits full-batch loops, not minibatching that swaps the data each step.
+        """
+        if backend is not None and backend != "numpy":
+            return self._grad_via_backend(objective, backend, dtype, jit)
         from pycograd.tracer import _INSTRUMENTED, _make_runner
         from pycograd.transforms import _wrap_leaf
 
@@ -380,6 +449,77 @@ class ParamDict(dict):
         )
         return value, grads
 
+    def _grad_via_backend(
+        self,
+        objective: Callable[[], PyTree],
+        backend: str,
+        dtype: DTypeLike | None,
+        jit: bool,
+    ) -> tuple[Array, ParamDict]:
+        """``grad`` on a delegate backend: bind each weight to a *backend tensor* in the
+        ambient ``_live`` slot (instead of a ``Var``), run the instrumented objective under
+        that backend, and read gradients from the framework's own autodiff. Leaf planning
+        (frozen -> constant, tied -> shared, per-leaf gradient) reuses the same helpers as
+        :func:`pycograd.compile.value_and_grad`, so the two paths agree leaf-for-leaf.
+
+        With ``jit=True`` the backend's compiled gradient (``Backend.compile_grad``) is
+        cached on this model per ``(objective, leaf structure)`` and reused across calls, so
+        jax traces the net once rather than every step.
+        """
+        from pycograd.backends import activate, get_backend
+        from pycograd.compile import _fill, _grad_for, _plan_leaf
+        from pycograd.dtypes import _maybe_dtype
+        from pycograd.tracer import _INSTRUMENTED, _make_runner
+
+        be = get_backend(backend)
+        with _maybe_dtype(dtype):
+            trainable: list[Array] = []
+            tie_slot: dict[object, int] = {}
+            slots = {key: _plan_leaf(self[key], trainable, tie_slot) for key in self}
+
+            runner = _INSTRUMENTED.get(objective)
+            if runner is None:
+                runner = _make_runner(objective)
+                _INSTRUMENTED[objective] = runner
+
+            # ``slots`` is rebuilt each call but is structurally identical step to step, so a
+            # cached compiled gradient (closed over the first call's slots) stays valid.
+            def make_scalar_fn(
+                plan: dict[str, tuple],
+            ) -> Callable[[list[object]], object]:
+                def scalar_fn(tensors: list[object]) -> object:
+                    with activate(be):
+                        prev = getattr(self, "_live", None)
+                        self._live = {k: _fill(plan[k], tensors, be) for k in self}
+                        try:
+                            return runner()
+                        finally:
+                            self._live = prev
+
+                return scalar_fn
+
+            if jit:
+                cache = getattr(self, "_compiled_grad", None)
+                if cache is None:
+                    cache = {}
+                    self._compiled_grad = cache
+                sig = (
+                    (id(objective), be.name)
+                    + tuple((key, slots[key][0]) for key in self)
+                    + tuple((np.shape(t), str(np.asarray(t).dtype)) for t in trainable)
+                )
+                compiled = cache.get(sig)
+                if compiled is None:
+                    compiled = be.compile_grad(make_scalar_fn(slots))
+                    cache[sig] = compiled
+                value, grad_leaves = compiled(trainable)
+            else:
+                value, grad_leaves = be.grad_and_value(make_scalar_fn(slots), trainable)
+            grads = ParamDict(
+                {key: _grad_for(slots[key], grad_leaves, be) for key in self}
+            )
+            return np.asarray(value), grads
+
     def step(self, grads: ParamDict, lr: float) -> None:
         """One in-place SGD step: ``p.value -= lr * grad`` for each trainable leaf
         (frozen leaves, whose gradient is ``None``, are left untouched). The model's
@@ -389,6 +529,70 @@ class ParamDict(dict):
             g = grads.get(key)
             if isinstance(leaf, Param) and leaf.trainable and g is not None:
                 leaf.value = cast(Array, leaf.value) - lr * cast(Array, g)
+
+    def to_torch_module(
+        self, forward: Callable[..., object], *, dtype: DTypeLike | None = None
+    ) -> object:
+        """Wrap an ambient ``forward`` (built against this model) as a ``torch.nn.Module``.
+
+        The DSL twin of :func:`pycograd.export.to_torch_module`: this model's trainable
+        leaves become ``Parameter``s (frozen leaves become buffers), and ``module(*inputs)``
+        binds those live tensors into the ambient slot and runs the compiled-to-torch
+        ``forward``. So the module trains with any torch optimizer (``loss.backward()``) and
+        traces to TorchScript / ONNX via :func:`pycograd.export.export_torchscript` /
+        :func:`~pycograd.export.export_onnx`. torch is imported only here.
+
+        ``forward`` reads the weights by the names ``with weights:`` injects, so call the
+        module (and trace it for export) **inside that block** -- the exported TorchScript /
+        ONNX artifact then carries the captured graph and runs with no pycograd dependency.
+        """
+        import torch
+
+        from pycograd.backends.torch_backend import _as_torch
+        from pycograd.compile import compile_to
+        from pycograd.dtypes import _maybe_dtype
+
+        run = compile_to(forward, "torch", dtype=dtype)
+        owner = self
+        keys = list(self)
+
+        class AmbientModule(torch.nn.Module):  # type: ignore[misc]
+            def __init__(self) -> None:
+                super().__init__()
+                self._slots: list[tuple[str, str, object]] = []
+                self._weights = torch.nn.ParameterList()
+                for key in keys:
+                    leaf = owner[key]
+                    value = leaf.value if isinstance(leaf, Param) else leaf
+                    with _maybe_dtype(dtype):
+                        tensor = _as_torch(torch, value)
+                    if isinstance(leaf, Param) and not leaf.trainable:
+                        name = f"_frozen_{len(self._slots)}"
+                        self.register_buffer(name, tensor)
+                        self._slots.append((key, "buffer", name))
+                    else:
+                        self._slots.append((key, "weight", len(self._weights)))
+                        self._weights.append(torch.nn.Parameter(tensor))
+
+            def _live_tensors(self) -> dict[str, object]:
+                return {
+                    key: (
+                        self._weights[cast(int, ref)]
+                        if kind == "weight"
+                        else getattr(self, cast(str, ref))
+                    )
+                    for key, kind, ref in self._slots
+                }
+
+            def forward(self, *inputs: BackendArray) -> BackendArray:
+                prev = getattr(owner, "_live", None)
+                owner._live = self._live_tensors()
+                try:
+                    return run(*inputs)
+                finally:
+                    owner._live = prev
+
+        return AmbientModule()
 
 
 # ---------------------------------------------------------------------------

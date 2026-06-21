@@ -95,6 +95,28 @@ def test_is_user_function_accepts_ipython_cells():
     assert _is_user_function(ns["repl_fn"]) is False  # <stdin>/<string> still rejected
 
 
+def test_autodiff_hook_resolves_bare_stage_under_delegate_backend():
+    # A bare-function pipe stage (`x |> relu`) is left raw during plain inference (fast
+    # path) but must be instrumented when a delegate backend is active -- otherwise the
+    # staged helper's `np.maximum` would meet a raw framework tensor when compiling an
+    # ambient DSL net. (The Var/Tracer cases are covered by the autodiff/vmap suites.)
+    import numpy as np
+
+    from pycograd.backends import activate, get_backend
+    from pycograd.extension import _autodiff_hook
+
+    def relu(z):
+        return np.maximum(0.0, z)
+
+    assert (
+        _autodiff_hook(relu, np.zeros(3)) is relu
+    )  # no backend -> raw, fast inference
+    pytest.importorskip("torch")
+    with activate(get_backend("torch")):
+        resolved = _autodiff_hook(relu, np.zeros(3))  # delegate active -> instrumented
+    assert resolved is not relu
+
+
 def test_extension_unload_preserves_user_named_frozen():
     # If the user already bound ``frozen``/``tied``, we must not clobber or remove
     # their value on load/unload.

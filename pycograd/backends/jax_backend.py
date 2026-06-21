@@ -58,6 +58,7 @@ def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
 
 class JaxBackend(Backend):
     name = "jax"
+    is_delegate = True
 
     def __init__(self) -> None:
         import jax
@@ -85,6 +86,19 @@ class JaxBackend(Backend):
     def const(self, array: BackendArray) -> BackendArray:
         return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
+    def coerce_operand(self, value: BackendArray) -> BackendArray:
+        # The tracer's ``after_{left,right}_binop_arg`` handlers run each ``@``/``+``/...
+        # operand through here. A concrete jax array shares numpy's operators, but a
+        # *trace-time* tracer (under jax.grad) cannot convert to numpy -- so a binop where a
+        # numpy data global (e.g. an input baked into an ambient-weights net) meets a weight
+        # bound to a tracer would raise. Promote that numpy operand to jnp so jax's own op
+        # runs. Existing jnp arrays, tracers, and python scalars are left untouched. (torch
+        # and tf override this too; the numpy/cupy tape needs no coercion, hence the identity
+        # default on the base ``Backend``.)
+        if isinstance(value, (np.ndarray, np.generic)):
+            return self._jnp.asarray(np.asarray(value, dtype=current_dtype()))
+        return value
+
     def to_numpy(self, tensor: BackendArray) -> Array:
         # Preserves dtype, including bfloat16 (jax's bf16 is the ml_dtypes numpy dtype).
         return np.asarray(tensor)
@@ -104,3 +118,29 @@ class JaxBackend(Backend):
             return np.asarray(f(arrs)), []
         value, grads = jax.value_and_grad(f)(arrs)
         return np.asarray(value), [np.asarray(g) for g in grads]
+
+    def compile_grad(
+        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+    ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        # jit the value-and-grad once; XLA caches the compiled program keyed by the leaves'
+        # shapes/dtypes, so reusing this closure across training steps traces the net a
+        # single time. (scalar_fn closes over the weights' ambient binding, but jit re-runs
+        # the Python only on the first trace -- later calls feed the leaf tensors straight
+        # into the compiled graph.)
+        jax, jnp = self._jax, self._jnp
+
+        def f(ts: list) -> object:
+            return jnp.asarray(scalar_fn(ts)).reshape(())
+
+        compiled = jax.jit(jax.value_and_grad(f))
+
+        def run(
+            leaves: list[BackendArray],
+        ) -> tuple[BackendArray, list[BackendArray]]:
+            arrs = [jnp.asarray(np.asarray(x, dtype=current_dtype())) for x in leaves]
+            if not arrs:
+                return np.asarray(f(arrs)), []
+            value, grads = compiled(arrs)
+            return np.asarray(value), [np.asarray(g) for g in grads]
+
+        return run

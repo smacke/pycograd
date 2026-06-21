@@ -48,6 +48,12 @@ class Backend:
     # compute with. ``None`` on the base and on delegate backends, which never read it.
     array_module: ModuleType | None = None
 
+    # True for *delegate* backends (jax/torch/tf): a foreign framework does the autodiff.
+    # The ambient-weights proxy reads this to route a bare-weight numpy ufunc / array-func
+    # onto the backend -- needed when the net is captured into a graph (torch ``make_fx``'s
+    # proxy mode dispatches a binop over a weight through ``__array_ufunc__``).
+    is_delegate: bool = False
+
     @property
     def intercept(self) -> Mapping[Prim, Prim]:
         raise NotImplementedError
@@ -91,6 +97,21 @@ class Backend:
     ) -> tuple[BackendArray, list[BackendArray]]:
         raise NotImplementedError
 
+    def compile_grad(
+        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+    ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        """Return a *reusable* ``leaves -> (value, [grad per leaf])`` callable.
+
+        The default just re-runs :meth:`grad_and_value` on every call (correct, but no
+        speedup). Every framework backend overrides it to build the gradient **once** and
+        reuse the result: ``jax.jit`` / ``tf.function`` trace the net a single time (keyed by
+        the leaves' shapes), and torch captures the value+grad into an ATen graph via
+        ``make_fx`` then ``torch.compile``\\ s it -- so a training loop stops re-tracing
+        every step. Callers cache the returned closure across steps and feed it the current
+        leaf values; it is valid only while the net's structure and the scalar_fn's non-leaf
+        inputs (e.g. data baked in by closure) stay fixed."""
+        return lambda leaves: self.grad_and_value(scalar_fn, leaves)
+
 
 # The active backend the tracer reads, per execution context. ``None`` means "use the
 # default numpy backend" -- resolved lazily so merely importing pycograd never forces a
@@ -104,6 +125,15 @@ def current_backend() -> Backend:
     """The backend the tracer should swap against right now (numpy unless overridden)."""
     be = _active.get()
     return get_backend("numpy") if be is None else be
+
+
+def active_backend_or_none() -> "Backend | None":
+    """The active backend, or ``None`` if none is overridden (the default numpy tape).
+
+    Unlike :func:`current_backend`, this never constructs the numpy backend, so the hot
+    ``Var``-tape path (no backend activated) pays only a contextvar read -- letting the
+    ambient-weights proxy cheaply detect a delegate backend swap."""
+    return _active.get()
 
 
 @contextlib.contextmanager
