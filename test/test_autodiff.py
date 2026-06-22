@@ -547,10 +547,12 @@ def test_dropout_eval_is_identity():
 
 def test_dropout_train_routes_gradient_through_mask():
     x = Var(np.array([1.0, 2.0, 3.0, 4.0]))
-    models._dropout_rng = np.random.default_rng(0)
-    out = dropout(x, 0.8, training=True)
+    # ``p`` is the *drop* probability now (functional dropout); thread an explicit
+    # generator rather than mutating a module global.
+    out = dropout(x, 0.2, training=True, rng=np.random.default_rng(0))
     out.backward()
-    mask = (np.random.default_rng(0).random((4,)) < 0.8) / 0.8
+    keep = 0.8
+    mask = (np.random.default_rng(0).random((4,)) < keep) / keep
     assert np.allclose(out.value, x.value * mask)
     assert np.allclose(x.grad, mask)  # gradient zero on dropped units
 

@@ -87,6 +87,56 @@ def gelu(x: Tensor) -> Tensor:
     return 0.5 * x * (1.0 + np.tanh(c * (x + 0.044715 * x**3)))
 
 
+def tanh(x: Tensor) -> Tensor:
+    """Hyperbolic tangent -- a friendly alias for ``np.tanh`` (the ``d_tanh``
+    primitive) so it reads alongside the other activations at a call site."""
+    return np.tanh(x)
+
+
+def leaky_relu(x: Tensor, slope: float = 0.01) -> Tensor:
+    """``max(x, 0) + slope * min(x, 0)`` -- ReLU with a small negative slope."""
+    return np.maximum(x, 0.0) + slope * np.minimum(x, 0.0)
+
+
+def elu(x: Tensor, alpha: float = 1.0) -> Tensor:
+    """Exponential linear unit: ``x`` for ``x > 0`` else ``alpha (exp(x) - 1)``."""
+    return np.where(x > 0.0, x, alpha * np.expm1(x))
+
+
+def softplus(x: Tensor) -> Tensor:
+    """``log(1 + exp(x))`` computed stably as ``max(x, 0) + log1p(exp(-|x|))``
+    (no ``exp`` overflow for large ``x``)."""
+    return np.maximum(x, 0.0) + np.log1p(np.exp(-np.abs(x)))
+
+
+def mish(x: Tensor) -> Tensor:
+    """Mish: ``x * tanh(softplus(x))``."""
+    return x * np.tanh(softplus(x))
+
+
+def hardsigmoid(x: Tensor) -> Tensor:
+    """Piecewise-linear sigmoid approximation ``clip(x + 3, 0, 6) / 6``."""
+    return np.clip(x + 3.0, 0.0, 6.0) / 6.0
+
+
+def hardswish(x: Tensor) -> Tensor:
+    """``x * hardsigmoid(x)`` -- the piecewise-linear SiLU approximation."""
+    return x * hardsigmoid(x)
+
+
+def softsign(x: Tensor) -> Tensor:
+    """``x / (1 + |x|)`` -- a cheaper, polynomially-saturating tanh-like squash."""
+    return x / (1.0 + np.abs(x))
+
+
+def selu(x: Tensor) -> Tensor:
+    """Scaled ELU with the self-normalizing constants
+    (``alpha = 1.6732632...``, ``scale = 1.0507009...``)."""
+    alpha = 1.6732632423543772
+    scale = 1.0507009873554805
+    return scale * np.where(x > 0.0, x, alpha * np.expm1(x))
+
+
 # ---------------------------------------------------------------------------
 # Convolution & pooling -- composed, not fused.
 #
@@ -189,3 +239,93 @@ def one_hot(indices: "np.ndarray", num_classes: int) -> "np.ndarray":
     """One-hot encode integer ``indices`` along a new last axis. A constant w.r.t. the
     (integer, non-differentiable) indices -- a plain array, not a tape node."""
     return np.eye(num_classes)[np.asarray(indices)]
+
+
+# ---------------------------------------------------------------------------
+# Normalization -- composed from the mean/var reductions, so the reverse pass,
+# jvp and vmap come for free (exactly as ``d_mean``/``d_var`` already do).
+# ---------------------------------------------------------------------------
+def layer_norm(x: Tensor, gamma: Tensor, beta: Tensor, eps: float = 1e-5) -> Tensor:
+    """Normalize over the last axis to zero mean / unit variance, then scale and
+    shift: ``(x - mean) / sqrt(var + eps) * gamma + beta``."""
+    mu = np.mean(x, axis=-1, keepdims=True)
+    centered = x - mu
+    var = np.mean(centered * centered, axis=-1, keepdims=True)
+    return centered / (var + eps) ** 0.5 * gamma + beta
+
+
+def rms_norm(x: Tensor, gamma: Tensor, eps: float = 1e-5) -> Tensor:
+    """Root-mean-square norm: ``x / sqrt(mean(x**2, -1) + eps) * gamma`` (no mean
+    subtraction / bias -- the LLaMA / RWKV-style normalizer)."""
+    ms = np.mean(x * x, axis=-1, keepdims=True)
+    return x / (ms + eps) ** 0.5 * gamma
+
+
+# ---------------------------------------------------------------------------
+# Attention & embedding.
+# ---------------------------------------------------------------------------
+def scaled_dot_product_attention(
+    q: Tensor, k: Tensor, v: Tensor, mask: Optional["np.ndarray"] = None
+) -> Tensor:
+    """Scaled dot-product attention ``softmax(q k^T / sqrt(d)) v`` over the last
+    two axes. ``q``/``k``/``v`` are ``(..., L, d)`` with arbitrary leading
+    batch/head dims; ``mask`` (optional, broadcastable to the ``(..., Lq, Lk)``
+    scores) keeps positions where it is truthy and drives the rest to ~0 weight.
+
+    Written with batched ``matmul`` (which broadcasts over the leading dims) and a
+    last-two-axes ``transpose``, so the whole thing batches under ``vmap`` with no
+    attention-specific rule."""
+    scale = q.shape[-1] ** -0.5
+    nd = len(k.shape)
+    perm = tuple(range(nd - 2)) + (nd - 1, nd - 2)  # swap the last two axes
+    scores = np.matmul(q, np.transpose(k, perm)) * scale
+    if mask is not None:
+        scores = np.where(mask, scores, -1e9)
+    weights = softmax(scores, axis=-1)
+    return np.matmul(weights, v)
+
+
+def embedding(table: Tensor, indices: "np.ndarray") -> Tensor:
+    """Look up rows of ``table`` (``(num_embeddings, dim)``) by integer
+    ``indices``, returning ``(*indices.shape, dim)``. A plain gather, so the
+    gradient scatter-adds back into the looked-up rows (``d_getitem``'s backward).
+
+    Note: for the compile backends (torch / jax / tf), the equivalent
+    ``one_hot(indices, num_embeddings) @ table`` avoids fancy indexing, which does
+    not bridge cleanly."""
+    return table[np.asarray(indices)]
+
+
+# ---------------------------------------------------------------------------
+# Linear & dropout.
+# ---------------------------------------------------------------------------
+def linear(x: Tensor, w: Tensor, b: Optional[Tensor] = None) -> Tensor:
+    """Affine map ``x @ w (+ b)``. ``w`` is ``(in, out)``; optional ``b`` is
+    ``(out,)`` and broadcasts over the leading dims."""
+    out = x @ w
+    return out if b is None else out + b
+
+
+# Default generator for the ``rng=None`` path. Prefer threading an explicit
+# ``rng`` for reproducibility (the splittable-PRNG story is a separate roadmap
+# item; this keeps dropout off a hidden global beyond this fallback).
+_default_dropout_rng = np.random.default_rng()
+
+
+def dropout(
+    x: Tensor,
+    p: float,
+    training: bool = True,
+    rng: Optional["np.random.Generator"] = None,
+) -> Tensor:
+    """Inverted dropout. ``p`` is the *drop* probability (torch/jax convention):
+    at training time each element is zeroed with probability ``p`` and the
+    survivors are scaled by ``1 / (1 - p)`` so the expected value is unchanged.
+    A no-op when ``not training`` or ``p == 0``. The mask is a plain-array
+    constant, so the gradient simply routes through it."""
+    if not training or p == 0.0:
+        return x
+    keep = 1.0 - p
+    gen = _default_dropout_rng if rng is None else rng
+    mask = (gen.random(x.shape) < keep) / keep  # x.shape via Var.shape
+    return x * mask

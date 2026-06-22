@@ -9,18 +9,20 @@ autodiff rule -- each is instrumented on demand so gradients flow through them.
 """
 from __future__ import annotations
 
-from typing import Optional, cast
+from typing import cast
 
 import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Operand, Tensor
+from pycograd.functional import dropout, layer_norm, linear
+from pycograd.functional import scaled_dot_product_attention as attention
 from pycograd.functional import softmax as _softmax
 from pycograd.tree import PyTree
 
 # NOTE: these demo functions are recompiled by pyccolo during instrumentation,
 # which re-evaluates their annotations. PEP 585 builtins (``list``/``dict``/
-# ``tuple``) are runtime-safe on 3.9, but PEP 604 ``X | None`` is not -- so the
-# one optional argument below keeps ``Optional`` rather than ``| None``.
+# ``tuple``) are runtime-safe on 3.9, but PEP 604 ``X | None`` is not -- so any
+# optional annotation here should use ``Optional[...]`` rather than ``| None``.
 
 
 # ---------------------------------------------------------------------------
@@ -171,29 +173,13 @@ def _mlp_tree_accuracy(params: PyTree) -> float:
 
 
 # ---------------------------------------------------------------------------
-# The same classifier with a LayerNorm and a Dropout layer. LayerNorm is
-# stateless (gamma/beta are just differentiated params), and Dropout's mask is a
-# sampled constant the gradient routes through.
+# The same classifier with a LayerNorm and a Dropout layer, now using the
+# first-class ``layer_norm`` / ``linear`` / ``dropout`` ops from
+# ``pycograd.functional``. LayerNorm is stateless (gamma/beta are just
+# differentiated params), and Dropout's mask is a sampled constant the gradient
+# routes through.
 # ---------------------------------------------------------------------------
 _dropout_rng = np.random.default_rng(0)
-
-
-def linear(x: Tensor, w: Tensor, b: Tensor) -> Tensor:
-    return x @ w + b
-
-
-def layer_norm(x: Tensor, gamma: Tensor, beta: Tensor, eps: float = 1e-5) -> Tensor:
-    mu = np.mean(x, axis=-1, keepdims=True)
-    centered = x - mu
-    var = np.mean(centered * centered, axis=-1, keepdims=True)
-    return centered / (var + eps) ** 0.5 * gamma + beta
-
-
-def dropout(x: Tensor, keep: float, training: bool) -> Tensor:
-    if not training:
-        return x
-    mask = (_dropout_rng.random(x.shape) < keep) / keep  # x.shape via Var.shape
-    return x * mask  # mask is a plain-array constant; grad routes through it
 
 
 def deep_forward(
@@ -207,7 +193,9 @@ def deep_forward(
     training: bool,
 ) -> Tensor:
     hidden = relu(layer_norm(linear(x, w1, b1), g, beta))
-    hidden = dropout(hidden, 0.9, training)
+    # ``p`` is the *drop* probability (was a 0.9 keep-prob before the op moved
+    # into functional); thread the demo's seeded generator for reproducibility.
+    hidden = dropout(hidden, 0.1, training, rng=_dropout_rng)
     return softmax(linear(hidden, w2, b2))
 
 
@@ -244,15 +232,8 @@ def softmax_last(z: Tensor) -> Tensor:
     return _softmax(z, axis=-1)
 
 
-def attention(
-    q: Tensor, k: Tensor, v: Tensor, mask: Optional[np.ndarray] = None
-) -> Tensor:
-    scores = (q @ k.T) * (q.shape[-1] ** -0.5)  # scaled dot-product
-    if mask is not None:
-        scores = np.where(mask, scores, -1e9)  # masked positions get ~0 weight
-    return softmax_last(scores) @ v
-
-
+# ``attention`` is now the first-class ``scaled_dot_product_attention`` op,
+# imported above (the rank-2 ``q @ k.T`` block this used to inline).
 def transformer_block(
     x: Tensor,
     wq: Tensor,
