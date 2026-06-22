@@ -9,13 +9,19 @@ np = pytest.importorskip("numpy")
 from pycograd import ShapeDtypeStruct as S  # noqa: E402
 from pycograd import (  # noqa: E402
     avg_pool2d,
+    causal_conv1d,
     conv1d,
     conv2d,
+    conv_transpose1d,
     cumsum,
     eval_shape,
     jvp,
     max_pool2d,
     one_hot,
+    streaming_conv1d,
+    streaming_conv1d_init,
+    streaming_conv_transpose1d,
+    streaming_conv_transpose1d_init,
     value_and_grad,
     vmap,
 )
@@ -97,6 +103,161 @@ def test_conv1d_forward_matches_conv2d_collapse():
     xp = np.pad(x, ((0, 0), (0, 0), (1, 1)))
     ref = _ref_conv2d(xp[:, :, None, :], w[:, :, None, :], b, stride=1, pad=0)
     assert np.allclose(got, ref[:, :, 0, :])
+
+
+# --- dilation ---------------------------------------------------------------
+def _ref_dilated_conv1d(x, w, b, stride, dilation):
+    n, c, ll = x.shape
+    c_out, _, k = w.shape
+    span = (k - 1) * dilation
+    l_out = (ll - span - 1) // stride + 1
+    out = np.zeros((n, c_out, l_out))
+    for ni in range(n):
+        for co in range(c_out):
+            for t in range(l_out):
+                s = t * stride
+                patch = x[ni, :, s : s + span + 1 : dilation]
+                out[ni, co, t] = np.sum(patch * w[co])
+    return out + b.reshape(1, c_out, 1)
+
+
+def test_conv1d_dilation_matches_reference():
+    rng = np.random.default_rng(10)
+    x = rng.standard_normal((2, 3, 11))
+    w = rng.standard_normal((4, 3, 3))
+    b = rng.standard_normal(4)
+    got = np.asarray(conv1d(x, w, b, stride=2, dilation=2))
+    assert np.allclose(got, _ref_dilated_conv1d(x, w, b, stride=2, dilation=2))
+
+
+def test_conv2d_dilation_matches_reference():
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal((1, 2, 8, 8))
+    w = rng.standard_normal((3, 2, 3, 3))
+    b = rng.standard_normal(3)
+    # height-1 collapse: a 2-D dilated conv matches the 1-D reference row-by-row
+    got = np.asarray(conv2d(x[:, :, :1, :], w[:, :, :1, :], b, dilation=2))
+    ref = _ref_dilated_conv1d(x[:, :, 0, :], w[:, :, 0, :], b, stride=1, dilation=2)
+    assert np.allclose(got[:, :, 0, :], ref)
+
+
+# --- causal conv1d ----------------------------------------------------------
+def test_causal_conv1d_is_left_padded_conv1d():
+    rng = np.random.default_rng(12)
+    x = rng.standard_normal((2, 3, 9))
+    w = rng.standard_normal((4, 3, 3))
+    b = rng.standard_normal(4)
+    got = np.asarray(causal_conv1d(x, w, b, dilation=2))
+    assert got.shape == x.shape[:1] + (4,) + x.shape[2:]  # length preserved
+    xp = np.pad(x, ((0, 0), (0, 0), ((3 - 1) * 2, 0)))  # left pad (k-1)*dilation
+    ref = np.asarray(conv1d(xp, w, b, dilation=2))
+    assert np.allclose(got, ref)
+
+
+def _causal_conv1d_loss(x, w, b):
+    return np.sum(causal_conv1d(x, w, b, stride=1, dilation=2) ** 2)
+
+
+def test_causal_conv1d_grad_matches_finite_diff():
+    rng = np.random.default_rng(13)
+    x = rng.standard_normal((1, 2, 6))
+    w = rng.standard_normal((3, 2, 3))
+    b = rng.standard_normal(3)
+    _assert_grads_match(_causal_conv1d_loss, (x, w, b))
+
+
+# --- conv_transpose1d -------------------------------------------------------
+def test_conv_transpose1d_is_the_adjoint_of_conv1d():
+    rng = np.random.default_rng(14)
+    x = rng.standard_normal((2, 3, 9))  # (N, C_in, L)
+    w = rng.standard_normal((4, 3, 3))  # (C_out, C_in, k)
+    y = np.asarray(conv1d(x, w, stride=2, pad=0))
+    g = rng.standard_normal(y.shape)
+    xt = np.asarray(conv_transpose1d(g, w, stride=2, pad=0))
+    assert xt.shape == x.shape  # inverts conv1d's size map
+    assert np.allclose(np.sum(y * g), np.sum(x * xt))  # the transpose identity
+
+
+def _conv_transpose1d_loss(x, w):
+    return np.sum(conv_transpose1d(x, w, stride=2) ** 2)
+
+
+def test_conv_transpose1d_grad_matches_finite_diff():
+    rng = np.random.default_rng(15)
+    x = rng.standard_normal((1, 3, 4))  # input channels == w's C_out (3)
+    w = rng.standard_normal((3, 2, 3))  # (C_out, C_in, k)
+    _assert_grads_match(_conv_transpose1d_loss, (x, w))
+
+
+# --- streaming convolutions -------------------------------------------------
+# The incremental step, fed a sequence chunk-by-chunk, must reproduce the
+# parallel op bit-for-bit (the ``rwkv_step`` equivalence pattern).
+_CHUNKS = [2, 1, 3, 2, 4, 1]  # deliberately uneven chunk sizes
+
+
+def _stream_conv1d(x, w, b, stride, dilation):
+    state = streaming_conv1d_init(x.shape[1], w.shape[2], dilation, x.shape[0])
+    outs, i, j = [], 0, 0
+    while i < x.shape[2]:
+        c = _CHUNKS[j % len(_CHUNKS)]
+        y, state = streaming_conv1d(
+            x[:, :, i : i + c], w, b, state, stride=stride, dilation=dilation
+        )
+        outs.append(np.asarray(y))
+        i, j = i + c, j + 1
+    return np.concatenate(outs, axis=2)
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dilation", [1, 2])
+def test_streaming_conv1d_matches_causal(stride, dilation):
+    rng = np.random.default_rng(16)
+    x = rng.standard_normal((2, 3, 13))
+    w = rng.standard_normal((4, 3, 3))
+    b = rng.standard_normal(4)
+    streamed = _stream_conv1d(x, w, b, stride, dilation)
+    parallel = np.asarray(causal_conv1d(x, w, b, stride=stride, dilation=dilation))
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
+def _stream_conv_transpose1d(x, w, b, stride):
+    state = streaming_conv_transpose1d_init()
+    outs, i, j = [], 0, 0
+    while i < x.shape[2]:
+        c = _CHUNKS[j % len(_CHUNKS)]
+        y, state = streaming_conv_transpose1d(
+            x[:, :, i : i + c], w, b, state, stride=stride
+        )
+        outs.append(np.asarray(y))
+        i, j = i + c, j + 1
+    outs.append(np.asarray(state[0]))  # end-of-stream flush of the cached tail
+    return np.concatenate(outs, axis=2)
+
+
+@pytest.mark.parametrize("stride", [1, 2, 3])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_streaming_conv_transpose1d_matches_parallel(stride, use_bias):
+    rng = np.random.default_rng(17)
+    x = rng.standard_normal((2, 4, 11))  # (N, C_out, L)
+    w = rng.standard_normal((4, 3, 3))  # (C_out, C_in, k)
+    b = rng.standard_normal(3) if use_bias else None
+    streamed = _stream_conv_transpose1d(x, w, b, stride)
+    parallel = np.asarray(conv_transpose1d(x, w, b, stride=stride))
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
+# --- streaming building blocks still compose with the transforms ------------
+def test_causal_conv1d_vmap_and_eval_shape():
+    rng = np.random.default_rng(18)
+    xb = rng.standard_normal((5, 1, 2, 7))  # batch of (1, C_in, L) sequences
+    w = rng.standard_normal((3, 2, 3))
+    got = np.asarray(vmap(causal_conv1d, in_axes=(0, None))(xb, w))
+    ref = np.stack([np.asarray(causal_conv1d(xb[i], w)) for i in range(len(xb))])
+    assert np.allclose(got, ref)
+    sh = eval_shape(lambda a, b: causal_conv1d(a, b), S((1, 2, 7)), S((3, 2, 3)))
+    assert sh.shape == (1, 3, 7)
 
 
 # --- pooling ----------------------------------------------------------------
