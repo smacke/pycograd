@@ -34,7 +34,14 @@ from pycograd._typing import (
     Shape,
 )
 from pycograd.backends import current_backend
-from pycograd.tensor import Var, _lift, _record_vjp, _unbroadcast, _xp
+from pycograd.tensor import (
+    Var,
+    _d_unbroadcast,
+    _lift,
+    _record_vjp,
+    _unbroadcast,
+    _xp,
+)
 
 if TYPE_CHECKING:
     from pycograd.forward import JVPTrace, JVPTracer
@@ -297,35 +304,90 @@ def _matmul(a: Operand, b: Operand) -> Var:
 # output) is reconstructed by appending a constant ``ones`` operand carrying it, so a
 # single reverse einsum covers both contraction and reduction-broadcast.
 #
-# Not supported (raises a clear error): an ellipsis (``...``) and a label repeated
-# *within one operand* (a diagonal / trace), neither of which a plain reverse einsum
-# expresses. These cover essentially every neural-net contraction (matmul, batched
-# attention, transposition, outer products, axis reductions).
+# An ellipsis (``...``) is supported with full numpy broadcasting: it is expanded
+# into explicit, right-aligned fresh labels using each operand's rank (so the
+# grad/vmap/shape machinery below sees only ordinary labels), and numpy broadcasts
+# any shared size-1 label in both the forward and reverse einsum -- the backward
+# then sums each gradient back to its operand's shape (``_unbroadcast``).
+#
+# The one form still rejected (a clear error): a label repeated *within one operand*
+# (a diagonal / trace), which a plain reverse einsum cannot express.
 # ---------------------------------------------------------------------------
-def _parse_einsum(subscripts: str, n_operands: int) -> tuple[list[str], str]:
+def _fresh_labels(n: int, used: "set[str]") -> str:
+    """``n`` distinct letters not in ``used`` (to name expanded ellipsis axes)."""
+    import string
+
+    out: list[str] = []
+    for c in string.ascii_letters:
+        if len(out) == n:
+            break
+        if c not in used:
+            out.append(c)
+    if len(out) != n:
+        raise ValueError("einsum: ran out of labels to expand the ellipsis")
+    return "".join(out)
+
+
+def _expand_ellipsis(
+    ins: list[str], sep: str, rhs: str, ranks: "Sequence[int]"
+) -> tuple[list[str], str]:
+    """Replace ``...`` in each operand (and the output) with explicit, right-aligned
+    fresh labels. The ellipsis width is the max over operands of ``rank - #explicit``;
+    an operand with fewer ellipsis axes takes the *trailing* labels, so they align
+    (and broadcast) exactly as numpy's ellipsis does."""
+    n_implicit = []
+    for sub, rank in zip(ins, ranks):
+        explicit = sub.replace("...", "")
+        if "..." in sub:
+            k = rank - len(explicit)
+            if k < 0:
+                raise ValueError(
+                    f"einsum: operand subscript {sub!r} has more labels than the "
+                    f"operand has axes ({rank})"
+                )
+            n_implicit.append(k)
+        else:
+            if len(explicit) != rank:
+                raise ValueError(f"einsum: operand subscript {sub!r} vs rank {rank}")
+            n_implicit.append(0)
+    width = max(n_implicit)
+    used = {c for c in "".join(ins) + rhs if c.isalpha()}
+    ell = _fresh_labels(width, used)
+    new_ins = [sub.replace("...", ell[width - k :]) for sub, k in zip(ins, n_implicit)]
+    if sep:
+        new_rhs = rhs.replace("...", ell)
+    else:  # implicit output: ellipsis labels first, then explicit singles, sorted
+        counts = Counter("".join(new_ins))
+        singles = sorted(c for c, n in counts.items() if n == 1 and c not in ell)
+        new_rhs = ell + "".join(singles)
+    return new_ins, new_rhs
+
+
+def _parse_einsum(subscripts: str, ranks: "Sequence[int]") -> tuple[list[str], str]:
     """Split an einsum spec into per-operand input labels and the (possibly implicit)
-    output labels, rejecting the forms our reverse rule can't express."""
+    output labels, expanding any ellipsis into explicit labels (using ``ranks``, the
+    per-operand ndims) and rejecting the forms our reverse rule can't express."""
     if not isinstance(subscripts, str):
         raise NotImplementedError(
             "einsum: only the subscripts-string form is supported"
         )
-    if "..." in subscripts:
-        raise NotImplementedError("einsum: ellipsis ('...') is not yet supported")
     lhs, sep, rhs = subscripts.replace(" ", "").partition("->")
     ins = lhs.split(",")
-    if len(ins) != n_operands:
+    if len(ins) != len(ranks):
         raise ValueError(
-            f"einsum: {len(ins)} subscript group(s) for {n_operands} operand(s)"
+            f"einsum: {len(ins)} subscript group(s) for {len(ranks)} operand(s)"
         )
+    if "..." in subscripts:
+        ins, rhs = _expand_ellipsis(ins, sep, rhs, ranks)
+    elif not sep:  # implicit output: labels appearing exactly once, sorted (numpy's)
+        counts = Counter("".join(ins))
+        rhs = "".join(sorted(c for c, n in counts.items() if n == 1))
     for sub in ins:
         if len(set(sub)) != len(sub):
             raise NotImplementedError(
                 f"einsum: a repeated label within one operand ({sub!r}, a diagonal / "
                 "trace) is not supported"
             )
-    if not sep:  # implicit output: labels appearing exactly once, sorted (numpy's rule)
-        counts = Counter("".join(ins))
-        rhs = "".join(sorted(c for c, n in counts.items() if n == 1))
     return ins, rhs
 
 
@@ -351,11 +413,12 @@ def d_einsum(subscripts: str, *operands: Operand) -> Var:
     if any(isinstance(o, Tracer) for o in operands):
         return cast(Var, bind(d_einsum, subscripts, *operands))
     xp = _xp()
-    ins, out = _parse_einsum(subscripts, len(operands))
     lifted = [_lift(o) for o in operands]
     vals = [o.value for o in lifted]
+    ins, out = _parse_einsum(subscripts, [v.ndim for v in vals])
+    fwd_spec = ",".join(ins) + "->" + out
     try:
-        primal = xp.einsum(subscripts, *vals)
+        primal = xp.einsum(fwd_spec, *vals)
     except ValueError as e:
         from pycograd.shapes import ShapeError, _shape_context
 
@@ -371,7 +434,8 @@ def d_einsum(subscripts: str, *operands: Operand) -> Var:
             if missing:
                 mshape = tuple(op.value.shape[ins[i].index(c)] for c in missing)
                 arrays.append(xp.ones(mshape, dtype=node.grad.dtype))
-            op.grad = op.grad + xp.einsum(spec, *arrays)
+            # ``_unbroadcast`` sums any size-1 operand axis that numpy broadcast up.
+            op.grad = op.grad + _unbroadcast(xp.einsum(spec, *arrays), op.value.shape)
 
     node._backward = _backward
     _record_vjp(node, d_einsum, tuple(lifted), {"subscripts": subscripts})
@@ -924,7 +988,7 @@ def _vjp_einsum(
     # The same reverse-einsum as the eager backward, but built with ``bind``-riding
     # ``d_einsum`` over the level-connected operands so the cotangent graph is itself
     # differentiable (composes with an enclosing jvp/grad).
-    ins, out = _parse_einsum(params["subscripts"], len(primals))
+    ins, out = _parse_einsum(params["subscripts"], [p.value.ndim for p in primals])
     xp = _xp()
     grads: list[Boxed] = []
     for i in range(len(primals)):
@@ -933,7 +997,10 @@ def _vjp_einsum(
         if missing:
             mshape = tuple(primals[i].value.shape[ins[i].index(c)] for c in missing)
             arrays.append(_const_like(xp.ones(mshape)))
-        grads.append(_b(d_einsum, spec, *arrays))
+        # ``_d_unbroadcast`` sums any size-1 operand axis numpy broadcast up.
+        grads.append(
+            _d_unbroadcast(_b(d_einsum, spec, *arrays), primals[i].value.shape)
+        )
     return grads
 
 

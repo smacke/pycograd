@@ -498,7 +498,7 @@ def abstract_einsum(subscripts: str, *operands: AbstractVal) -> ShapedArray:
     from pycograd import ops
 
     avals = [_aval(o) for o in operands]
-    ins, out = ops._parse_einsum(subscripts, len(operands))
+    ins, out = ops._parse_einsum(subscripts, [len(av.shape) for av in avals])
     label_dim: dict[str, "int | Dim"] = {}
     for sub, av in zip(ins, avals):
         if len(sub) != len(av.shape):
@@ -507,9 +507,21 @@ def abstract_einsum(subscripts: str, *operands: AbstractVal) -> ShapedArray:
             prev = label_dim.get(label)
             if prev is None:
                 label_dim[label] = d
-            elif not _constraints.register_eq(prev, d):
-                raise ShapeError(f"einsum: conflicting sizes for index {label!r}")
+            else:
+                label_dim[label] = _einsum_label_dim(prev, d, label)
     return ShapedArray(tuple(label_dim[c] for c in out), _result_dtype(*avals))
+
+
+def _einsum_label_dim(a: "int | Dim", b: "int | Dim", label: str) -> "int | Dim":
+    """Resolve a shared einsum label's size with numpy broadcasting: a concrete ``1``
+    yields the other; otherwise the two extents must match (``register_eq``)."""
+    if not isinstance(a, Dim) and int(a) == 1:
+        return b
+    if not isinstance(b, Dim) and int(b) == 1:
+        return a
+    if not _constraints.register_eq(a, b):
+        raise ShapeError(f"einsum: conflicting sizes for index {label!r}")
+    return a
 
 
 def abstract_cumsum(x: AbstractVal, axis: "int | None" = None) -> ShapedArray:

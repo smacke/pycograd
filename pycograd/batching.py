@@ -389,7 +389,7 @@ def _einsum_rule(trace: BatchTrace, subscripts: str, *operands: Boxed) -> BatchT
     if not any(t.bdim is not None for t in tracers):
         vals = tuple(t.value for t in tracers)
         return _result(trace, bind(ops.d_einsum, subscripts, *vals), None)
-    ins, out = ops._parse_einsum(subscripts, len(operands))
+    ins, out = ops._parse_einsum(subscripts, [len(t.shape) for t in tracers])
     bc = _fresh_label(set("".join(ins)) | set(out))
     new_ins, aligned = [], []
     for t, sub in zip(tracers, ins):

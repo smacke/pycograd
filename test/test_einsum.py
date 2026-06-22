@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tests for the fused ``einsum`` primitive: forward values against ``np.einsum``,
 gradients against finite differences across contraction shapes (matmul, batched,
-transpose, outer, reduction, 3-operand), and composition with vmap / jvp / eval_shape.
-Unsupported forms (ellipsis, within-operand diagonal) must raise clearly."""
+transpose, outer, reduction, 3-operand, ellipsis with broadcasting), and composition
+with vmap / jvp / eval_shape. The within-operand diagonal must still raise clearly."""
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -49,6 +49,11 @@ CASES = [
     ("bhqd,bhkd->bhqk", [(2, 2, 3, 4), (2, 2, 5, 4)]),  # attention scores
     ("ij,jk,kl->il", [(2, 3), (3, 4), (4, 5)]),  # 3-operand chain
     ("ij,ij->ij", [(3, 4), (3, 4)]),  # hadamard
+    ("...ij,...jk->...ik", [(2, 3, 4), (2, 4, 5)]),  # ellipsis batched matmul
+    ("...ij->...ji", [(2, 3, 4)]),  # ellipsis transpose of the last two axes
+    ("...ij,jk->...ik", [(2, 6, 3, 4), (4, 5)]),  # differing ellipsis rank
+    ("...qd,...kd->...qk", [(2, 2, 3, 4), (2, 2, 5, 4)]),  # ellipsis attention
+    ("...ij", [(2, 3, 4)]),  # implicit-output ellipsis (identity copy)
 ]
 
 
@@ -133,9 +138,47 @@ def test_einsum_eval_shape():
     assert tuple(out.shape) == (7, 3, 5)
 
 
-def test_einsum_rejects_ellipsis_and_diagonal():
+def test_einsum_rejects_diagonal():
     x = np.arange(9.0).reshape(3, 3)
     with pytest.raises(NotImplementedError):
         einsum("ii->i", x)  # within-operand diagonal
-    with pytest.raises(NotImplementedError):
-        einsum("...ij->...i", x)  # ellipsis
+
+
+def test_einsum_ellipsis_broadcasts_size_one():
+    # A size-1 ellipsis axis broadcasts against size N (numpy parity); the gradient
+    # of the broadcast operand must come back at its true (size-1) shape.
+    rng = np.random.default_rng(6)
+    a = rng.standard_normal((1, 2, 3))
+    b = rng.standard_normal((4, 3, 5))
+    spec = "...ij,...jk->...ik"
+    assert np.allclose(einsum(spec, a, b).value, np.einsum(spec, a, b))
+
+    def f(x, y):
+        return np.einsum(spec, x, y)
+
+    _, (ga, gb) = value_and_grad(f)(a, b)
+    assert ga.shape == (1, 2, 3) and gb.shape == (4, 3, 5)
+    _assert_grads_match(f, (a, b))
+
+
+def test_einsum_ellipsis_composes_with_vmap():
+    rng = np.random.default_rng(7)
+    a_batch = rng.standard_normal((6, 2, 3, 4))
+    w = rng.standard_normal((4, 5))
+
+    def f(a, b):
+        return np.einsum("...ij,jk->...ik", a, b)
+
+    out = vmap(f, in_axes=(0, None))(a_batch, w)
+    assert out.shape == (6, 2, 3, 5)
+    for i in range(6):
+        assert np.allclose(
+            np.asarray(out[i]), np.einsum("...ij,jk->...ik", a_batch[i], w)
+        )
+
+
+def test_einsum_ellipsis_eval_shape():
+    out = eval_shape(
+        lambda a, b: np.einsum("...ij,...jk->...ik", a, b), S((7, 3, 4)), S((7, 4, 5))
+    )
+    assert tuple(out.shape) == (7, 3, 5)

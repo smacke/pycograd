@@ -300,7 +300,7 @@ def conv_transpose2d(
     # Selection matrices placing input element i at dilated position i*stride.
     sh = np.eye(h_dil)[np.arange(h) * stride]  # (h, h_dil), constant
     sw = np.eye(w_dil)[np.arange(ww) * stride]  # (ww, w_dil), constant
-    x_dil = np.einsum("nchw,hH,wW->ncHW", x, sh, sw)  # zero-interleaved input
+    x_dil = np.einsum("...hw,hH,wW->...HW", x, sh, sw)  # zero-interleaved input
     x_dil = _pad2d(x_dil, kh - 1 - pad, kw - 1 - pad)
     # Transpose of cross-correlation = convolution: swap C_out/C_in and flip the kernel.
     rev_h, rev_w = np.arange(kh)[::-1], np.arange(kw)[::-1]
