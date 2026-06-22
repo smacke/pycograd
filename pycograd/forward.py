@@ -326,6 +326,24 @@ def _matmul_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
+def _einsum_rule(trace: JVPTrace, subscripts: str, *operands: Boxed) -> JVPTracer:
+    # einsum is multilinear in its operands, so by the product rule the tangent is the
+    # sum over operands of the einsum with that operand replaced by its tangent.
+    # ``subscripts`` is static (not raised).
+    tracers = [trace._raise(o) for o in operands]
+    primals = [t.primal for t in tracers]
+    primal_out = bind(ops.d_einsum, subscripts, *primals)
+    tangent_out: Boxed = None
+    for i, t in enumerate(tracers):
+        args = list(primals)
+        args[i] = t.tangent
+        term = bind(ops.d_einsum, subscripts, *args)
+        tangent_out = (
+            term if tangent_out is None else bind(ops.d_add, tangent_out, term)
+        )
+    return _result(trace, primal_out, tangent_out)
+
+
 def _select_for(prim: Prim) -> Rule:
     """max / min of two operands: route each operand's tangent through wherever that
     operand was selected (``mask = primal_out == operand``)."""
@@ -646,6 +664,9 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_div: _div_rule,
             ops.d_pow: _pow_rule,
             ops._matmul: _matmul_rule,
+            ops.d_einsum: _einsum_rule,
+            # cumsum is linear: the tangent is the cumsum of the tangent.
+            ops.d_cumsum: _linear_for(ops.d_cumsum),
             # comparisons: zero tangent (a plain boolean mask leaves the level).
             ops.d_lt: _compare_for(ops.d_lt),
             ops.d_le: _compare_for(ops.d_le),

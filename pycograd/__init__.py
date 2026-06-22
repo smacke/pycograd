@@ -15,6 +15,22 @@ from pycograd.data import DataLoader, batches
 from pycograd.dtypes import current_dtype, dtype, resolve_dtype
 from pycograd.export import export_onnx, export_torchscript, to_torch_module
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
+from pycograd.functional import (
+    avg_pool2d,
+    conv1d,
+    conv2d,
+    cross_entropy,
+    gelu,
+    log_softmax,
+    logsumexp,
+    max_pool2d,
+    one_hot,
+    relu,
+    sigmoid,
+    silu,
+    softmax,
+    swish,
+)
 from pycograd.ops import (
     AutodiffWarning,
     d_abs,
@@ -24,7 +40,9 @@ from pycograd.ops import (
     d_concatenate,
     d_cos,
     d_cosh,
+    d_cumsum,
     d_dstack,
+    d_einsum,
     d_exp,
     d_expand_dims,
     d_expm1,
@@ -104,6 +122,11 @@ from pycograd.tree import (
     tree_unflatten,
 )
 
+# Friendly aliases for the fused primitives (also reached via ``np.einsum`` / ``np.cumsum``
+# interception); these read more naturally than the ``d_`` names at a call site.
+einsum = d_einsum
+cumsum = d_cumsum
+
 try:
     __version__ = version("pycograd")
 except PackageNotFoundError:  # not installed (e.g. running from a source checkout)
@@ -167,6 +190,21 @@ __all__ = [
     "constant_lr",
     "step_decay",
     "cosine_decay",
+    # neural-net ops (stable softmax family, cross-entropy, activations)
+    "softmax",
+    "log_softmax",
+    "logsumexp",
+    "cross_entropy",
+    "relu",
+    "sigmoid",
+    "silu",
+    "swish",
+    "gelu",
+    "conv1d",
+    "conv2d",
+    "max_pool2d",
+    "avg_pool2d",
+    "one_hot",
     # data / batching
     "batches",
     "DataLoader",
@@ -219,4 +257,8 @@ __all__ = [
     "d_hstack",
     "d_column_stack",
     "d_dstack",
+    "d_einsum",
+    "einsum",
+    "d_cumsum",
+    "cumsum",
 ]

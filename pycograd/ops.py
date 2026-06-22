@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections import Counter
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, cast
 
 import numpy as np
@@ -282,6 +283,126 @@ def _matmul(a: Operand, b: Operand) -> Var:
 
     out._backward = _backward
     _record_vjp(out, _matmul, (a, b))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Einsum -- a fused primitive (general tensor contraction).
+#
+# A single ``np.einsum`` call cannot be generically decomposed into our other
+# primitives, so it carries its own rules. The VJP of an einsum w.r.t. operand ``i``
+# is *another* einsum whose inputs are the upstream cotangent (subscripted as the
+# output) and the remaining operands, contracted down to operand ``i``'s subscript.
+# A label of operand ``i`` that was summed out (appears nowhere else and not in the
+# output) is reconstructed by appending a constant ``ones`` operand carrying it, so a
+# single reverse einsum covers both contraction and reduction-broadcast.
+#
+# Not supported (raises a clear error): an ellipsis (``...``) and a label repeated
+# *within one operand* (a diagonal / trace), neither of which a plain reverse einsum
+# expresses. These cover essentially every neural-net contraction (matmul, batched
+# attention, transposition, outer products, axis reductions).
+# ---------------------------------------------------------------------------
+def _parse_einsum(subscripts: str, n_operands: int) -> tuple[list[str], str]:
+    """Split an einsum spec into per-operand input labels and the (possibly implicit)
+    output labels, rejecting the forms our reverse rule can't express."""
+    if not isinstance(subscripts, str):
+        raise NotImplementedError(
+            "einsum: only the subscripts-string form is supported"
+        )
+    if "..." in subscripts:
+        raise NotImplementedError("einsum: ellipsis ('...') is not yet supported")
+    lhs, sep, rhs = subscripts.replace(" ", "").partition("->")
+    ins = lhs.split(",")
+    if len(ins) != n_operands:
+        raise ValueError(
+            f"einsum: {len(ins)} subscript group(s) for {n_operands} operand(s)"
+        )
+    for sub in ins:
+        if len(set(sub)) != len(sub):
+            raise NotImplementedError(
+                f"einsum: a repeated label within one operand ({sub!r}, a diagonal / "
+                "trace) is not supported"
+            )
+    if not sep:  # implicit output: labels appearing exactly once, sorted (numpy's rule)
+        counts = Counter("".join(ins))
+        rhs = "".join(sorted(c for c, n in counts.items() if n == 1))
+    return ins, rhs
+
+
+def _einsum_grad_spec(
+    ins: list[str], out: str, i: int
+) -> "tuple[str, list[int], list[str]]":
+    """The reverse-einsum spec for operand ``i``'s cotangent, plus the indices of the
+    other operands (in order) and the labels of operand ``i`` that were summed out (and
+    so need a ``ones`` operand). The cotangent is subscripted as ``out``."""
+    sub_i = ins[i]
+    others = [j for j in range(len(ins)) if j != i]
+    avail = set("".join(ins[j] for j in others)) | set(out)
+    missing = [c for c in sub_i if c not in avail]
+    in_subs = [out] + [ins[j] for j in others] + (["".join(missing)] if missing else [])
+    return ",".join(in_subs) + "->" + sub_i, others, missing
+
+
+def d_einsum(subscripts: str, *operands: Operand) -> Var:
+    from pycograd.trace import Tracer, bind
+
+    # A higher trace level is live (a vmap/jvp/abstract Tracer flowed in via a direct
+    # call rather than ``bind``): route through the stack so the registered rule runs.
+    if any(isinstance(o, Tracer) for o in operands):
+        return cast(Var, bind(d_einsum, subscripts, *operands))
+    xp = _xp()
+    ins, out = _parse_einsum(subscripts, len(operands))
+    lifted = [_lift(o) for o in operands]
+    vals = [o.value for o in lifted]
+    try:
+        primal = xp.einsum(subscripts, *vals)
+    except ValueError as e:
+        from pycograd.shapes import ShapeError, _shape_context
+
+        raise ShapeError(
+            _shape_context("einsum " + subscripts, *(v.shape for v in vals))
+        ) from e
+    node = Var(primal, _parents=tuple(lifted))
+
+    def _backward() -> None:
+        for i, op in enumerate(lifted):
+            spec, others, missing = _einsum_grad_spec(ins, out, i)
+            arrays = [node.grad] + [vals[j] for j in others]
+            if missing:
+                mshape = tuple(op.value.shape[ins[i].index(c)] for c in missing)
+                arrays.append(xp.ones(mshape, dtype=node.grad.dtype))
+            op.grad = op.grad + xp.einsum(spec, *arrays)
+
+    node._backward = _backward
+    _record_vjp(node, d_einsum, tuple(lifted), {"subscripts": subscripts})
+    return node
+
+
+# ---------------------------------------------------------------------------
+# Cumulative sum -- a fused primitive (linear; no composition expresses the prefix
+# sum). The VJP is a reverse cumulative sum (flip -> cumsum -> flip).
+# ---------------------------------------------------------------------------
+def d_cumsum(x: Operand, axis: int | None = None) -> Var:
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(x, Tracer):
+        return cast(Var, bind(d_cumsum, x, axis=axis))
+    if axis is None:
+        raise NotImplementedError(
+            "cumsum: pass an explicit integer axis (the flatten-all default is not "
+            "supported)"
+        )
+    x, xp = _lift(x), _xp()
+    out = Var(xp.cumsum(x.value, axis=axis), _parents=(x,))
+
+    def _backward() -> None:
+        g = out.grad
+        x.grad = x.grad + xp.flip(
+            xp.cumsum(xp.flip(g, axis=axis), axis=axis), axis=axis
+        )
+
+    out._backward = _backward
+    _record_vjp(out, d_cumsum, (x,), {"axis": axis})
     return out
 
 
@@ -599,6 +720,8 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_min: (np.min, np.amin),
     # linear algebra / shape / structure
     _matmul: (np.dot, np.matmul),
+    d_einsum: (np.einsum,),
+    d_cumsum: (np.cumsum,),
     d_transpose: (np.transpose,),
     d_reshape: (np.reshape,),
     d_expand_dims: (np.expand_dims,),
@@ -790,6 +913,43 @@ def _vjp_matmul(
         return [_b(_matmul, b, g), gb]
     # batched / 2-D @ 2-D: da = g @ bᵀ, db = aᵀ @ g (transposing the last two axes).
     return [_b(_matmul, g, _swap_last2(b, nb)), _b(_matmul, _swap_last2(a, na), g)]
+
+
+def _vjp_einsum(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # The same reverse-einsum as the eager backward, but built with ``bind``-riding
+    # ``d_einsum`` over the level-connected operands so the cotangent graph is itself
+    # differentiable (composes with an enclosing jvp/grad).
+    ins, out = _parse_einsum(params["subscripts"], len(primals))
+    xp = _xp()
+    grads: list[Boxed] = []
+    for i in range(len(primals)):
+        spec, others, missing = _einsum_grad_spec(ins, out, i)
+        arrays: list[Boxed] = [g] + [operands[j] for j in others]
+        if missing:
+            mshape = tuple(primals[i].value.shape[ins[i].index(c)] for c in missing)
+            arrays.append(_const_like(xp.ones(mshape)))
+        grads.append(_b(d_einsum, spec, *arrays))
+    return grads
+
+
+def _vjp_cumsum(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # Reverse cumulative sum, built with bind-riding ops (flip = a reversed-slice gather)
+    # so it composes with an enclosing jvp/grad.
+    axis = params["axis"]
+    ndim = primals[0].value.ndim
+    ax = axis % ndim
+    key = tuple(slice(None, None, -1) if d == ax else slice(None) for d in range(ndim))
+    return [_b(d_getitem, _b(d_cumsum, _b(d_getitem, g, key), axis=axis), key)]
 
 
 def _vjp_getitem(
@@ -989,6 +1149,8 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_div: _vjp_div,
             d_pow: _vjp_pow,
             _matmul: _vjp_matmul,
+            d_einsum: _vjp_einsum,
+            d_cumsum: _vjp_cumsum,
             d_getitem: _vjp_getitem,
             _scatter: _vjp_scatter,
             d_sum: _vjp_sum,

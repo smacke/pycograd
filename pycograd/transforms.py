@@ -223,9 +223,11 @@ def value_and_grad(
         )
         return value, grads
 
-    # Tag so ``vmap`` can recognize ``vmap(value_and_grad(f))`` / ``vmap(grad(f))`` and
-    # take the per-sample path (a single batched forward + one batched-cotangent backward),
-    # and so the tracer never re-instruments this closure (it closes over ``f``/``runner``).
+    # ``_pycograd_vag_of`` lets ``vmap`` recognize ``vmap(value_and_grad(f))`` /
+    # ``vmap(grad(f))`` and take the per-sample path (a single batched forward + one
+    # batched-cotangent backward). ``_pycograd_run_directly`` keeps this orchestration
+    # wrapper out of the interception path: it manages its own tracing, so its body
+    # should not itself be instrumented.
     wrapped._pycograd_vag_of = f  # type: ignore[attr-defined]
     wrapped._pycograd_run_directly = True  # type: ignore[attr-defined]
     return wrapped
@@ -409,11 +411,10 @@ def vmap(
             ]
             return tree_unflatten(out_def, cast("list[Leaf]", finished))
 
-    # Mark the wrapper so the tracer never re-instruments it (it is a closure over
-    # ``in_axes``/``runner``/``f`` -- recompiling from source would drop the closure,
-    # raising ``NameError: in_axes``). It manages its own tracing; when it is the ``f``
-    # of an *outer* ``vmap`` (nested ``vmap(vmap(...))``) the outer ``runner`` calls it
-    # directly, and it pushes its own ``BatchTrace`` level internally.
+    # Run the wrapper directly rather than instrumenting it: it manages its own tracing,
+    # so its body should stay out of the interception path. When it is the ``f`` of an
+    # *outer* ``vmap`` (nested ``vmap(vmap(...))``) the outer ``runner`` calls it directly,
+    # and it pushes its own ``BatchTrace`` level internally.
     wrapped._pycograd_run_directly = True  # type: ignore[attr-defined]
     return wrapped
 
@@ -964,17 +965,22 @@ def jacfwd(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
             )
             return jvp(f, primals, tangents)[1]
 
+        def _finalize(stacked: "np.ndarray") -> PyTree:
+            # ``stacked`` is (n_in, *out_shape); move the input axis last -> (*out, *in).
+            out_shape = stacked.shape[1:]
+            jac = np.moveaxis(stacked, 0, -1)
+            return jac.reshape(out_shape + x_arr.shape)
+
         try:
-            cols = vmap(column)(basis)
-            stacked = np.asarray(cols)
+            # Vectorize the basis sweep with vmap-over-jvp. The finalize is inside the
+            # try so a composition that yields an incompatibly-shaped result (e.g. the
+            # batched forward-over-reverse of a ``jacfwd(grad(f))`` Hessian) falls back to
+            # the Python loop, which is always correct.
+            return _finalize(np.asarray(vmap(column)(basis)))
         except Exception:
-            # Fall back to a Python loop if the vmap-over-jvp composition trips on a
-            # particular function (kept available so jacfwd is always usable).
-            stacked = np.stack([np.asarray(column(basis[i])) for i in range(n)], axis=0)
-        # ``stacked`` is (n_in, *out_shape); move the input axis last -> (*out, *in).
-        out_shape = stacked.shape[1:]
-        jac = np.moveaxis(stacked, 0, -1)
-        return jac.reshape(out_shape + x_arr.shape)
+            return _finalize(
+                np.stack([np.asarray(column(basis[i])) for i in range(n)], axis=0)
+            )
 
     # ``jacfwd(grad(f))`` is a Hessian; carry the inner ``f`` (and ``argnum==0``) so
     # ``vmap`` can recognize ``vmap(jacfwd(grad(f)))`` and take the per-sample-Hessian path.
@@ -1015,9 +1021,9 @@ def jacrev(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
         basis = np.eye(m, dtype=x_arr.dtype).reshape((m,) + out_shape)
 
         def make_component(e: Array) -> Callable[..., PyTree]:
-            # ``sum(f(x) * e_i)`` -- a scalar whose gradient is one Jacobian row. Tagged to
-            # run directly so the tracer keeps it (and its closure over ``f``/``e``) intact
-            # while still intercepting the ``np.*`` calls inside.
+            # ``sum(f(x) * e_i)`` -- a scalar whose gradient is one Jacobian row. Run
+            # directly (not recompiled) under the tracer, so the ``f`` / ``np.*`` calls
+            # inside are still intercepted while its body is left as written.
             def component(xa: object) -> PyTree:
                 replaced = tuple(
                     tree_unflatten(treedef, [cast(Leaf, xa)]) if i == argnum else a

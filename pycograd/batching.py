@@ -370,6 +370,48 @@ def _lead1(v: Boxed) -> Boxed:
     return np.asarray(cast(Any, v))[np.newaxis, ...]
 
 
+# -- einsum -----------------------------------------------------------------
+def _fresh_label(used: "set[str]") -> str:
+    """A single einsum label not already in ``used`` (for the new batch axis)."""
+    import string
+
+    for c in string.ascii_letters:
+        if c not in used:
+            return c
+    raise ValueError("einsum: ran out of labels to name the vmap batch axis")
+
+
+def _einsum_rule(trace: BatchTrace, subscripts: str, *operands: Boxed) -> BatchTracer:
+    # vmap of einsum: give each batched operand (and the output) a fresh leading label
+    # for the batch axis. An unbatched operand keeps its labels and is reused across the
+    # batch -- exactly einsum's semantics for an index it lacks.
+    tracers = [trace._raise(o) for o in operands]
+    if not any(t.bdim is not None for t in tracers):
+        vals = tuple(t.value for t in tracers)
+        return _result(trace, bind(ops.d_einsum, subscripts, *vals), None)
+    ins, out = ops._parse_einsum(subscripts, len(operands))
+    bc = _fresh_label(set("".join(ins)) | set(out))
+    new_ins, aligned = [], []
+    for t, sub in zip(tracers, ins):
+        if t.bdim is not None:
+            aligned.append(_move_bdim_to_front(t))
+            new_ins.append(bc + sub)
+        else:
+            aligned.append(t.value)
+            new_ins.append(sub)
+    new_spec = ",".join(new_ins) + "->" + bc + out
+    return _result(trace, bind(ops.d_einsum, new_spec, *aligned), 0)
+
+
+def _cumsum_rule(trace: BatchTrace, x: Boxed, axis: int = -1) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_cumsum, t.value, axis=axis), None)
+    # The logical ``axis`` shifts past the leading batch axis once it's at the front.
+    ax = axis % _logical_ndim(t)
+    return _result(trace, bind(ops.d_cumsum, _move_bdim_to_front(t), axis=ax + 1), 0)
+
+
 # -- getitem (incl. batched gather) -----------------------------------------
 def _getitem_rule(trace: BatchTrace, x: Boxed, key: Index) -> BatchTracer:
     tx = trace._raise(x)
@@ -551,6 +593,8 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_max: _reduce_for(ops.d_max),
             ops.d_min: _reduce_for(ops.d_min),
             ops._matmul: _matmul_rule,
+            ops.d_einsum: _einsum_rule,
+            ops.d_cumsum: _cumsum_rule,
             ops.d_transpose: _transpose_rule,
             ops.d_reshape: _reshape_rule,
             ops.d_broadcast_to: _broadcast_to_rule,

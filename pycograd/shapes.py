@@ -484,6 +484,29 @@ def abstract_matmul(a: AbstractVal, b: AbstractVal) -> ShapedArray:
     return ShapedArray(batch + (sa[-2], sb[-1]), dtype)
 
 
+def abstract_einsum(subscripts: str, *operands: AbstractVal) -> ShapedArray:
+    from pycograd import ops
+
+    avals = [_aval(o) for o in operands]
+    ins, out = ops._parse_einsum(subscripts, len(operands))
+    label_dim: dict[str, "int | Dim"] = {}
+    for sub, av in zip(ins, avals):
+        if len(sub) != len(av.shape):
+            raise ShapeError(f"einsum: subscript {sub!r} vs operand shape {av.shape}")
+        for label, d in zip(sub, av.shape):
+            prev = label_dim.get(label)
+            if prev is None:
+                label_dim[label] = d
+            elif not _constraints.register_eq(prev, d):
+                raise ShapeError(f"einsum: conflicting sizes for index {label!r}")
+    return ShapedArray(tuple(label_dim[c] for c in out), _result_dtype(*avals))
+
+
+def abstract_cumsum(x: AbstractVal, axis: "int | None" = None) -> ShapedArray:
+    a = _aval(x)
+    return ShapedArray(a.shape, a.dtype)  # cumsum is shape-preserving for an int axis
+
+
 def abstract_reduce(
     x: AbstractVal, axis: Axis = None, keepdims: bool = False, **_: Any
 ) -> ShapedArray:
@@ -805,6 +828,8 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_max: abstract_reduce,
             ops.d_min: abstract_reduce,
             ops._matmul: abstract_matmul,
+            ops.d_einsum: abstract_einsum,
+            ops.d_cumsum: abstract_cumsum,
             ops.d_transpose: abstract_transpose,
             ops.d_reshape: abstract_reshape,
             ops.d_broadcast_to: abstract_broadcast_to,

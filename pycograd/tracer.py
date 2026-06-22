@@ -54,15 +54,20 @@ def _is_user_function(func: Prim) -> bool:
     The autodiff primitives (``d_*`` etc.) live in :mod:`pycograd.ops` but are only
     ever reached via ``_INTERCEPT`` / operator dispatch, never as a call site inside
     instrumented user code, so they are never handed to this predicate. pycograd's
-    own internals (and pyccolo) are excluded as a safety net; ``pycograd.examples``
-    helpers are *not* -- they are user-level demo code and should differentiate.
+    own internals (and pyccolo) are excluded as a safety net; the compose-from-``np.*``
+    op libraries (``pycograd.functional``, ``pycograd.examples``) are *not* -- they are
+    user-level code whose bodies must be instrumented so their ``np.*`` calls route to
+    the differentiable primitives (a plain ``np.max(var)`` would otherwise bypass the
+    tape, since ``Var`` disables ``__array_ufunc__``).
     """
     if not inspect.isfunction(func):  # excludes C builtins, numpy ufuncs, methods
         return False
     module = getattr(func, "__module__", "") or ""
     if module.startswith("numpy") or module.startswith("pyccolo."):
         return False
-    if module.startswith("pycograd.") and not module.startswith("pycograd.examples"):
+    if module.startswith("pycograd.") and not module.startswith(
+        ("pycograd.functional", "pycograd.examples")
+    ):
         return False
     filename = getattr(getattr(func, "__code__", None), "co_filename", "") or ""
     # An IPython/Jupyter cell (``<ipython-input-N-...>``) is user code whose source
@@ -303,9 +308,10 @@ def _make_runner(f: Prim) -> Prim:
     built as it executes; recompiling its lowered source would corrupt it.
     """
     tracer = AutodiffTracer.instance()
-    # A function explicitly tagged to run directly (e.g. ``vmap``'s wrapper, a closure
-    # over its config) manages its own tracing; instrumenting it from source would drop
-    # its closure. Run it under the tracer so any ``np.*`` it makes is still intercepted.
+    # A function explicitly tagged to run directly (e.g. ``vmap``'s wrapper) manages its
+    # own tracing -- it pushes its own trace level -- so its body should stay out of the
+    # interception path. Run it under the tracer so any ``np.*`` it makes is still
+    # intercepted, but without instrumenting (recompiling) it.
     if getattr(f, "_pycograd_run_directly", False):
 
         @functools.wraps(f)
@@ -318,8 +324,8 @@ def _make_runner(f: Prim) -> Prim:
         try:
             return tracer.instrumented(f)
         except Exception:
-            # No recompilable source (e.g. a closure over free vars, or a REPL/eval
-            # function with no linecache entry): run it directly instead.
+            # No recompilable source (e.g. a REPL/eval function with no linecache entry,
+            # or a dynamically built code object): run it directly instead.
             pass
 
     @functools.wraps(f)

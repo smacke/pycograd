@@ -14,6 +14,7 @@ from typing import Optional, cast
 import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Operand, Tensor
+from pycograd.functional import softmax as _softmax
 from pycograd.tree import PyTree
 
 # NOTE: these demo functions are recompiled by pyccolo during instrumentation,
@@ -75,8 +76,8 @@ def relu(z: Tensor) -> Tensor:
 
 
 def softmax(z: Tensor) -> Tensor:
-    e = np.exp(z)
-    return e / np.sum(e, axis=1, keepdims=True)
+    # Stable softmax over the class axis, from the first-class op in functional.
+    return _softmax(z, axis=1)
 
 
 def cross_entropy(probs: Tensor, y_onehot: Tensor) -> Operand:
@@ -239,9 +240,8 @@ def _deep_accuracy(params: tuple[Array, ...]) -> float:
 # A single-head Transformer encoder block and a tiny sequence classifier.
 # ---------------------------------------------------------------------------
 def softmax_last(z: Tensor) -> Tensor:
-    z = z - np.max(z, axis=-1, keepdims=True)  # subtract max for numerical stability
-    e = np.exp(z)
-    return e / np.sum(e, axis=-1, keepdims=True)
+    # Stable softmax over the last axis (attention weights), via functional.
+    return _softmax(z, axis=-1)
 
 
 def attention(
