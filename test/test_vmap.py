@@ -658,3 +658,52 @@ def test_vmap_rwkv_block_per_sample_grad():
     )
     assert got.shape == ref.shape
     assert np.allclose(got, ref, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# GRU / LSTM: the gated scans seed their state from a bias ``* 0.0`` (not a shape
+# read off the input), so the per-timestep recurrence vectorizes over a batch of
+# sequences exactly like RWKV's.
+# ---------------------------------------------------------------------------
+_GRU_CELL = M._init_gru_cell(_rng(1), 4, 4)
+_LSTM_CELL = M._init_lstm_cell(_rng(2), 4, 4)
+
+
+def gru_scan_fwd(x):  # x: (T, 4) one sequence
+    return M.gru_scan(x, _GRU_CELL)
+
+
+def gru_scan_energy(x):
+    return np.sum(M.gru_scan(x, _GRU_CELL) ** 2)
+
+
+def lstm_scan_fwd(x):
+    return M.lstm_scan(x, _LSTM_CELL)
+
+
+def lstm_scan_energy(x):
+    return np.sum(M.lstm_scan(x, _LSTM_CELL) ** 2)
+
+
+def test_vmap_gru_scan_forward():
+    _check(gru_scan_fwd, (_rng(3).standard_normal((5, 6, 4)),))
+
+
+def test_vmap_lstm_scan_forward():
+    _check(lstm_scan_fwd, (_rng(4).standard_normal((5, 6, 4)),))
+
+
+def test_vmap_gru_scan_per_sample_grad():
+    X = _rng(5).standard_normal((5, 6, 4))
+    got = per_example_grad(gru_scan_energy)(X)
+    ref = np.stack([np.asarray(grad(gru_scan_energy)(X[i])[0]) for i in range(len(X))])
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref, atol=1e-6)
+
+
+def test_vmap_lstm_scan_per_sample_grad():
+    X = _rng(6).standard_normal((5, 6, 4))
+    got = per_example_grad(lstm_scan_energy)(X)
+    ref = np.stack([np.asarray(grad(lstm_scan_energy)(X[i])[0]) for i in range(len(X))])
+    assert got.shape == ref.shape
+    assert np.allclose(got, ref, atol=1e-6)

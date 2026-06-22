@@ -32,24 +32,39 @@ from pycograd.examples import models  # noqa: E402
 from pycograd.examples.models import (  # noqa: E402
     _accuracy,
     _deep_accuracy,
+    _gru_accuracy,
     _init_deep,
+    _init_gru,
+    _init_gru_cell,
+    _init_lstm,
+    _init_lstm_cell,
     _init_mlp,
     _init_mlp_tree,
+    _init_rnn,
+    _init_rnn_cell,
     _init_rwkv,
     _init_rwkv_block,
     _init_transformer,
+    _lstm_accuracy,
     _mlp_accuracy,
     _mlp_tree_accuracy,
+    _rnn_accuracy,
     _rwkv_accuracy,
     _transformer_accuracy,
     attention,
     cross_entropy,
     deep_loss,
     dropout,
+    gru_loss,
+    gru_scan,
     layer_norm,
     logistic_loss,
+    lstm_loss,
+    lstm_scan,
     mlp_loss,
     mlp_tree_loss,
+    rnn_loss,
+    rnn_scan,
     rwkv_block,
     rwkv_init_state,
     rwkv_lm,
@@ -685,6 +700,73 @@ def test_rwkv_recurrent_matches_parallel():
         logits, state = rwkv_step(int(ids[t]), top, blocks, state)
         rows.append(logits)
     assert np.allclose(parallel, np.stack(rows), atol=1e-9)
+
+
+# --- RNN / GRU / LSTM: gated recurrent cells --------------------------------
+# Gradient checks differentiate the scan w.r.t. its input with the cell weights
+# frozen in a module-level dict (the ``rwkv_block_sq`` precedent); the end-to-end
+# weight gradients are exercised by the training tests below.
+_RNN_CELL = _init_rnn_cell(np.random.default_rng(10), d_in=4, d_hidden=4)
+_GRU_CELL = _init_gru_cell(np.random.default_rng(11), d_in=4, d_hidden=4)
+_LSTM_CELL = _init_lstm_cell(np.random.default_rng(12), d_in=4, d_hidden=4)
+
+
+def rnn_scan_sq(x):
+    return np.sum(rnn_scan(x, _RNN_CELL["Wx"], _RNN_CELL["Wh"], _RNN_CELL["b"]) ** 2)
+
+
+def gru_scan_sq(x):
+    return np.sum(gru_scan(x, _GRU_CELL) ** 2)
+
+
+def lstm_scan_sq(x):
+    return np.sum(lstm_scan(x, _LSTM_CELL) ** 2)
+
+
+def test_rnn_scan_gradient():
+    x = np.random.default_rng(13).standard_normal((5, 4))
+    _assert_grads_match(rnn_scan_sq, (x,), atol=1e-4)
+
+
+def test_gru_scan_gradient():
+    x = np.random.default_rng(14).standard_normal((5, 4))
+    _assert_grads_match(gru_scan_sq, (x,), atol=1e-4)
+
+
+def test_lstm_scan_gradient():
+    x = np.random.default_rng(15).standard_normal((5, 4))
+    _assert_grads_match(lstm_scan_sq, (x,), atol=1e-4)
+
+
+def _train_recurrent_lm(init, loss_fn, accuracy, steps, lr=0.5):
+    from pycograd.tree import sgd_update
+
+    p = init(np.random.default_rng(0), vocab=len(models._CHAR_VOCAB), d_model=16)
+    first = last = None
+    for _ in range(steps):
+        loss, (g,) = value_and_grad(loss_fn)(p)
+        first = float(loss) if first is None else first
+        last = float(loss)
+        p = sgd_update(p, g, lr)
+    return first, last, accuracy(p)
+
+
+def test_rnn_lm_trains():
+    first, last, acc = _train_recurrent_lm(_init_rnn, rnn_loss, _rnn_accuracy, 200)
+    assert last < first
+    assert acc == 1.0  # tiny corpus is memorized
+
+
+def test_gru_lm_trains():
+    first, last, acc = _train_recurrent_lm(_init_gru, gru_loss, _gru_accuracy, 300)
+    assert last < first
+    assert acc == 1.0
+
+
+def test_lstm_lm_trains():
+    first, last, acc = _train_recurrent_lm(_init_lstm, lstm_loss, _lstm_accuracy, 400)
+    assert last < first
+    assert acc == 1.0
 
 
 # --- end-to-end: logistic regression ----------------------------------------

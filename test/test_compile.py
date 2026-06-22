@@ -86,6 +86,27 @@ _CASES = [
         lambda: M._init_rwkv(_rng(3), vocab=len(M._CHAR_VOCAB), d_model=8, n_blocks=1),
         {"jax", "torch", "tf"},
     ),
+    # The gated recurrent cells lower to all three frameworks: the scans carry the
+    # per-step state as a ``(1, D)`` row and slice each timestep as ``x[t : t + 1]``,
+    # so every matmul is rank-2 (tf's ``@`` needs rank >= 2).
+    (
+        "rnn",
+        M.rnn_loss,
+        lambda: (M._init_rnn(_rng(3), vocab=len(M._CHAR_VOCAB), d_model=8),),
+        {"jax", "torch", "tf"},
+    ),
+    (
+        "gru",
+        M.gru_loss,
+        lambda: (M._init_gru(_rng(3), vocab=len(M._CHAR_VOCAB), d_model=8),),
+        {"jax", "torch", "tf"},
+    ),
+    (
+        "lstm",
+        M.lstm_loss,
+        lambda: (M._init_lstm(_rng(3), vocab=len(M._CHAR_VOCAB), d_model=8),),
+        {"jax", "torch", "tf"},
+    ),
 ]
 
 _PARITY_PARAMS = [

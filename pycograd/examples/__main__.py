@@ -25,28 +25,39 @@ from pycograd import (
     sgd_update,
     value_and_grad,
 )
-from pycograd._typing import Array
+from pycograd._typing import Array, Tensor
 from pycograd.examples.models import (
+    _CHAR_VOCAB,
     _accuracy,
     _deep_accuracy,
+    _gru_accuracy,
     _init_deep,
+    _init_gru,
+    _init_lstm,
     _init_mlp,
     _init_mlp_tree,
+    _init_rnn,
     _init_transformer,
+    _lstm_accuracy,
     _mlp_accuracy,
     _mlp_tree_accuracy,
+    _rnn_accuracy,
     _transformer_accuracy,
     _Xc,
     _Yoh,
     deep_loss,
+    gru_loss,
     logistic_loss,
     logistic_param_loss,
+    lstm_loss,
     mlp_batch_loss,
     mlp_loss,
     mlp_tree_loss,
+    rnn_loss,
     sin_sq,
     transformer_loss,
 )
+from pycograd.tree import PyTree
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +165,34 @@ def main() -> None:
         len(t_hist),
     )
     logger.info("  train accuracy: %.3f", _transformer_accuracy(tparams))
+
+    # Classic recurrent cells as char-level language models. Params are a flat
+    # name->tensor dict (a pytree), so each trains with the same value_and_grad +
+    # sgd_update (tree_map SGD) loop used for the dict-pytree MLP above.
+    vocab = len(_CHAR_VOCAB)
+    for name, init, loss_fn, accuracy, steps in (
+        ("vanilla RNN", _init_rnn, rnn_loss, _rnn_accuracy, 200),
+        ("GRU", _init_gru, gru_loss, _gru_accuracy, 300),
+        ("LSTM", _init_lstm, lstm_loss, _lstm_accuracy, 400),
+    ):
+        rp: PyTree = cast(
+            PyTree, init(np.random.default_rng(0), vocab=vocab, d_model=16)
+        )
+        first = last = 0.0
+        for step in range(steps):
+            loss, (g,) = value_and_grad(loss_fn)(rp)
+            last = float(loss)
+            if step == 0:
+                first = last
+            rp = sgd_update(rp, g, lr=0.5)
+        logger.info(
+            "%s char-LM (%d SGD steps): loss %.4f -> %.4f, train accuracy %.3f",
+            name,
+            steps,
+            first,
+            last,
+            accuracy(cast("dict[str, Tensor]", rp)),
+        )
 
     xv = np.array([0.5, 1.0, 1.5])
     val, (g,) = value_and_grad(sin_sq)(xv)

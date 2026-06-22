@@ -614,5 +614,212 @@ def rwkv_step(
     return np.asarray(x @ top["head_w"] + top["head_b"]), new_state
 
 
+# ---------------------------------------------------------------------------
+# Classic recurrent cells: vanilla RNN, GRU, LSTM. Like every layer above, each
+# is a plain helper with no autodiff rule -- built from ``tanh`` / ``sigmoid`` /
+# matmul and a Python time-loop, so it differentiates on the numpy tape, batches
+# under ``vmap``, and compiles to torch/jax/tf unchanged.
+#
+# The scans carry the per-step state as a ``(1, D)`` *row* vector and slice each
+# input timestep as ``x[t : t + 1]`` (also ``(1, D)``), so every matmul is
+# rank-2 -- TensorFlow's ``@`` needs rank >= 2, and the rows lower cleanly to all
+# three backends. The state is seeded from a bias param times zero
+# (``np.expand_dims(b * 0.0, 0)``) rather than a hardcoded shape -- the
+# data-shaped-zero trick ``wkv`` uses -- so the scan still vectorizes over a batch
+# of sequences for free (``vmap`` gives each sequence its own *logical* shape).
+# The cells themselves are rank-polymorphic (elementwise + matmul + broadcast), so
+# they read identically whether handed a ``(D,)`` vector or a ``(1, D)`` row.
+# ---------------------------------------------------------------------------
+# A cell's parameters as one flat ``name -> tensor`` dict (input/hidden weight
+# matrices plus per-gate biases), like ``RWKVBlockParams``.
+RNNParams = dict[str, Tensor]
+GRUParams = dict[str, Tensor]
+LSTMParams = dict[str, Tensor]
+
+
+def rnn_cell(x: Tensor, h: Tensor, Wx: Tensor, Wh: Tensor, b: Tensor) -> Tensor:
+    # Elman cell: a tanh of the affine mix of the input and the previous hidden.
+    return cast(Tensor, np.tanh(x @ Wx + h @ Wh + b))
+
+
+def gru_cell(x: Tensor, h: Tensor, p: GRUParams) -> Tensor:
+    # Gated recurrent unit (torch convention): an update gate ``z`` interpolates
+    # between the previous hidden and a reset-gated candidate ``n``.
+    z = sigmoid(x @ p["Wz"] + h @ p["Uz"] + p["bz"])  # update gate
+    r = sigmoid(x @ p["Wr"] + h @ p["Ur"] + p["br"])  # reset gate
+    n = np.tanh(x @ p["Wn"] + (r * h) @ p["Un"] + p["bn"])  # candidate
+    return cast(Tensor, (1.0 - z) * n + z * h)
+
+
+def lstm_cell(x: Tensor, h: Tensor, c: Tensor, p: LSTMParams) -> tuple[Tensor, Tensor]:
+    # Long short-term memory: input/forget/output gates around a cell state ``c``.
+    # Returns the (hidden, cell) pair carried to the next step.
+    i = sigmoid(x @ p["Wi"] + h @ p["Ui"] + p["bi"])  # input gate
+    f = sigmoid(x @ p["Wf"] + h @ p["Uf"] + p["bf"])  # forget gate
+    g = np.tanh(x @ p["Wg"] + h @ p["Ug"] + p["bg"])  # candidate cell
+    o = sigmoid(x @ p["Wo"] + h @ p["Uo"] + p["bo"])  # output gate
+    c_new = f * c + i * g
+    h_new = o * np.tanh(c_new)
+    return cast(Tensor, h_new), cast(Tensor, c_new)
+
+
+def rnn_scan(x: Tensor, Wx: Tensor, Wh: Tensor, b: Tensor) -> Tensor:
+    # Unroll the Elman cell over a ``(T, D_in)`` sequence; return the ``(T, D_hid)``
+    # hidden states. The state is a ``(1, D_hid)`` row (rank-2 matmuls), seeded
+    # from ``b * 0.0`` so its shape comes from a param, not from ``x``.
+    h: Tensor = np.expand_dims(b * 0.0, 0)
+    outs = []
+    for t in range(x.shape[0]):
+        h = rnn_cell(x[t : t + 1], h, Wx, Wh, b)
+        outs.append(h)
+    return cast(Tensor, np.concatenate(outs, axis=0))
+
+
+def gru_scan(x: Tensor, p: GRUParams) -> Tensor:
+    h: Tensor = np.expand_dims(p["bz"] * 0.0, 0)
+    outs = []
+    for t in range(x.shape[0]):
+        h = gru_cell(x[t : t + 1], h, p)
+        outs.append(h)
+    return cast(Tensor, np.concatenate(outs, axis=0))
+
+
+def lstm_scan(x: Tensor, p: LSTMParams) -> Tensor:
+    h: Tensor = np.expand_dims(p["bi"] * 0.0, 0)
+    c: Tensor = np.expand_dims(p["bi"] * 0.0, 0)
+    outs = []
+    for t in range(x.shape[0]):
+        h, c = lstm_cell(x[t : t + 1], h, c, p)
+        outs.append(h)
+    return cast(Tensor, np.concatenate(outs, axis=0))
+
+
+# Char-level language models on top of each scan: embed one-hot rows with a matmul
+# (an embedding lookup written so it lowers to every backend), run the recurrence,
+# and project the hidden states to per-token vocab logits. ``d_in == d_hidden ==
+# d_model`` throughout so the matmuls line up.
+def rnn_lm(onehot: Tensor, p: RNNParams) -> Tensor:
+    x = onehot @ p["emb"]  # (T, D)
+    h = rnn_scan(x, p["Wx"], p["Wh"], p["b"])
+    return cast(Tensor, h @ p["head_w"] + p["head_b"])
+
+
+def gru_lm(onehot: Tensor, p: GRUParams) -> Tensor:
+    x = onehot @ p["emb"]
+    h = gru_scan(x, p)
+    return cast(Tensor, h @ p["head_w"] + p["head_b"])
+
+
+def lstm_lm(onehot: Tensor, p: LSTMParams) -> Tensor:
+    x = onehot @ p["emb"]
+    h = lstm_scan(x, p)
+    return cast(Tensor, h @ p["head_w"] + p["head_b"])
+
+
+def _init_rnn_cell(rng: np.random.Generator, d_in: int, d_hidden: int) -> RNNParams:
+    s = 0.1
+    rn = rng.standard_normal
+    return {
+        "Wx": s * rn((d_in, d_hidden)),
+        "Wh": s * rn((d_hidden, d_hidden)),
+        "b": np.zeros(d_hidden),
+    }
+
+
+def _init_gru_cell(rng: np.random.Generator, d_in: int, d_hidden: int) -> GRUParams:
+    s = 0.1
+    rn = rng.standard_normal
+    p: GRUParams = {}
+    for gate in ("z", "r", "n"):
+        p["W" + gate] = s * rn((d_in, d_hidden))
+        p["U" + gate] = s * rn((d_hidden, d_hidden))
+        p["b" + gate] = np.zeros(d_hidden)
+    return p
+
+
+def _init_lstm_cell(rng: np.random.Generator, d_in: int, d_hidden: int) -> LSTMParams:
+    s = 0.1
+    rn = rng.standard_normal
+    p: LSTMParams = {}
+    for gate in ("i", "f", "g", "o"):
+        p["W" + gate] = s * rn((d_in, d_hidden))
+        p["U" + gate] = s * rn((d_hidden, d_hidden))
+        p["b" + gate] = np.zeros(d_hidden)
+    return p
+
+
+def _init_recurrent_lm(
+    cell: RNNParams, rng: np.random.Generator, vocab: int, d_model: int
+) -> dict[str, Array]:
+    # Wrap a cell-weight dict with an embedding and an output head.
+    s = 0.1
+    rn = rng.standard_normal
+    return {
+        "emb": s * rn((vocab, d_model)),
+        **cast(dict[str, Array], cell),
+        "head_w": s * rn((d_model, vocab)),
+        "head_b": np.zeros(vocab),
+    }
+
+
+def _init_rnn(
+    rng: np.random.Generator, vocab: int, d_model: int = 8
+) -> dict[str, Array]:
+    return _init_recurrent_lm(
+        _init_rnn_cell(rng, d_model, d_model), rng, vocab, d_model
+    )
+
+
+def _init_gru(
+    rng: np.random.Generator, vocab: int, d_model: int = 8
+) -> dict[str, Array]:
+    return _init_recurrent_lm(
+        _init_gru_cell(rng, d_model, d_model), rng, vocab, d_model
+    )
+
+
+def _init_lstm(
+    rng: np.random.Generator, vocab: int, d_model: int = 8
+) -> dict[str, Array]:
+    return _init_recurrent_lm(
+        _init_lstm_cell(rng, d_model, d_model), rng, vocab, d_model
+    )
+
+
+def _next_char_ce(logits: Tensor) -> Operand:
+    # Mean next-char cross-entropy against ``_CHAR_OH[1:]`` (predict 1..T from 0..T-1).
+    targets = _CHAR_OH[1:]
+    return -np.mean(np.sum(targets * np.log(softmax_last(logits) + 1e-12), axis=-1))
+
+
+def rnn_loss(p: RNNParams) -> Operand:
+    return _next_char_ce(rnn_lm(_CHAR_OH[:-1], p))
+
+
+def gru_loss(p: GRUParams) -> Operand:
+    return _next_char_ce(gru_lm(_CHAR_OH[:-1], p))
+
+
+def lstm_loss(p: LSTMParams) -> Operand:
+    return _next_char_ce(lstm_lm(_CHAR_OH[:-1], p))
+
+
+def _recurrent_accuracy(logits: Tensor) -> float:
+    preds = np.argmax(np.asarray(logits), axis=-1)
+    return float(np.mean(preds == _CHAR_IDS[1:]))
+
+
+def _rnn_accuracy(p: RNNParams) -> float:
+    return _recurrent_accuracy(rnn_lm(_CHAR_OH[:-1], p))
+
+
+def _gru_accuracy(p: GRUParams) -> float:
+    return _recurrent_accuracy(gru_lm(_CHAR_OH[:-1], p))
+
+
+def _lstm_accuracy(p: LSTMParams) -> float:
+    return _recurrent_accuracy(lstm_lm(_CHAR_OH[:-1], p))
+
+
 def sin_sq(x: Tensor) -> Operand:
     return np.sum(np.sin(x * x))
