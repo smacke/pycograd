@@ -18,10 +18,14 @@ from pycograd import (
     Adam,
     Param,
     ParamDict,
+    batch_norm,
+    batch_norm_init,
     batches,
+    dropout,
     frozen,
     gradient_descent,
     params,
+    random,
     sgd_update,
     value_and_grad,
 )
@@ -193,6 +197,39 @@ def main() -> None:
             last,
             accuracy(cast("dict[str, Tensor]", rp)),
         )
+
+    # batch_norm running statistics (state-in/state-out) + key-based dropout. Both
+    # run eagerly on plain arrays here -- the state and the PRNG key are threaded
+    # explicitly, no hidden global. Over minibatches the running mean tracks the
+    # data mean, and a forward at eval time would normalize with these buffers.
+    bn_rng = np.random.default_rng(0)
+    data_mean = np.array([5.0, -2.0, 0.0])
+    run_mean, run_var = batch_norm_init(3)
+    for _ in range(200):
+        xb = bn_rng.normal(data_mean.reshape(3, 1, 1), 1.0, size=(32, 3, 1, 1))
+        _, run_mean, run_var = batch_norm(
+            xb, np.ones(3), np.zeros(3), run_mean, run_var, training=True
+        )
+    logger.info(
+        "batch_norm running mean %s tracks the data mean %s",
+        np.round(run_mean, 2),
+        data_mean,
+    )
+    k1, k2 = random.split(random.key(0))
+    ones = np.ones(8)
+    reproducible = np.array_equal(
+        np.asarray(dropout(ones, 0.5, True, key=k1)),
+        np.asarray(dropout(ones, 0.5, True, key=k1)),
+    )
+    distinct = not np.array_equal(
+        np.asarray(dropout(ones, 0.5, True, key=k1)),
+        np.asarray(dropout(ones, 0.5, True, key=k2)),
+    )
+    logger.info(
+        "key-based dropout: same key reproducible=%s, split keys differ=%s",
+        reproducible,
+        distinct,
+    )
 
     xv = np.array([0.5, 1.0, 1.5])
     val, (g,) = value_and_grad(sin_sq)(xv)

@@ -17,14 +17,17 @@ than ``log(softmax(x) + eps)``, dropping the epsilon fudge.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
+
+from pycograd import random
 
 # NOTE: like ``examples/models.py``, these helpers are recompiled by pyccolo when
 # instrumented on demand, which re-evaluates their annotations -- so the ``Axis``
 # alias (a value lookup) is fine, but avoid PEP 604 ``X | None`` spellings here.
 from pycograd._typing import Axis, Operand, Tensor
+from pycograd.tensor import _value
 
 
 def logsumexp(x: Tensor, axis: Axis = None, keepdims: bool = False) -> Tensor:
@@ -235,6 +238,46 @@ def avg_pool2d(x: Tensor, k: int, stride: Optional[int] = None) -> Tensor:
     return _pool2d(x, k, stride, "mean")
 
 
+def conv_transpose2d(
+    x: Tensor, w: Tensor, b: Optional[Tensor] = None, stride: int = 1, pad: int = 0
+) -> Tensor:
+    """2-D transposed convolution -- the transpose (adjoint) of :func:`conv2d`,
+    sharing its ``(C_out, C_in, kH, kW)`` weight layout. ``x`` is
+    ``(N, C_out, H, W)`` (the conv's *output* channels); returns
+    ``(N, C_in, H', W')`` with ``H' = (H-1)*stride - 2*pad + kH`` -- the inverse of
+    ``conv2d``'s size map. Used to *upsample* in decoders / generators.
+
+    There is no forward scatter-add primitive yet (``x.at[i].add`` is a separate
+    roadmap item), so this is built from existing primitives via the standard
+    equivalence: dilate the input by ``stride`` (insert zeros) with a constant
+    stop-gradient selection matrix per axis applied through ``einsum``, then a plain
+    ``conv2d`` with the channel-transposed, spatially-flipped kernel. Pure, so the
+    reverse pass / jvp / vmap come for free."""
+    kh, kw = w.shape[2], w.shape[3]
+    h, ww = x.shape[2], x.shape[3]
+    h_dil, w_dil = (h - 1) * stride + 1, (ww - 1) * stride + 1
+    # Selection matrices placing input element i at dilated position i*stride.
+    sh = np.eye(h_dil)[np.arange(h) * stride]  # (h, h_dil), constant
+    sw = np.eye(w_dil)[np.arange(ww) * stride]  # (ww, w_dil), constant
+    x_dil = np.einsum("nchw,hH,wW->ncHW", x, sh, sw)  # zero-interleaved input
+    x_dil = _pad2d(x_dil, kh - 1 - pad, kw - 1 - pad)
+    # Transpose of cross-correlation = convolution: swap C_out/C_in and flip the kernel.
+    rev_h, rev_w = np.arange(kh)[::-1], np.arange(kw)[::-1]
+    w_flip = np.transpose(w, (1, 0, 2, 3))[:, :, rev_h][:, :, :, rev_w]
+    return conv2d(x_dil, w_flip, b, stride=1, pad=0)
+
+
+def upsample_nearest2d(x: Tensor, scale: int) -> Tensor:
+    """Nearest-neighbor upsample of the last two (spatial) axes by an integer
+    ``scale``: ``(N, C, H, W) -> (N, C, H*scale, W*scale)``, each output pixel a
+    copy of its source. A gather, so the gradient sum-pools back over each block
+    (``d_getitem``'s scatter-add backward)."""
+    h, ww = x.shape[2], x.shape[3]
+    ih = np.repeat(np.arange(h), scale)  # source row per output row
+    iw = np.repeat(np.arange(ww), scale)
+    return x[:, :, ih][:, :, :, iw]
+
+
 def one_hot(indices: "np.ndarray", num_classes: int) -> "np.ndarray":
     """One-hot encode integer ``indices`` along a new last axis. A constant w.r.t. the
     (integer, non-differentiable) indices -- a plain array, not a tape node."""
@@ -261,6 +304,88 @@ def rms_norm(x: Tensor, gamma: Tensor, eps: float = 1e-5) -> Tensor:
     return x / (ms + eps) ** 0.5 * gamma
 
 
+def batch_norm_init(num_features: int) -> "tuple[np.ndarray, np.ndarray]":
+    """Initial ``(running_mean, running_var)`` buffers for :func:`batch_norm` --
+    zeros / ones of length ``num_features`` (the channel count)."""
+    return np.zeros(num_features), np.ones(num_features)
+
+
+def batch_norm(
+    x: Tensor,
+    gamma: Tensor,
+    beta: Tensor,
+    running_mean: Tensor,
+    running_var: Tensor,
+    training: bool = True,
+    momentum: float = 0.1,
+    eps: float = 1e-5,
+) -> "tuple[Tensor, np.ndarray, np.ndarray]":
+    """Batch normalization over the channel axis (axis 1) of an ``(N, C, ...)``
+    input. ``gamma``/``beta``/``running_mean``/``running_var`` are length-``C``.
+
+    *State-in/state-out* (the ``rwkv_step`` pattern), since the running statistics
+    are mutable buffers, not gradient-trained weights: returns ``(y, new_mean,
+    new_var)``. While ``training`` it normalizes with the *batch* mean/variance
+    (so the gradient flows through them) and returns the running buffers advanced
+    by an EMA of the **detached** batch stats (``momentum`` weight on the new
+    batch); at eval it normalizes with the passed running stats and returns them
+    unchanged. Thread the returned buffers forward yourself, or -- with the ambient
+    DSL -- declare them as ``buffer[...]`` and write them back via
+    ``ParamDict.update_buffers``."""
+    nd = len(x.shape)
+    c = x.shape[1]
+    bshape = tuple(c if i == 1 else 1 for i in range(nd))  # broadcast over channels
+    g = np.reshape(gamma, bshape)
+    b = np.reshape(beta, bshape)
+    # Running stats are stop-gradient buffers: pull their raw arrays so the EMA below
+    # is plain numpy (no tape), even if the caller passed them as differentiated leaves.
+    rm_raw = cast(np.ndarray, _value(running_mean))
+    rv_raw = cast(np.ndarray, _value(running_var))
+    if training:
+        axes = tuple(i for i in range(nd) if i != 1)  # reduce batch + spatial
+        mean = np.mean(x, axis=axes, keepdims=True)
+        centered = x - mean
+        var = np.mean(centered * centered, axis=axes, keepdims=True)
+        x_hat = centered / (var + eps) ** 0.5
+        # EMA of the *detached* batch stats (``.reshape`` is a plain-array method,
+        # never intercepted), kept as length-C buffer arrays.
+        batch_mean = cast(np.ndarray, _value(mean)).reshape((c,))
+        batch_var = cast(np.ndarray, _value(var)).reshape((c,))
+        new_mean = (1.0 - momentum) * rm_raw + momentum * batch_mean
+        new_var = (1.0 - momentum) * rv_raw + momentum * batch_var
+        return x_hat * g + b, new_mean, new_var
+    x_hat = (x - rm_raw.reshape(bshape)) / (rv_raw.reshape(bshape) + eps) ** 0.5
+    return x_hat * g + b, rm_raw, rv_raw
+
+
+def group_norm(
+    x: Tensor, gamma: Tensor, beta: Tensor, num_groups: int, eps: float = 1e-5
+) -> Tensor:
+    """Group normalization over an ``(N, C, ...)`` input: split the ``C`` channels
+    into ``num_groups`` groups and normalize each group (its channels + all spatial
+    positions) per sample, then scale/shift per channel with length-``C``
+    ``gamma``/``beta``. Stateless -- no batch statistics, so it is batch-size
+    independent (unlike :func:`batch_norm`)."""
+    nd = len(x.shape)
+    n, c = x.shape[0], x.shape[1]
+    spatial = tuple(x.shape[i] for i in range(2, nd))
+    grouped = (n, num_groups, c // num_groups) + spatial
+    xg = np.reshape(x, grouped)
+    axes = tuple(range(2, len(grouped)))  # channels-in-group + spatial
+    mu = np.mean(xg, axis=axes, keepdims=True)
+    centered = xg - mu
+    var = np.mean(centered * centered, axis=axes, keepdims=True)
+    xn = np.reshape(centered / (var + eps) ** 0.5, (n, c) + spatial)
+    bshape = tuple(c if i == 1 else 1 for i in range(nd))
+    return xn * np.reshape(gamma, bshape) + np.reshape(beta, bshape)
+
+
+def instance_norm(x: Tensor, gamma: Tensor, beta: Tensor, eps: float = 1e-5) -> Tensor:
+    """Instance normalization: :func:`group_norm` with one group per channel --
+    each channel of each sample is normalized over its spatial positions alone."""
+    return group_norm(x, gamma, beta, num_groups=x.shape[1], eps=eps)
+
+
 # ---------------------------------------------------------------------------
 # Attention & embedding.
 # ---------------------------------------------------------------------------
@@ -285,6 +410,36 @@ def scaled_dot_product_attention(
     return np.matmul(weights, v)
 
 
+def multi_head_attention(
+    q: Tensor, k: Tensor, v: Tensor, num_heads: int, mask: Optional["np.ndarray"] = None
+) -> Tensor:
+    """Multi-head attention over ``(..., L, d_model)`` inputs: split ``d_model``
+    into ``num_heads`` heads of width ``d_model // num_heads``, run
+    :func:`scaled_dot_product_attention` independently per head (the head axis just
+    rides along as another leading dim), then concatenate the heads back to
+    ``(..., L, d_model)``. The Q/K/V/output projections are the caller's
+    :func:`linear`s; ``mask`` broadcasts over the head axis."""
+    nd = len(q.shape)
+    d_model = q.shape[-1]
+    d_head = d_model // num_heads
+
+    def split_heads(t: Tensor) -> Tensor:
+        lead = tuple(t.shape[i] for i in range(nd - 2))
+        seq = t.shape[-2]
+        t = np.reshape(t, lead + (seq, num_heads, d_head))  # (..., L, H, d_head)
+        # move the head axis (nd-1) ahead of L (nd-2) -> (..., H, L, d_head)
+        return np.transpose(t, tuple(range(nd - 2)) + (nd - 1, nd - 2, nd))
+
+    out = scaled_dot_product_attention(
+        split_heads(q), split_heads(k), split_heads(v), mask
+    )  # (..., H, L, d_head)
+    lead = tuple(out.shape[i] for i in range(nd - 2))
+    seq = out.shape[-2]
+    # (..., H, L, d_head) -> (..., L, H, d_head) -> (..., L, d_model)
+    merged = np.transpose(out, tuple(range(nd - 2)) + (nd - 1, nd - 2, nd))
+    return np.reshape(merged, lead + (seq, d_model))
+
+
 def embedding(table: Tensor, indices: "np.ndarray") -> Tensor:
     """Look up rows of ``table`` (``(num_embeddings, dim)``) by integer
     ``indices``, returning ``(*indices.shape, dim)``. A plain gather, so the
@@ -306,26 +461,41 @@ def linear(x: Tensor, w: Tensor, b: Optional[Tensor] = None) -> Tensor:
     return out if b is None else out + b
 
 
-# Default generator for the ``rng=None`` path. Prefer threading an explicit
-# ``rng`` for reproducibility (the splittable-PRNG story is a separate roadmap
-# item; this keeps dropout off a hidden global beyond this fallback).
-_default_dropout_rng = np.random.default_rng()
-
-
 def dropout(
     x: Tensor,
     p: float,
     training: bool = True,
+    key: Optional["np.ndarray"] = None,
     rng: Optional["np.random.Generator"] = None,
 ) -> Tensor:
     """Inverted dropout. ``p`` is the *drop* probability (torch/jax convention):
     at training time each element is zeroed with probability ``p`` and the
     survivors are scaled by ``1 / (1 - p)`` so the expected value is unchanged.
-    A no-op when ``not training`` or ``p == 0``. The mask is a plain-array
-    constant, so the gradient simply routes through it."""
+    A no-op when ``not training`` or ``p == 0``.
+
+    Randomness is threaded explicitly -- pass a splittable ``key`` (from
+    :mod:`pycograd.random`; preferred) or an ``np.random.Generator`` via ``rng``;
+    one is required while training (there is no hidden global generator). On a
+    ``(B, ...)`` batch this already zeros each element independently, so a single
+    key gives per-sample dropout without ``vmap`` -- ``split`` the key per step (or
+    ``fold_in`` the step index) to vary masks across training steps. The mask is a
+    stop-gradient plain-array constant -- the gradient routes through it, and it
+    lowers to the compile backends as a constant (RNG stays host-side).
+
+    (Mapping a *per-key* mask with ``vmap(..., in_axes=(0, 0))`` over split keys is
+    not supported: host-side RNG can't consume a batched-tracer key, and vmap's
+    single symbolic pass would share one mask regardless -- draw the full-batch
+    mask as above instead.)"""
     if not training or p == 0.0:
         return x
     keep = 1.0 - p
-    gen = _default_dropout_rng if rng is None else rng
-    mask = (gen.random(x.shape) < keep) / keep  # x.shape via Var.shape
+    if key is not None:
+        mask = random.bernoulli(key, keep, x.shape) / keep  # x.shape via Var.shape
+    elif rng is not None:
+        mask = (rng.random(x.shape) < keep) / keep
+    else:
+        raise ValueError(
+            "dropout: training=True needs an explicit `key` (pycograd.random) or "
+            "`rng` (np.random.Generator) -- there is no global generator"
+        )
     return x * mask

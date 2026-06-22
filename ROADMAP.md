@@ -88,19 +88,32 @@ it is gated by the foundation.
   (pure Python).
 - **Real optimizers.** Adam/AdamW, SGD+momentum, weight decay, gradient
   clipping, LR schedules, `zero_grad`. Crucial: high. Feasibility: high.
-- **Fused, numerically-stable primitives.** `log_softmax`, `logsumexp`,
-  `softmax`, `cross_entropy`, `layer_norm`/`batch_norm` (with running stats) as
-  first-class stable ops rather than hand-composed. Crucial: high. Feasibility:
-  high (mostly composition + care).
+- **Fused, numerically-stable primitives.** *Landed.* `log_softmax`,
+  `logsumexp`, `softmax`, `cross_entropy`, the activation family, and the
+  normalization layers are first-class ops in `pycograd/functional.py`:
+  `layer_norm`, `rms_norm`, `group_norm`, `instance_norm`, and `batch_norm` (with
+  running stats, *state-in/state-out* `(y, new_mean, new_var)`). `batch_norm`'s
+  running stats ride a new mutable-`buffer` leaf (`Param.mutable` + `buffer[...]`
+  + `ParamDict.update_buffers`): non-trainable, optimizer-skipped, advanced
+  out-of-band. Also landed: `scaled_dot_product_attention`, `multi_head_attention`,
+  `embedding`, `linear`, `dropout`, and `conv_transpose2d` / `upsample_nearest2d`.
+  Open: a forward scatter-add primitive (`x.at[i].add(...)`, Phase 2) — until
+  then `conv_transpose2d` is built from an einsum input-dilation + flipped conv
+  rather than a col2im scatter.
 - **Broader op coverage.** `einsum` (general contractions / attention variants),
   `gather`/`scatter` + embeddings, `sort`/`argsort`/`topk`, `cumsum`, padding,
   one-hot. Crucial: high for novel architectures. Feasibility: medium (`einsum`
   is real work).
 - **Convolution / pooling.** Conv1d/2d, pooling. Crucial: high (CNNs).
   Feasibility: medium — naive is easy but slow; fast conv = im2col/FFT.
-- **RNG management.** Splittable/threaded PRNG (JAX-style keys) instead of a
-  hidden global generator (dropout currently uses `np.random`). Crucial: medium
-  (reproducibility). Feasibility: high.
+- **RNG management.** *Landed* (`pycograd/random.py`): a pure, splittable
+  JAX-style key API — `key` / `split` / `fold_in` plus `bernoulli` / `uniform` /
+  `normal` / `randint`, built on numpy's counter-based `SeedSequence` + `Philox`.
+  `dropout` takes an explicit `key` (or `rng`) and no longer falls back to a
+  hidden global. Keys are sampled host-side (a per-backend RNG seam is still
+  open); `vmap` over a per-row key is not supported (host RNG can't consume a
+  batched-tracer key), but a single key already gives independent per-sample masks
+  over a `(B, …)` batch.
 - **Training glue.** Data loading/batching/shuffling, checkpoint save/load
   (params + optimizer state), basic metrics/logging. Crucial: medium.
   Feasibility: high (orthogonal).

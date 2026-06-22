@@ -45,15 +45,21 @@ class Param:
     """A model-parameter leaf carrying differentiation metadata.
 
     ``trainable=False`` holds the value fixed: its gradient comes back ``None``
-    and ``sgd_update`` leaves it untouched. ``tie`` groups leaves that are the
-    *same* underlying weight -- every ``Param`` sharing a ``tie`` key is backed
-    by one tape node, so the gradient accumulates once and is reported
-    identically at each position (tied params must be initialized equal; the
-    shared node adopts the first occurrence's value).
+    and ``sgd_update`` leaves it untouched. ``mutable=True`` (with
+    ``trainable=False``) marks a *buffer* -- a non-gradient leaf the forward pass
+    may still advance (a batch-norm running mean/variance), updated out-of-band via
+    :meth:`ParamDict.update_buffers` rather than by the optimizer. ``tie`` groups
+    leaves that are the *same* underlying weight -- every ``Param`` sharing a
+    ``tie`` key is backed by one tape node, so the gradient accumulates once and is
+    reported identically at each position (tied params must be initialized equal;
+    the shared node adopts the first occurrence's value).
     """
 
     value: Array
     trainable: bool = True
+    # A non-trainable-but-mutable buffer (running stats etc.): no gradient, skipped
+    # by the optimizer, but writable via ``ParamDict.update_buffers``.
+    mutable: bool = False
     tie: Hashable | None = None
     # Stamped by the ``params{...}`` DSL with the block that declared this param,
     # so ``value_and_grad`` can reject a weight also passed in by hand.
@@ -75,6 +81,25 @@ class _Frozen:
 
 
 frozen = _Frozen()
+
+
+class _Buffer:
+    """A non-trainable but mutable *buffer*, as a call or a subscript:
+    ``buffer(v)`` / ``buffer[v]`` (the bracket form reads naturally inside a
+    ``params{...}`` block). Carries no gradient and is skipped by the optimizer,
+    but the forward pass advances it via :meth:`ParamDict.update_buffers` (e.g. a
+    batch-norm running mean/variance)."""
+
+    def __call__(self, value: ArrayLike) -> Param:
+        return Param(
+            np.asarray(value, dtype=current_dtype()), trainable=False, mutable=True
+        )
+
+    def __getitem__(self, value: ArrayLike) -> Param:
+        return self(value)
+
+
+buffer = _Buffer()
 
 
 class _TieRef:
@@ -522,13 +547,28 @@ class ParamDict(dict):
 
     def step(self, grads: ParamDict, lr: float) -> None:
         """One in-place SGD step: ``p.value -= lr * grad`` for each trainable leaf
-        (frozen leaves, whose gradient is ``None``, are left untouched). The model's
-        proxies read the updated values on the next call."""
+        (frozen / buffer leaves, whose gradient is ``None``, are left untouched). The
+        model's proxies read the updated values on the next call."""
         for key in self:
             leaf = self[key]
             g = grads.get(key)
             if isinstance(leaf, Param) and leaf.trainable and g is not None:
                 leaf.value = cast(Array, leaf.value) - lr * cast(Array, g)
+
+    def update_buffers(self, updates: dict[str, ArrayLike]) -> None:
+        """Write new values into mutable ``buffer`` leaves in place (running stats
+        and the like). The controlled, explicit mutation point for non-gradient
+        state: thread the advanced buffers a forward returns (e.g. ``batch_norm``'s
+        ``new_mean`` / ``new_var``) back here. Refuses any key that is not a
+        ``buffer`` (a trainable weight or a frozen constant)."""
+        for key, value in updates.items():
+            leaf = self.get(key)
+            if not (isinstance(leaf, Param) and leaf.mutable):
+                raise ValueError(
+                    f"update_buffers: {key!r} is not a mutable buffer "
+                    "(declare it with buffer[...] in params(...))"
+                )
+            leaf.value = np.asarray(value, dtype=current_dtype())
 
     def to_torch_module(
         self, forward: Callable[..., object], *, dtype: DTypeLike | None = None

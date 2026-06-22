@@ -15,6 +15,7 @@ from pycograd import (  # noqa: E402
     AdamW,
     DataLoader,
     batches,
+    buffer,
     clip_grad_norm,
     constant_lr,
     cosine_decay,
@@ -92,6 +93,23 @@ def test_frozen_param_is_held_fixed():
         m = opt.step(m, g)
     assert float(m["b"].value) == 7.0  # frozen bias never moved
     assert np.any(m["w"].value != 0.0)  # trainable weight did
+
+
+def test_buffer_is_held_by_optimizer_but_updatable():
+    m = params(w=np.zeros(2), b=np.zeros(1), bn=buffer[np.zeros(3)])
+    assert m["bn"].mutable and not m["bn"].trainable
+    opt = Adam(lr=0.1)
+    for _ in range(20):
+        _loss, (g,) = value_and_grad(logistic_param_loss)(m)
+        assert g["bn"] is None  # buffer carries no gradient
+        m = opt.step(m, g)
+    assert np.allclose(m["bn"].value, 0.0)  # optimizer never touched the buffer
+    assert np.any(m["w"].value != 0.0)  # trainable weight did move
+    # ...but update_buffers writes it in place, and rejects non-buffers.
+    m.update_buffers({"bn": np.array([1.0, 2.0, 3.0])})
+    assert np.allclose(m["bn"].value, [1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="not a mutable buffer"):
+        m.update_buffers({"w": np.zeros(2)})
 
 
 def test_tied_params_stay_equal():

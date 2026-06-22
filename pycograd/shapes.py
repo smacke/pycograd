@@ -389,11 +389,21 @@ class ShapedArray(Tracer):
 
 
 def _aval(x: AbstractVal) -> ShapedArray:
-    """Coerce an array / number / ``ShapeDtypeStruct`` / ``ShapedArray`` to an aval."""
+    """Coerce an array / number / ``ShapeDtypeStruct`` / ``ShapedArray`` to an aval.
+
+    A ``Var``/``Param`` reaches here when a pure-constant subexpression (no abstract
+    operand) is evaluated eagerly mid-``eval_shape`` -- e.g. ``np.reshape`` of a
+    closure array routes through the base ``EvalTrace`` and yields a concrete
+    ``Var``. Its value carries a real shape/dtype, so read those directly rather
+    than ``np.asarray`` (which a ``Var`` rejects)."""
     if isinstance(x, ShapedArray):
         return x
     if isinstance(x, ShapeDtypeStruct):
         return ShapedArray(x.shape, x.dtype)
+    if isinstance(x, Var):
+        return ShapedArray(x.value.shape, x.value.dtype)
+    if isinstance(x, Param):
+        x = x.value
     arr = np.asarray(x)
     return ShapedArray(arr.shape, arr.dtype)
 

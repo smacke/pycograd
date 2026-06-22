@@ -8,6 +8,7 @@ function to return gradients with the same pytree structure as its arguments.
 """
 from importlib.metadata import PackageNotFoundError, version
 
+from pycograd import random
 from pycograd._typing import Operand, Tensor
 from pycograd.backends import activate, device, get_backend
 from pycograd.compile import compile_to
@@ -17,15 +18,20 @@ from pycograd.export import export_onnx, export_torchscript, to_torch_module
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
 from pycograd.functional import (
     avg_pool2d,
+    batch_norm,
+    batch_norm_init,
     conv1d,
     conv2d,
+    conv_transpose2d,
     cross_entropy,
     dropout,
     elu,
     embedding,
     gelu,
+    group_norm,
     hardsigmoid,
     hardswish,
+    instance_norm,
     layer_norm,
     leaky_relu,
     linear,
@@ -33,6 +39,7 @@ from pycograd.functional import (
     logsumexp,
     max_pool2d,
     mish,
+    multi_head_attention,
     one_hot,
     relu,
     rms_norm,
@@ -45,6 +52,7 @@ from pycograd.functional import (
     softsign,
     swish,
     tanh,
+    upsample_nearest2d,
 )
 from pycograd.ops import (
     AutodiffWarning,
@@ -99,6 +107,7 @@ from pycograd.params import (
     Param,
     ParamDict,
     Weight,
+    buffer,
     frozen,
     param_values,
     params,
@@ -159,6 +168,7 @@ __all__ = [
     "ParamDict",
     "Weight",
     "frozen",
+    "buffer",
     "tied",
     "params",
     "param_values",
@@ -226,16 +236,25 @@ __all__ = [
     "selu",
     "conv1d",
     "conv2d",
+    "conv_transpose2d",
+    "upsample_nearest2d",
     "max_pool2d",
     "avg_pool2d",
     "one_hot",
     # neural-net layers (normalization, attention, embedding, linear, dropout)
     "layer_norm",
     "rms_norm",
+    "batch_norm",
+    "batch_norm_init",
+    "group_norm",
+    "instance_norm",
     "scaled_dot_product_attention",
+    "multi_head_attention",
     "embedding",
     "linear",
     "dropout",
+    # splittable PRNG keys (pycograd.random: key / split / fold_in + samplers)
+    "random",
     # data / batching
     "batches",
     "DataLoader",

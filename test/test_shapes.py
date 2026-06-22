@@ -122,6 +122,20 @@ def test_abstract_matmul_error_matches_eager_message():
     assert str(eager.value) == str(abstract.value)
 
 
+def test_abstract_handles_eager_constant_subexpressions():
+    # A pure-constant subexpression (no abstract operand) evaluates eagerly to a
+    # concrete Var mid-eval_shape -- e.g. np.reshape / np.mean of a closure array.
+    # Mixing that Var back with an abstract operand must still infer a shape (it
+    # used to raise "Var has no array conversion").
+    g = np.ones(4)
+
+    def f(x):  # x abstract; g a plain closure constant reshaped + reduced
+        return x * np.reshape(g, (1, 4)) + np.sum(np.reshape(g, (2, 2)))
+
+    out = eval_shape(f, SDS((3, 4)), method="abstract")
+    assert tuple(out.shape) == (3, 4)
+
+
 def test_abstract_boolean_mask_is_symbolic():
     # A boolean mask is data-dependent: its length flows through as a symbolic Dim
     # (was a ShapeError before symbolic dimensions existed).

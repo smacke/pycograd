@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 Scalar = Union[int, float]
 Array = np.ndarray
 ArrayLike = Union[Scalar, Array]
+# A splittable PRNG key (see :mod:`pycograd.random`): a small immutable ``uint32``
+# array that deterministically seeds a draw or derives child keys, in place of a
+# stateful ``np.random.Generator``.
+Key = np.ndarray
 # An operand is a Var, a plain number/array, or a ``Weight`` proxy (a late-bound
 # reference to an ambient parameter; see ``with`` support near ``ParamDict``).
 Operand = Union["Var", ArrayLike, "Weight"]

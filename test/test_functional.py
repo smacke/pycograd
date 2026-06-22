@@ -10,6 +10,10 @@ np = pytest.importorskip("numpy")
 
 from pycograd import ShapeDtypeStruct as S  # noqa: E402
 from pycograd import (  # noqa: E402
+    batch_norm,
+    batch_norm_init,
+    conv2d,
+    conv_transpose2d,
     cross_entropy,
     dropout,
     elu,
@@ -17,8 +21,10 @@ from pycograd import (  # noqa: E402
     eval_shape,
     gelu,
     grad,
+    group_norm,
     hardsigmoid,
     hardswish,
+    instance_norm,
     jvp,
     layer_norm,
     leaky_relu,
@@ -26,6 +32,7 @@ from pycograd import (  # noqa: E402
     log_softmax,
     logsumexp,
     mish,
+    multi_head_attention,
     relu,
     rms_norm,
     scaled_dot_product_attention,
@@ -35,6 +42,7 @@ from pycograd import (  # noqa: E402
     softplus,
     softsign,
     tanh,
+    upsample_nearest2d,
     value_and_grad,
     vmap,
 )
@@ -190,6 +198,52 @@ def test_rms_norm_values_and_grad():
     _assert_grads_match(rms_norm, (x, g))
 
 
+# Running stats are module globals (not closure free vars) so the instrumented
+# grad helper can read them -- instrumented bodies drop closure captures.
+_BN_RM, _BN_RV = batch_norm_init(4)
+
+
+def _bn_train_y(x, gamma, beta):  # return only y so finite-diff can score it
+    return batch_norm(x, gamma, beta, _BN_RM, _BN_RV, training=True)[0]
+
+
+def test_batch_norm_train_values_running_stats_and_grad():
+    rng = np.random.default_rng(15)
+    x = rng.standard_normal((8, 4, 3, 3))
+    gamma, beta = np.ones(4), np.zeros(4)
+    y, new_mean, new_var = batch_norm(x, gamma, beta, _BN_RM, _BN_RV, training=True)
+    y = np.asarray(y)
+    # Identity affine => per-channel zero mean / unit variance over (N, H, W).
+    assert np.allclose(y.mean(axis=(0, 2, 3)), 0.0, atol=1e-6)
+    assert np.allclose(y.var(axis=(0, 2, 3)), 1.0, atol=1e-4)
+    # Running buffers are advanced (EMA) and come back as plain arrays.
+    assert isinstance(new_mean, np.ndarray) and new_mean.shape == (4,)
+    assert not np.allclose(new_mean, _BN_RM)
+    _assert_grads_match(_bn_train_y, (x, gamma, beta), atol=1e-4)
+
+
+def test_batch_norm_eval_uses_running_stats_unchanged():
+    rng = np.random.default_rng(16)
+    x = rng.standard_normal((5, 3, 2, 2))
+    gamma, beta = np.ones(3), np.zeros(3)
+    rm, rv = np.array([1.0, -1.0, 0.5]), np.array([4.0, 1.0, 9.0])
+    y, new_mean, new_var = batch_norm(x, gamma, beta, rm, rv, training=False)
+    ref = (x - rm.reshape(1, 3, 1, 1)) / np.sqrt(rv.reshape(1, 3, 1, 1) + 1e-5)
+    assert np.allclose(np.asarray(y), ref)
+    assert np.allclose(new_mean, rm) and np.allclose(new_var, rv)  # eval: untouched
+
+
+def test_batch_norm_eval_shape():
+    # Plain closure params (gamma/beta/running stats reshaped to the channel axis):
+    # these are eagerly-evaluated constants under the shape trace, which now works.
+    g, b = np.ones(4), np.zeros(4)
+    rm, rv = batch_norm_init(4)
+    out = eval_shape(
+        lambda x: batch_norm(x, g, b, rm, rv, training=False)[0], S((8, 4, 5, 5))
+    )
+    assert tuple(out.shape) == (8, 4, 5, 5)
+
+
 # --- extra activations ------------------------------------------------------
 def test_extra_activation_values_match_reference():
     x = np.array([-2.0, -0.5, 0.5, 1.5, 2.0])
@@ -318,6 +372,98 @@ def test_dropout_train_scales_survivors_and_grad_routes_through_mask():
     )(x)
     mask = (np.random.default_rng(99).random(x.shape) < 0.5) / 0.5
     assert np.allclose(g, mask)
+
+
+# --- group / instance norm --------------------------------------------------
+# Module-level wrappers (with the int arg baked in) so value_and_grad can
+# getsource them -- a black-wrapped multi-line lambda breaks source extraction.
+def _group_norm_3(x, gamma, beta):
+    return group_norm(x, gamma, beta, 3)
+
+
+def test_group_norm_values_and_grad():
+    rng = np.random.default_rng(17)
+    x = rng.standard_normal((2, 6, 4, 4))
+    g, b = np.ones(6), np.zeros(6)
+    y = np.asarray(group_norm(x, g, b, num_groups=3)).reshape(2, 3, 2, 4, 4)
+    assert np.allclose(y.mean(axis=(2, 3, 4)), 0.0, atol=1e-6)  # per-group zero mean
+    assert np.allclose(y.var(axis=(2, 3, 4)), 1.0, atol=1e-4)  # per-group unit var
+    _assert_grads_match(_group_norm_3, (x, g, b), atol=1e-4)
+
+
+def test_instance_norm_normalizes_each_channel_per_sample():
+    rng = np.random.default_rng(18)
+    x = rng.standard_normal((2, 3, 4, 4))
+    g, b = np.ones(3), np.zeros(3)
+    y = np.asarray(instance_norm(x, g, b)).reshape(2, 3, 16)
+    assert np.allclose(y.mean(axis=-1), 0.0, atol=1e-6)
+    assert np.allclose(y.var(axis=-1), 1.0, atol=1e-4)
+
+
+# --- multi-head attention ---------------------------------------------------
+def test_multi_head_attention_matches_per_head_and_single_head():
+    rng = np.random.default_rng(19)
+    q, k, v = (rng.standard_normal((5, 8)) for _ in range(3))
+    mh = np.asarray(multi_head_attention(q, k, v, num_heads=2))
+    heads = [
+        np.asarray(scaled_dot_product_attention(q[:, s], k[:, s], v[:, s]))
+        for s in (slice(0, 4), slice(4, 8))
+    ]
+    assert np.allclose(mh, np.concatenate(heads, axis=-1))
+    # one head is plain scaled dot-product attention
+    assert np.allclose(
+        np.asarray(multi_head_attention(q, k, v, 1)),
+        np.asarray(scaled_dot_product_attention(q, k, v)),
+    )
+
+
+def _mha_2(q, k, v):
+    return multi_head_attention(q, k, v, 2)
+
+
+def test_multi_head_attention_grad_and_vmap():
+    rng = np.random.default_rng(20)
+    q, k, v = (rng.standard_normal((4, 6)) for _ in range(3))
+    _assert_grads_match(_mha_2, (q, k, v), atol=1e-4)
+    bq, bk, bv = (rng.standard_normal((3, 4, 6)) for _ in range(3))
+    out = vmap(_mha_2)(bq, bk, bv)
+    assert out.shape == (3, 4, 6)
+    for i in range(3):
+        assert np.allclose(out[i], multi_head_attention(bq[i], bk[i], bv[i], 2))
+
+
+# --- transposed conv / upsample ---------------------------------------------
+def test_conv_transpose2d_is_the_adjoint_of_conv2d():
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((2, 3, 5, 5))  # (N, C_in, H, W)
+    w = rng.standard_normal((4, 3, 3, 3))  # (C_out, C_in, kH, kW)
+    y = np.asarray(conv2d(x, w, stride=2, pad=0))
+    g = rng.standard_normal(y.shape)
+    xt = np.asarray(conv_transpose2d(g, w, stride=2, pad=0))
+    assert xt.shape == x.shape  # inverts conv2d's size map
+    # <conv2d(x, w), g> == <x, conv_transpose2d(g, w)>: the transpose identity.
+    assert np.allclose(np.sum(y * g), np.sum(x * xt))
+
+
+def _conv_transpose_s2(x, w):  # module-level so value_and_grad can getsource it
+    return conv_transpose2d(x, w, stride=2)
+
+
+def test_conv_transpose2d_grad_matches_finite_diff():
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((1, 3, 4, 4))  # input channels == w's C_out (3)
+    w = rng.standard_normal((3, 2, 3, 3))  # (C_out, C_in, kH, kW)
+    _assert_grads_match(_conv_transpose_s2, (x, w), atol=1e-4)
+
+
+def test_upsample_nearest2d_repeats_and_grad_sum_pools():
+    x = np.arange(4.0).reshape(1, 1, 2, 2)
+    up = np.asarray(upsample_nearest2d(x, 2))
+    assert up.shape == (1, 1, 4, 4)
+    assert np.allclose(up[0, 0, :2, :2], x[0, 0, 0, 0])  # each source repeated 2x2
+    # gradient of a sum sends 1 back to each source scale*scale times.
+    _, (g,) = value_and_grad(lambda a: np.sum(upsample_nearest2d(a, 2)))(x)
+    assert np.allclose(g, 4.0)
 
 
 # --- composition with the transform stack -----------------------------------
