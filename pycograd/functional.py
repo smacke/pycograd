@@ -296,20 +296,26 @@ def avg_pool2d(x: Tensor, k: int, stride: Optional[int] = None) -> Tensor:
 
 
 def conv_transpose2d(
-    x: Tensor, w: Tensor, b: Optional[Tensor] = None, stride: int = 1, pad: int = 0
+    x: Tensor,
+    w: Tensor,
+    b: Optional[Tensor] = None,
+    stride: int = 1,
+    pad: int = 0,
+    dilation: int = 1,
 ) -> Tensor:
     """2-D transposed convolution -- the transpose (adjoint) of :func:`conv2d`,
     sharing its ``(C_out, C_in, kH, kW)`` weight layout. ``x`` is
     ``(N, C_out, H, W)`` (the conv's *output* channels); returns
-    ``(N, C_in, H', W')`` with ``H' = (H-1)*stride - 2*pad + kH`` -- the inverse of
-    ``conv2d``'s size map. Used to *upsample* in decoders / generators.
+    ``(N, C_in, H', W')`` with ``H' = (H-1)*stride - 2*pad + (kH-1)*dilation + 1``
+    -- the inverse of ``conv2d``'s size map. Used to *upsample* in decoders /
+    generators. ``dilation`` matches the dilation of the conv it transposes.
 
     There is no forward scatter-add primitive yet (``x.at[i].add`` is a separate
     roadmap item), so this is built from existing primitives via the standard
     equivalence: dilate the input by ``stride`` (insert zeros) with a constant
     stop-gradient selection matrix per axis applied through ``einsum``, then a plain
-    ``conv2d`` with the channel-transposed, spatially-flipped kernel. Pure, so the
-    reverse pass / jvp / vmap come for free."""
+    ``conv2d`` with the channel-transposed, spatially-flipped kernel (itself dilated
+    by ``dilation``). Pure, so the reverse pass / jvp / vmap come for free."""
     kh, kw = w.shape[2], w.shape[3]
     h, ww = x.shape[2], x.shape[3]
     h_dil, w_dil = (h - 1) * stride + 1, (ww - 1) * stride + 1
@@ -317,26 +323,32 @@ def conv_transpose2d(
     sh = np.eye(h_dil)[np.arange(h) * stride]  # (h, h_dil), constant
     sw = np.eye(w_dil)[np.arange(ww) * stride]  # (ww, w_dil), constant
     x_dil = np.einsum("...hw,hH,wW->...HW", x, sh, sw)  # zero-interleaved input
-    x_dil = _pad2d(x_dil, kh - 1 - pad, kw - 1 - pad)
+    # Pad by the (dilated) kernel footprint minus 1, less the conv's own padding.
+    x_dil = _pad2d(x_dil, (kh - 1) * dilation - pad, (kw - 1) * dilation - pad)
     # Transpose of cross-correlation = convolution: swap C_out/C_in and flip the kernel.
     rev_h, rev_w = np.arange(kh)[::-1], np.arange(kw)[::-1]
     w_flip = np.transpose(w, (1, 0, 2, 3))[:, :, rev_h][:, :, :, rev_w]
-    return conv2d(x_dil, w_flip, b, stride=1, pad=0)
+    return conv2d(x_dil, w_flip, b, stride=1, pad=0, dilation=dilation)
 
 
 def conv_transpose1d(
-    x: Tensor, w: Tensor, b: Optional[Tensor] = None, stride: int = 1, pad: int = 0
+    x: Tensor,
+    w: Tensor,
+    b: Optional[Tensor] = None,
+    stride: int = 1,
+    pad: int = 0,
+    dilation: int = 1,
 ) -> Tensor:
     """1-D transposed convolution -- the adjoint of :func:`conv1d`, sharing its
     ``(C_out, C_in, k)`` weight layout. ``x`` is ``(N, C_out, L)`` (the conv's
-    *output* channels); returns ``(N, C_in, (L-1)*stride - 2*pad + k)``. A height-1
-    :func:`conv_transpose2d` underneath, exactly as :func:`conv1d` wraps
-    :func:`conv2d`. The parallel/training form whose incremental counterpart is
-    :func:`streaming_conv_transpose1d`."""
+    *output* channels); returns ``(N, C_in, (L-1)*stride - 2*pad + (k-1)*dilation +
+    1)``. A height-1 :func:`conv_transpose2d` underneath, exactly as :func:`conv1d`
+    wraps :func:`conv2d`. The parallel/training form whose incremental counterpart
+    is :func:`streaming_conv_transpose1d`."""
     c_out, c_in, kk = w.shape[0], w.shape[1], w.shape[2]
     x4 = np.reshape(x, (x.shape[0], c_out, 1, x.shape[2]))
     w4 = np.reshape(w, (c_out, c_in, 1, kk))
-    out = conv_transpose2d(x4, w4, b, stride=stride, pad=pad)
+    out = conv_transpose2d(x4, w4, b, stride=stride, pad=pad, dilation=dilation)
     return np.reshape(out, (out.shape[0], c_in, out.shape[3]))
 
 
@@ -417,20 +429,24 @@ def streaming_conv_transpose1d(
     b: Optional[Tensor] = None,
     state: "Optional[tuple[np.ndarray, int]]" = None,
     stride: int = 1,
+    dilation: int = 1,
 ) -> "tuple[np.ndarray, tuple[np.ndarray, int]]":
     """One incremental step of a :func:`conv_transpose1d` over the next chunk ``x``
     ``(N, C_out, L_chunk)``, returning ``(finalized_y, new_state)``. The transpose
     is the dual of :func:`streaming_conv1d`: it caches the *output* overlap (whose
     bias must not be double-counted when summed with the next chunk's output) and
-    finalizes ``stride * L_chunk`` samples per step. **End-of-stream flush:** the
-    last ``state[0]`` holds the final ``k-stride`` output samples that no further
-    input can touch -- concatenate it after the loop to recover the full sequence.
-    Streaming from ``state=None`` reproduces :func:`conv_transpose1d` over the
-    whole input."""
+    finalizes ``stride * L_chunk`` samples per step (independent of ``dilation`` --
+    which only lengthens the cached overlap). **End-of-stream flush:** the last
+    ``state[0]`` holds the final ``(k-1)*dilation + 1 - stride`` output samples that
+    no further input can touch -- concatenate it after the loop to recover the full
+    sequence. Streaming from ``state=None`` reproduces :func:`conv_transpose1d` over
+    the whole input."""
     xa = np.asarray(_value(x))
     bias = None if b is None else np.asarray(_value(b))
     c_out = w.shape[1]  # transpose swaps channels: weight's C_in is the output
-    y = np.asarray(conv_transpose1d(xa, w, bias, stride=stride, pad=0))
+    y = np.asarray(
+        conv_transpose1d(xa, w, bias, stride=stride, pad=0, dilation=dilation)
+    )
     post_y, post_t = (None, 0) if state is None else state
     if post_t > 0:  # bias-only positions a large stride left between footprints
         init_y = np.zeros((xa.shape[0], c_out, post_t))

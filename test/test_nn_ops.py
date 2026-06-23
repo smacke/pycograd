@@ -178,6 +178,20 @@ def test_conv_transpose1d_is_the_adjoint_of_conv1d():
     assert np.allclose(np.sum(y * g), np.sum(x * xt))  # the transpose identity
 
 
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dilation", [1, 2, 3])
+def test_conv_transpose1d_dilated_adjoint(stride, dilation):
+    rng = np.random.default_rng(140 + stride * 10 + dilation)
+    # L=9 (odd) keeps the stride-2 size map exactly invertible for k=3, any dilation.
+    x = rng.standard_normal((2, 3, 9))  # (N, C_in, L)
+    w = rng.standard_normal((4, 3, 3))  # (C_out, C_in, k)
+    y = np.asarray(conv1d(x, w, stride=stride, pad=0, dilation=dilation))
+    g = rng.standard_normal(y.shape)
+    xt = np.asarray(conv_transpose1d(g, w, stride=stride, pad=0, dilation=dilation))
+    assert xt.shape == x.shape  # dilated size map inverts
+    assert np.allclose(np.sum(y * g), np.sum(x * xt))  # the transpose identity
+
+
 def _conv_transpose1d_loss(x, w):
     return np.sum(conv_transpose1d(x, w, stride=2) ** 2)
 
@@ -187,6 +201,17 @@ def test_conv_transpose1d_grad_matches_finite_diff():
     x = rng.standard_normal((1, 3, 4))  # input channels == w's C_out (3)
     w = rng.standard_normal((3, 2, 3))  # (C_out, C_in, k)
     _assert_grads_match(_conv_transpose1d_loss, (x, w))
+
+
+def _conv_transpose1d_dilated_loss(x, w):
+    return np.sum(conv_transpose1d(x, w, stride=2, dilation=2) ** 2)
+
+
+def test_conv_transpose1d_dilated_grad_matches_finite_diff():
+    rng = np.random.default_rng(25)
+    x = rng.standard_normal((1, 3, 4))
+    w = rng.standard_normal((3, 2, 3))
+    _assert_grads_match(_conv_transpose1d_dilated_loss, (x, w))
 
 
 # --- streaming convolutions -------------------------------------------------
@@ -221,13 +246,13 @@ def test_streaming_conv1d_matches_causal(stride, dilation):
     assert np.allclose(streamed, parallel, atol=1e-9)
 
 
-def _stream_conv_transpose1d(x, w, b, stride):
+def _stream_conv_transpose1d(x, w, b, stride, dilation=1):
     state = streaming_conv_transpose1d_init()
     outs, i, j = [], 0, 0
     while i < x.shape[2]:
         c = _CHUNKS[j % len(_CHUNKS)]
         y, state = streaming_conv_transpose1d(
-            x[:, :, i : i + c], w, b, state, stride=stride
+            x[:, :, i : i + c], w, b, state, stride=stride, dilation=dilation
         )
         outs.append(np.asarray(y))
         i, j = i + c, j + 1
@@ -244,6 +269,19 @@ def test_streaming_conv_transpose1d_matches_parallel(stride, use_bias):
     b = rng.standard_normal(3) if use_bias else None
     streamed = _stream_conv_transpose1d(x, w, b, stride)
     parallel = np.asarray(conv_transpose1d(x, w, b, stride=stride))
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dilation", [2, 3])
+def test_streaming_conv_transpose1d_dilation_matches_parallel(stride, dilation):
+    rng = np.random.default_rng(19)
+    x = rng.standard_normal((2, 4, 11))  # (N, C_out, L)
+    w = rng.standard_normal((4, 3, 3))  # (C_out, C_in, k)
+    b = rng.standard_normal(3)
+    streamed = _stream_conv_transpose1d(x, w, b, stride, dilation)
+    parallel = np.asarray(conv_transpose1d(x, w, b, stride=stride, dilation=dilation))
     assert streamed.shape == parallel.shape
     assert np.allclose(streamed, parallel, atol=1e-9)
 
