@@ -875,6 +875,23 @@ def _const_like(arr: Array) -> Var:
     return Var(arr)
 
 
+# A VJP rule reads its primals' shape/ndim/dtype to size the cotangent. Those primals are
+# recorded ``Var``s on the eager higher-order path (read ``.value.*``) but ``GraphTracer``s
+# when ``grad_graph`` differentiates a captured graph (read the aval via ``.shape``/
+# ``.dtype``). These accessors are byte-identical for a ``Var``, so the eager path is
+# unchanged; they just let the same rules also build a backward *graph*.
+def _pshape(p: Boxed) -> "tuple[int, ...]":
+    return p.value.shape if isinstance(p, Var) else tuple(cast(Any, p).shape)
+
+
+def _pndim(p: Boxed) -> int:
+    return p.value.ndim if isinstance(p, Var) else len(cast(Any, p).shape)
+
+
+def _pdtype(p: Boxed) -> "np.dtype":
+    return p.value.dtype if isinstance(p, Var) else cast(Any, p).dtype
+
+
 # Local-derivative helpers for the elementwise-unary VJPs, written with ``_b`` (``bind``)
 # so each tangent rides the enclosing level. ``primal`` is the level-connected operand;
 # ``f'(primal)`` times the upstream cotangent is the operand cotangent.
@@ -1017,21 +1034,21 @@ def _vjp_matmul(
 ) -> list[Boxed]:
     a, b = operands
     pa, pb = primals
-    na, nb = pa.value.ndim, pb.value.ndim
+    na, nb = _pndim(pa), _pndim(pb)
     if na == 1 and nb == 1:  # inner product: g is a scalar
         return [_b(d_mul, g, b), _b(d_mul, g, a)]
     if na == 2 and nb == 1:  # da = outer(g, b); db = a.T @ g
         ga = _b(
             _matmul,
-            _b(d_reshape, g, (pa.value.shape[0], 1)),
-            _b(d_reshape, b, (1, pb.value.shape[0])),
+            _b(d_reshape, g, (_pshape(pa)[0], 1)),
+            _b(d_reshape, b, (1, _pshape(pb)[0])),
         )
         return [ga, _b(_matmul, _b(d_transpose, a), g)]
     if na == 1 and nb == 2:  # da = b @ g ; db = outer(a, g)
         gb = _b(
             _matmul,
-            _b(d_reshape, a, (pa.value.shape[0], 1)),
-            _b(d_reshape, g, (1, pb.value.shape[1])),
+            _b(d_reshape, a, (_pshape(pa)[0], 1)),
+            _b(d_reshape, g, (1, _pshape(pb)[1])),
         )
         return [_b(_matmul, b, g), gb]
     # batched / 2-D @ 2-D: da = g @ bᵀ, db = aᵀ @ g (transposing the last two axes).
@@ -1047,19 +1064,17 @@ def _vjp_einsum(
     # The same reverse-einsum as the eager backward, but built with ``bind``-riding
     # ``d_einsum`` over the level-connected operands so the cotangent graph is itself
     # differentiable (composes with an enclosing jvp/grad).
-    ins, out = _parse_einsum(params["subscripts"], [p.value.ndim for p in primals])
+    ins, out = _parse_einsum(params["subscripts"], [_pndim(p) for p in primals])
     xp = _xp()
     grads: list[Boxed] = []
     for i in range(len(primals)):
         spec, others, missing = _einsum_grad_spec(ins, out, i)
         arrays: list[Boxed] = [g] + [operands[j] for j in others]
         if missing:
-            mshape = tuple(primals[i].value.shape[ins[i].index(c)] for c in missing)
+            mshape = tuple(_pshape(primals[i])[ins[i].index(c)] for c in missing)
             arrays.append(_const_like(xp.ones(mshape)))
         # ``_d_unbroadcast`` sums any size-1 operand axis numpy broadcast up.
-        grads.append(
-            _d_unbroadcast(_b(d_einsum, spec, *arrays), primals[i].value.shape)
-        )
+        grads.append(_d_unbroadcast(_b(d_einsum, spec, *arrays), _pshape(primals[i])))
     return grads
 
 
@@ -1072,7 +1087,7 @@ def _vjp_cumsum(
     # Reverse cumulative sum, built with bind-riding ops (flip = a reversed-slice gather)
     # so it composes with an enclosing jvp/grad.
     axis = params["axis"]
-    ndim = primals[0].value.ndim
+    ndim = _pndim(primals[0])
     ax = axis % ndim
     key = tuple(slice(None, None, -1) if d == ax else slice(None) for d in range(ndim))
     return [_b(d_getitem, _b(d_cumsum, _b(d_getitem, g, key), axis=axis), key)]
@@ -1090,7 +1105,7 @@ def _vjp_getitem(
     # differentiates it too.
     (p,) = primals
     key = params["key"]
-    return [_b(_scatter, g, key, p.value.shape, p.value.dtype)]
+    return [_b(_scatter, g, key, _pshape(p), _pdtype(p))]
 
 
 def _scatter(g: Operand, key: Index, shape: tuple[int, ...], dtype: DTypeLike) -> Var:
@@ -1161,7 +1176,7 @@ def _vjp_sum(
     keepdims = params.get("keepdims", False)
     if axis is not None and not keepdims:
         g = _expand_dims_multi(g, axis)
-    return [_b(d_broadcast_to, g, p.value.shape)]
+    return [_b(d_broadcast_to, g, _pshape(p))]
 
 
 def _vjp_reshape(
@@ -1171,7 +1186,7 @@ def _vjp_reshape(
     g: Boxed,
 ) -> list[Boxed]:
     (p,) = primals
-    return [_b(d_reshape, g, p.value.shape)]
+    return [_b(d_reshape, g, _pshape(p))]
 
 
 def _vjp_broadcast_to(
@@ -1183,7 +1198,7 @@ def _vjp_broadcast_to(
     from pycograd.tensor import _d_unbroadcast
 
     (p,) = primals
-    return [_d_unbroadcast(g, p.value.shape)]
+    return [_d_unbroadcast(g, _pshape(p))]
 
 
 def _vjp_transpose(
@@ -1205,12 +1220,12 @@ def _vjp_concatenate(
     g: Boxed,
 ) -> list[Boxed]:
     axis = params.get("axis", 0)
-    ndim = primals[0].value.ndim
+    ndim = _pndim(primals[0])
     ax = axis % ndim
     out: list[Boxed] = []
     start = 0
     for p in primals:
-        end = start + p.value.shape[ax]
+        end = start + _pshape(p)[ax]
         key = tuple(slice(start, end) if i == ax else slice(None) for i in range(ndim))
         out.append(_b(d_getitem, g, key))
         start = end
@@ -1257,8 +1272,9 @@ def _vjp_where(
     pa, _pb = primals
     cond = params["cond"]
     xp = _xp()
-    cmask = _const_like(xp.asarray(cond).astype(pa.value.dtype))
-    omask = _const_like((~xp.asarray(cond).astype(bool)).astype(pa.value.dtype))
+    pdt = _pdtype(pa)
+    cmask = _const_like(xp.asarray(cond).astype(pdt))
+    omask = _const_like((~xp.asarray(cond).astype(bool)).astype(pdt))
     return [_b(d_mul, g, cmask), _b(d_mul, g, omask)]
 
 
