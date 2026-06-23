@@ -98,6 +98,33 @@ Shape mismatches raise a `ShapeError` that names the op and the operand shapes
 and a shape that genuinely depends on data values (e.g. boolean-mask indexing) is
 reported as such rather than silently mis-sized.
 
+## Gradient checkpointing
+
+The closure-tape keeps *every* intermediate alive until `backward`, so a deep net or a
+long sequence can run out of memory. `checkpoint(f)` wraps a segment so its
+intermediate activations are **dropped on the forward and recomputed in backward** —
+trading ~one extra forward pass for a peak-memory drop from "every segment at once" to
+"one segment at a time". It's a drop-in: wrap the call, gradients are unchanged.
+
+```python
+from pycograd import checkpoint, value_and_grad
+
+def block(x):                      # a chunk of the model
+    h = np.tanh(x @ W1)
+    return np.tanh(h @ W2)
+
+def loss(x):
+    y = checkpoint(block)(x)       # block's activations are rematerialized in backward
+    return np.sum(y * y)
+
+value, (g,) = value_and_grad(loss)(x)   # same gradient as without checkpoint, less memory
+```
+
+Works with positional `grad` / `value_and_grad` and the ambient `weights.grad` training
+loop, over arbitrary pytree outputs, and nests. `f` must be deterministic in its
+inputs/weights (it is re-run to recover the activations). Under a live `jvp`/`vmap`
+checkpoint is transparent (correct gradients, no memory saving in that nested case).
+
 ## Devices / backends
 
 The tape runs on a pluggable **array backend** (NumPy by default). A `device(...)`

@@ -11,6 +11,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pycograd import random
 from pycograd._typing import Operand, Tensor
 from pycograd.backends import activate, device, get_backend
+from pycograd.checkpoint import checkpoint
 from pycograd.compile import compile_to
 from pycograd.data import DataLoader, batches
 from pycograd.dtypes import current_dtype, dtype, resolve_dtype
@@ -185,6 +186,7 @@ __all__ = [
     # transforms / training
     "value_and_grad",
     "grad",
+    "checkpoint",
     "vmap",
     "jvp",
     "jacfwd",

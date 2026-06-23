@@ -120,10 +120,26 @@ it is gated by the foundation.
 
 ### Phase 2 — Depth & memory (correctness at real model sizes)
 
-- **Gradient checkpointing.** Recompute activations in backward instead of
-  retaining the whole tape; the closure-tape keeps *every* intermediate alive
-  until `backward`, so deep nets / long sequences OOM. Crucial: high for scale.
-  Feasibility: medium (known technique, fiddly with the closure design).
+- **Gradient checkpointing.** *Landed* (`pycograd/checkpoint.py`): `checkpoint(f)`
+  wraps a segment so its *intermediate* activations are dropped on the forward and
+  **rematerialized in backward** by re-running `f` -- trading ~one extra forward for a
+  peak-memory drop from "every segment at once" to "one segment at a time". A single
+  **boundary node** stands in for `outputs = f(inputs)`; its value is the flat
+  concatenation of the output leaves and the user-visible outputs are real
+  `slice`+`reshape` views, so the multi-output cotangent join rides the existing
+  VJPs. Backward lifts the saved input/weight values into fresh leaves, re-runs `f`,
+  contracts each output leaf with its cotangent, and scatters the recomputed grads
+  onto the boundary's parents. Works with **positional `grad`/`value_and_grad`** and
+  the **ambient `weights.grad`** path (ambient weights enter by globals and the live
+  binding is gone by backward time, so checkpoint discovers the weight `Var`s a
+  segment touches via a small active-bindings registry and re-binds them for the
+  remat), over **arbitrary pytree** outputs, and **nests**. Under a live `jvp`/`vmap`
+  the inputs are tracers and a `Var` boundary can't be built without dropping the
+  tangent/batch axis, so checkpoint is *transparent* there (correct grads, no memory
+  saving in that nested case); reverse-over-reverse of a checkpointed segment
+  (`grad(grad)` / `jacrev` of its gradient) raises with a pointer to the
+  forward-over-reverse `jacfwd(grad)` Hessian. Constraint: `f` must be deterministic
+  in its inputs+weights (RNG/dropout-in-`f` replay is a follow-up).
 - **Explicit tape lifetime.** Free graphs deterministically; `no_grad` context;
   guard against the tape/`_INSTRUMENTED` caches growing unbounded. Crucial:
   medium. Feasibility: medium.

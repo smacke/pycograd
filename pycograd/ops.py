@@ -1208,6 +1208,30 @@ def _vjp_where(
     return [_b(d_mul, g, cmask), _b(d_mul, g, omask)]
 
 
+def _remat(*operands: Boxed) -> Boxed:
+    """Sentinel primitive marking a ``checkpoint`` boundary node. It is never bound to
+    produce a value (the boundary node is constructed directly by ``pycograd.checkpoint``);
+    it exists only as the ``_vjp_prim`` key under which the differentiable reverse path
+    locates the per-instance rematerialization rule. See :func:`_vjp_remat`."""
+    raise RuntimeError(
+        "_remat is a checkpoint-boundary marker, not a callable primitive"
+    )
+
+
+def _vjp_remat(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    """Differentiable VJP of a ``checkpoint`` boundary: rematerialize the segment's forward
+    on the level-connected ``operands`` and run an inner differentiable backward. The
+    instance-specific logic (the runner, saved inputs, weight snapshot, slice layout) rides
+    ``params["remat"]`` -- a ``pycograd.checkpoint`` box -- so this stays a thin dispatch.
+    """
+    return params["remat"].differentiable_vjp(operands, g)
+
+
 def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
     vjp_for: dict[Prim, Callable[..., list[Boxed]]] = {
         prim: _vjp_unary_for(cast(Callable[..., Var], prim))
@@ -1238,6 +1262,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_maximum: _vjp_select,
             d_minimum: _vjp_select,
             d_where: _vjp_where,
+            _remat: _vjp_remat,
         }
     )
     return vjp_for

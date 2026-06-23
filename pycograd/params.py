@@ -188,6 +188,30 @@ def _any_recording(obj: object) -> bool:
     return False
 
 
+# Ambient models whose weights are bound to ``Var``s for the dynamic extent of a
+# ``ParamDict.grad`` objective (innermost last). Ambient weights enter a forward pass via
+# injected globals, not as positional args, so ``checkpoint`` cannot see them among a
+# segment's arguments. It reads this registry to discover which weight ``Var``s a
+# checkpointed segment touches -- so it can make them boundary parents and re-bind them
+# during the backward rematerialization (the live binding is gone by backward time, see
+# ``grad``'s ``finally``). Empty outside a numpy-backend ``grad`` pass.
+_ACTIVE_BINDINGS: "list[ParamDict]" = []
+
+
+def active_weight_bindings() -> "list[tuple[ParamDict, dict[str, Var]]]":
+    """For each active ambient grad pass (outermost first), its model and the snapshot of
+    ``{key: live_var}`` for every weight currently bound to a ``Var``. ``checkpoint`` keys
+    off the ``Var`` identities to find a segment's weight dependencies and rebinds the whole
+    snapshot during remat (so *tied* keys sharing one ``Var`` rebind consistently)."""
+    out: "list[tuple[ParamDict, dict[str, Var]]]" = []
+    for model in _ACTIVE_BINDINGS:
+        live = getattr(model, "_live", None)
+        if live is None:
+            continue
+        out.append((model, {k: v for k, v in live.items() if isinstance(v, Var)}))
+    return out
+
+
 class Weight:
     """A late-bound proxy for an ambient parameter (injected by ``with weights:``).
 
@@ -456,10 +480,13 @@ class ParamDict(dict):
         self._live = live
         # ``grad_recording`` lets an ambient ``vmap(forward)(X)`` inside ``objective`` keep
         # its output on the tape even though the weights arrive by closure, not as args.
+        # The registry lets a ``checkpoint`` inside ``objective`` discover these weight Vars.
+        _ACTIVE_BINDINGS.append(self)
         try:
             with grad_recording():
                 out = runner()
         finally:
+            _ACTIVE_BINDINGS.pop()
             self._live = prev
         if isinstance(out, Var):
             out.backward()
