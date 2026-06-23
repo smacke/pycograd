@@ -10,6 +10,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from pycograd import random
 from pycograd._typing import Operand, Tensor
+from pycograd.ad_graph import grad_graph, jit
 from pycograd.backends import activate, device, get_backend
 from pycograd.capture import Graph, capture, eval_graph
 from pycograd.checkpoint import checkpoint
@@ -215,6 +216,8 @@ __all__ = [
     "capture",
     "eval_graph",
     "optimize",
+    "grad_graph",
+    "jit",
     "Graph",
     # device / array backend seam (numpy default, cupy for GPU)
     "device",

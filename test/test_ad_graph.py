@@ -7,7 +7,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd import d_sigmoid, ops, value_and_grad  # noqa: E402
+from pycograd import d_sigmoid, jit, ops, value_and_grad  # noqa: E402
 from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import capture, eval_graph  # noqa: E402
 from pycograd.examples import models as M  # noqa: E402
@@ -130,3 +130,36 @@ def test_optimize_preserves_grad_graph_semantics():
     args = (M._init_mlp_tree(_rng(1)),)
     opt = optimize(grad_graph(capture(M.mlp_tree_loss, *args)))
     _grads_match(opt, args, M.mlp_tree_loss)
+
+
+# --- the jit entrypoint -----------------------------------------------------
+def test_jit_forward_matches_eager():
+    args = (M._init_mlp_tree(_rng(1)),)
+    fast = jit(M.mlp_tree_loss)
+    ref = float(_value(M.mlp_tree_loss(*args)))
+    assert np.allclose(float(_value(fast(*args))), ref)
+    assert np.allclose(float(_value(fast(*args))), ref)  # second call (cache reuse)
+
+
+def test_jit_grad_matches_value_and_grad():
+    args = (M._init_mlp_tree(_rng(1)),)
+    val, grads = jit(M.mlp_tree_loss, grad=True)(*args)
+    rval, rgrads = value_and_grad(M.mlp_tree_loss)(*args)
+    assert np.allclose(float(_value(val)), float(_value(rval)))
+    gl = [np.asarray(_value(x)) for arg in grads for x in tree_leaves(arg)]
+    rl = [np.asarray(x) for arg in rgrads for x in tree_leaves(arg)]
+    assert len(gl) == len(rl) and gl
+    for a, b in zip(gl, rl):
+        assert np.allclose(a, b, atol=1e-9)
+
+
+def _dynamic_fn(x):
+    if float(np.sum(x)) > 0.0:  # data-dependent branch -> can't be captured
+        return np.sum(x * x)
+    return np.sum(x)
+
+
+def test_jit_falls_back_to_eager_on_dynamic_control_flow():
+    x = _rng(0).standard_normal((4,))
+    got = jit(_dynamic_fn)(x)
+    assert np.allclose(float(_value(got)), float(_value(_dynamic_fn(x))))

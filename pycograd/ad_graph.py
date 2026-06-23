@@ -32,12 +32,15 @@ from pycograd.capture import (
     GraphTracer,
     Ref,
     _Builder,
+    _is_numeric,
     _rebuild,
+    capture,
+    eval_graph,
 )
 from pycograd.shapes import ShapedArray
-from pycograd.tensor import _d_unbroadcast
+from pycograd.tensor import _d_unbroadcast, _value
 from pycograd.trace import bind, new_main
-from pycograd.tree import tree_flatten
+from pycograd.tree import PyTree, tree_flatten, tree_map, tree_unflatten
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +282,77 @@ def grad_graph(forward: Graph) -> Graph:
     inputs = [nd.id for nd in builder.nodes if nd.prim is _INPUT]
     in_avals = [builder.nodes[i].aval for i in inputs]
     return Graph(builder.nodes, inputs, out_ids, out_treedef, in_avals)
+
+
+# ---------------------------------------------------------------------------
+# jit: the ergonomic graph-mode entrypoint.
+# ---------------------------------------------------------------------------
+def _cache_key(args: tuple) -> tuple:
+    """A key over the inputs' shapes/dtypes (and any non-numeric *static* leaf values,
+    which select the captured graph). Same key => reuse the optimized graph; a new
+    shape re-captures."""
+    key: list = []
+    for a in args:
+        leaves, treedef = tree_flatten(a)
+        key.append(repr(treedef))
+        for leaf in leaves:
+            if _is_numeric(leaf):
+                arr = np.asarray(cast(Any, leaf))
+                key.append((tuple(arr.shape), str(arr.dtype)))
+            else:  # a bool flag / None / string baked into the graph
+                key.append(("static", repr(leaf)))
+    return tuple(key)
+
+
+def _regroup_grads(flat: list, args: tuple) -> tuple:
+    """Reshape ``grad_graph``'s flat per-leaf grads back into per-arg pytrees matching
+    the inputs (``None`` for any non-numeric, non-differentiated leaf), so the output
+    mirrors ``value_and_grad``."""
+    it = iter(flat)
+    out = []
+    for a in args:
+        leaves, treedef = tree_flatten(a)
+        rebuilt = [next(it) if _is_numeric(leaf) else None for leaf in leaves]
+        out.append(tree_unflatten(treedef, rebuilt))
+    return tuple(out)
+
+
+def jit(f: Callable[..., PyTree], grad: bool = False) -> Callable[..., PyTree]:
+    """Graph-mode wrapper: capture ``f`` once per input shape/dtype, optimize the graph,
+    cache it, and replay on later calls -- so the optimization passes (CSE/DCE/fusion)
+    amortize over a training/inference loop. Falls back to eager if ``f`` can't be traced
+    (e.g. data-dependent control flow).
+
+    ``grad=False`` returns ``f``'s output. ``grad=True`` returns ``(value, grads)`` like
+    :func:`value_and_grad`, but computed from a single *optimized forward+backward* graph
+    (via :func:`grad_graph`) -- the gradient comes from the graph's backward nodes, with
+    cross-pass CSE applied, and no eager ``.backward()`` pass.
+    """
+    cache: dict[tuple, Graph] = {}
+
+    def _eager(args: tuple) -> PyTree:
+        if not grad:
+            return f(*args)
+        from pycograd.transforms import value_and_grad
+
+        return value_and_grad(f)(*args)
+
+    def run(*args: PyTree) -> PyTree:
+        key = _cache_key(args)
+        graph = cache.get(key)
+        if graph is None:
+            try:
+                from pycograd.passes import optimize
+
+                fwd = capture(f, *args)
+                graph = optimize(grad_graph(fwd) if grad else fwd)
+            except Exception:
+                return _eager(args)  # untraceable (dynamic control flow) -> eager
+            cache[key] = graph
+        out = tree_map(_value, eval_graph(graph, *args))
+        if grad:
+            value, flat = cast("tuple[Any, Any]", out)
+            return value, _regroup_grads(list(flat), args)
+        return out
+
+    return run
