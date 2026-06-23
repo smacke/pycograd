@@ -815,6 +815,13 @@ _INTERCEPT: dict[Prim, Prim] = {fn: impl for impl, fns in _RULES.items() for fn 
 # forward-over-reverse Hessians). ``Var.backward`` takes this path only when a higher trace
 # level is live; the base level keeps its raw ``.grad`` closures untouched.
 #
+# So each VJP is effectively spelled twice -- the raw ``.grad`` closure on ``_unary`` /
+# ``_binary`` (the fast base path) and the ``bind``-riding rule here. This duplication is
+# deliberate: collapsing the base path onto this differentiable one (always routing through
+# ``bind``) was benchmarked ~2x slower on the backward pass, since it builds tape nodes for
+# cotangents even when no second-order pass needs them. The two are kept in parity by the
+# finite-diff / higher-order tests rather than by sharing one implementation.
+#
 # Non-smooth primitives (max/min/abs/where/clip) compute a selection mask from the
 # *primals* and treat it as a CONSTANT (the ``forward.py`` convention), giving the correct
 # a.e. zero second derivative through the kink.
