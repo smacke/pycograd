@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence, cast
 import numpy as np
 
 from pycograd._typing import Boxed
-from pycograd.tensor import Var, _unbroadcast, _xp, grad_recording
+from pycograd.tensor import Var, _accumulate, _unbroadcast, _xp, grad_recording
 from pycograd.tree import Leaf, PyTree, TreeDef, tree_flatten, tree_unflatten
 
 if TYPE_CHECKING:
@@ -170,10 +170,12 @@ class _Remat:
         s.backward()
 
         for real, fresh in zip(self.input_vars, fresh_inputs):
-            real.grad = real.grad + _unbroadcast(fresh.grad, real.value.shape)
+            real.grad = _accumulate(
+                real.grad, _unbroadcast(fresh.grad, real.value.shape)
+            )
         for orig in self.used_weight_vars:
             fv = cast(Var, fresh_weight_for[id(orig)])
-            orig.grad = orig.grad + _unbroadcast(fv.grad, orig.value.shape)
+            orig.grad = _accumulate(orig.grad, _unbroadcast(fv.grad, orig.value.shape))
 
     # -- differentiable path (higher-order reverse) --------------------------
     def differentiable_vjp(self, operands: tuple[Boxed, ...], g: Boxed) -> list[Boxed]:

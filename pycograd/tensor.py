@@ -91,6 +91,22 @@ def _unbroadcast(
     return grad.reshape(out_shape)
 
 
+def _accumulate(acc: Array, delta: Array) -> Array:
+    """Accumulate a cotangent contribution into a ``.grad`` buffer.
+
+    In place when the shapes match -- the overwhelmingly common case -- so the reverse
+    pass reuses each buffer instead of allocating a fresh sum array per contribution.
+    Falls back to an out-of-place add when ``delta`` is *larger*: the ``vmap(grad)``
+    per-sample path has ``_unbroadcast`` keep a leading per-example axis (``keep_axes``),
+    so the contribution outgrows the unbatched accumulator and must broadcast-grow it.
+    The right-hand side is always derived from a *child*'s ``.grad`` (never the
+    accumulator itself), so the in-place add can never alias its own input."""
+    if acc.shape == delta.shape:
+        acc += delta
+        return acc
+    return acc + delta
+
+
 def _logical_shape(x: Boxed) -> tuple[int, ...]:
     """The shape of a cotangent that may be a ``Var`` (``.value.shape``) or a level
     tracer (``.shape``)."""
@@ -223,8 +239,12 @@ class Var:
         out = Var(value, _parents=(self,))
 
         def _backward() -> None:
-            self.grad = self.grad + _unbroadcast(
-                grad_fn(self.value, out.grad), self.value.shape
+            # Accumulate in place (base/raw path) via ``_accumulate``: ``self.grad`` is
+            # a private accumulator the driver pre-zeros for every topo node, summed in
+            # reverse order before any parent reads it. The differentiable path
+            # (``_backward_differentiable``) is separate and untouched.
+            self.grad = _accumulate(
+                self.grad, _unbroadcast(grad_fn(self.value, out.grad), self.value.shape)
             )
 
         out._backward = _backward
@@ -244,8 +264,11 @@ class Var:
 
         def _backward() -> None:
             ga, gb = grad_fn(self.value, other.value, out.grad)
-            self.grad = self.grad + _unbroadcast(ga, self.value.shape)
-            other.grad = other.grad + _unbroadcast(gb, other.value.shape)
+            # Accumulate in place on the base path (see ``_unary``). ``self`` and
+            # ``other`` may be the same node (``x + x``); accumulating twice still sums
+            # correctly, and neither rhs aliases the accumulator.
+            self.grad = _accumulate(self.grad, _unbroadcast(ga, self.value.shape))
+            other.grad = _accumulate(other.grad, _unbroadcast(gb, other.value.shape))
 
         out._backward = _backward
         if prim is not None:
@@ -368,7 +391,7 @@ class Var:
             grad = _xp().zeros_like(self.value)
             # scatter-add (np.add.at / cupyx.scatter_add) handles repeated indices
             current_backend().scatter_add(grad, key, out.grad)
-            self.grad = self.grad + grad
+            self.grad = _accumulate(self.grad, grad)
 
         out._backward = _backward
         from pycograd import ops

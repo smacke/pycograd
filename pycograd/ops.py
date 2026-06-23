@@ -36,6 +36,7 @@ from pycograd._typing import (
 from pycograd.backends import current_backend
 from pycograd.tensor import (
     Var,
+    _accumulate,
     _d_unbroadcast,
     _lift,
     _record_vjp,
@@ -154,8 +155,8 @@ def _elementwise_max(
 
     def _backward() -> None:
         mask = (a.value == out.value).astype(float)
-        a.grad = a.grad + _unbroadcast(out.grad * mask, a.value.shape)
-        b.grad = b.grad + _unbroadcast(out.grad * (1 - mask), b.value.shape)
+        a.grad = _accumulate(a.grad, _unbroadcast(out.grad * mask, a.value.shape))
+        b.grad = _accumulate(b.grad, _unbroadcast(out.grad * (1 - mask), b.value.shape))
 
     out._backward = _backward
     _record_vjp(out, prim, (a, b), {"out_value": out.value})
@@ -187,8 +188,12 @@ def d_where(cond: Array, a: Operand, b: Operand) -> Var:
     out = Var(xp.where(cond, a.value, b.value), _parents=(a, b))
 
     def _backward() -> None:
-        a.grad = a.grad + _unbroadcast(xp.where(cond, out.grad, 0.0), a.value.shape)
-        b.grad = b.grad + _unbroadcast(xp.where(cond, 0.0, out.grad), b.value.shape)
+        a.grad = _accumulate(
+            a.grad, _unbroadcast(xp.where(cond, out.grad, 0.0), a.value.shape)
+        )
+        b.grad = _accumulate(
+            b.grad, _unbroadcast(xp.where(cond, 0.0, out.grad), b.value.shape)
+        )
 
     out._backward = _backward
     _record_vjp(out, d_where, (a, b), {"cond": cond})
@@ -285,8 +290,8 @@ def _matmul(a: Operand, b: Operand) -> Var:
 
     def _backward() -> None:
         da, db = _matmul_grads(a.value, b.value, out.grad)
-        a.grad = a.grad + _unbroadcast(da, a.value.shape)
-        b.grad = b.grad + _unbroadcast(db, b.value.shape)
+        a.grad = _accumulate(a.grad, _unbroadcast(da, a.value.shape))
+        b.grad = _accumulate(b.grad, _unbroadcast(db, b.value.shape))
 
     out._backward = _backward
     _record_vjp(out, _matmul, (a, b))
@@ -435,7 +440,9 @@ def d_einsum(subscripts: str, *operands: Operand) -> Var:
                 mshape = tuple(op.value.shape[ins[i].index(c)] for c in missing)
                 arrays.append(xp.ones(mshape, dtype=node.grad.dtype))
             # ``_unbroadcast`` sums any size-1 operand axis that numpy broadcast up.
-            op.grad = op.grad + _unbroadcast(xp.einsum(spec, *arrays), op.value.shape)
+            op.grad = _accumulate(
+                op.grad, _unbroadcast(xp.einsum(spec, *arrays), op.value.shape)
+            )
 
     node._backward = _backward
     _record_vjp(node, d_einsum, tuple(lifted), {"subscripts": subscripts})
@@ -461,8 +468,8 @@ def d_cumsum(x: Operand, axis: int | None = None) -> Var:
 
     def _backward() -> None:
         g = out.grad
-        x.grad = x.grad + xp.flip(
-            xp.cumsum(xp.flip(g, axis=axis), axis=axis), axis=axis
+        x.grad = _accumulate(
+            x.grad, xp.flip(xp.cumsum(xp.flip(g, axis=axis), axis=axis), axis=axis)
         )
 
     out._backward = _backward
@@ -481,7 +488,7 @@ def d_sum(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
         g = out.grad
         if axis is not None and not keepdims:
             g = xp.expand_dims(g, axis)
-        x.grad = x.grad + xp.broadcast_to(g, x.value.shape)
+        x.grad = _accumulate(x.grad, xp.broadcast_to(g, x.value.shape))
 
     out._backward = _backward
     _record_vjp(out, d_sum, (x,), {"axis": axis, "keepdims": keepdims})
@@ -548,7 +555,7 @@ def _reduce_select(
             g = xp.expand_dims(g, axis)
         mask = (x.value == kept).astype(float)
         mask /= mask.sum(axis=axis, keepdims=True)
-        x.grad = x.grad + mask * g
+        x.grad = _accumulate(x.grad, mask * g)
 
     out._backward = _backward
     _record_vjp(
@@ -589,7 +596,7 @@ def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
         # split itself slices the device-resident gradient and uses the active module.
         splits = np.cumsum([p.value.shape[axis] for p in parts])[:-1]
         for part, gpart in zip(parts, xp.split(out.grad, splits.tolist(), axis=axis)):
-            part.grad = part.grad + gpart
+            part.grad = _accumulate(part.grad, gpart)
 
     out._backward = _backward
     _record_vjp(out, d_concatenate, tuple(parts), {"axis": axis})
@@ -602,10 +609,12 @@ def d_transpose(x: Operand, axes: tuple[int, ...] | None = None) -> Var:
 
     def _backward() -> None:
         if axes is None:
-            x.grad = x.grad + xp.transpose(out.grad)
+            x.grad = _accumulate(x.grad, xp.transpose(out.grad))
         else:
             # np.argsort over the (host-side) axes tuple; the transpose runs on device.
-            x.grad = x.grad + xp.transpose(out.grad, tuple(np.argsort(axes)))
+            x.grad = _accumulate(
+                x.grad, xp.transpose(out.grad, tuple(np.argsort(axes)))
+            )
 
     out._backward = _backward
     _record_vjp(out, d_transpose, (x,), {"axes": axes})
@@ -627,7 +636,7 @@ def d_reshape(x: Operand, *shape: Shape) -> Var:
     out = Var(primal, _parents=(x,))
 
     def _backward() -> None:
-        x.grad = x.grad + out.grad.reshape(x.value.shape)
+        x.grad = _accumulate(x.grad, out.grad.reshape(x.value.shape))
 
     out._backward = _backward
     _record_vjp(out, d_reshape, (x,))
@@ -648,7 +657,7 @@ def d_broadcast_to(x: Operand, shape: Shape) -> Var:
     out = Var(xp.broadcast_to(x.value, target), _parents=(x,))
 
     def _backward() -> None:
-        x.grad = x.grad + _unbroadcast(out.grad, x.value.shape)
+        x.grad = _accumulate(x.grad, _unbroadcast(out.grad, x.value.shape))
 
     out._backward = _backward
     _record_vjp(out, d_broadcast_to, (x,))
@@ -1054,7 +1063,9 @@ def _scatter(g: Operand, key: Index, shape: tuple[int, ...], dtype: DTypeLike) -
     out = Var(buf, _parents=(g,))
 
     def _backward() -> None:
-        g.grad = g.grad + out.grad[cast(Index, key)]  # gather cotangent at scatter key
+        g.grad = _accumulate(
+            g.grad, out.grad[cast(Index, key)]
+        )  # gather at scatter key
 
     out._backward = _backward
     _record_vjp(out, _scatter, (g,), {"key": key})
