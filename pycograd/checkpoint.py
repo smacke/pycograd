@@ -197,19 +197,90 @@ def _flatten_args(args: tuple[PyTree, ...]) -> tuple[list[Leaf], TreeDef]:
     return tree_flatten(list(args))
 
 
+def _checkpoint_under_vmap(
+    runner: Callable[..., PyTree], in_leaves: list[Leaf], in_treedef: TreeDef
+) -> PyTree:
+    """Lower a live ``vmap`` into the checkpoint: ``vmap(checkpoint(f)) == checkpoint(vmap(f))``.
+
+    Each batched input is *physicalized* (batch axis moved to front, yielding a level-down
+    value); the segment is rebuilt as ``vmap(g)`` (``g`` just unflattens and calls the
+    instrumented ``runner``) and run through the ordinary ``checkpoint`` pipeline on those
+    physical values -- so the boundary is built one level down (the batched activations are
+    dropped and rematerialized in backward). The batched outputs are re-wrapped as
+    ``BatchTracer``s at the outer level. Nesting (``vmap(vmap(checkpoint))``) falls out:
+    a physicalized operand may itself be a lower ``BatchTracer``, re-entering this path.
+    """
+    from pycograd.batching import BatchTrace, BatchTracer, _move_bdim_to_front
+    from pycograd.transforms import vmap
+
+    trace = cast(
+        "BatchTrace",
+        next(
+            cast(BatchTracer, leaf)._trace
+            for leaf in in_leaves
+            if isinstance(leaf, BatchTracer)
+        ),
+    )
+    physical: list[PyTree] = []
+    axes: list[int | None] = []
+    for leaf in in_leaves:
+        if isinstance(leaf, BatchTracer) and leaf.bdim is not None:
+            physical.append(cast(PyTree, _move_bdim_to_front(leaf)))
+            axes.append(0)
+        elif isinstance(leaf, BatchTracer):
+            physical.append(cast(PyTree, leaf.value))  # shared at this level
+            axes.append(None)
+        else:
+            physical.append(cast(PyTree, leaf))
+            axes.append(None)
+
+    def g(*flat_leaves: PyTree) -> PyTree:
+        leaves = cast("list[Leaf]", list(flat_leaves))
+        call_args = cast("list[PyTree]", tree_unflatten(in_treedef, leaves))
+        return runner(*call_args)
+
+    # Run ``g`` directly (don't instrument it): it only unflattens and calls the already
+    # instrumented ``runner``, and instrumentation would drop its closure (``runner`` /
+    # ``in_treedef``). ``vmap`` then maps it, and ``checkpoint`` builds the boundary below.
+    g._pycograd_run_directly = True  # type: ignore[attr-defined]
+    vg = vmap(g, in_axes=tuple(axes))
+    result = checkpoint(vg)(*physical)
+
+    out_leaves, out_treedef = tree_flatten(result)
+    rewrapped = [
+        (
+            cast(Leaf, BatchTracer(trace, leaf, 0))
+            if isinstance(leaf, (Var, BatchTracer))
+            else leaf
+        )
+        for leaf in out_leaves
+    ]
+    return tree_unflatten(out_treedef, rewrapped)
+
+
 def _checkpoint_call(
     f: Callable[..., PyTree],
     runner: Callable[..., PyTree],
     args: tuple[PyTree, ...],
 ) -> PyTree:
     in_leaves, in_treedef = _flatten_args(args)
+    from pycograd.batching import BatchTracer
     from pycograd.params import active_weight_bindings
     from pycograd.trace import Tracer
 
-    # A live ``jvp``/``vmap`` presents the segment's inputs as *Tracers*. A plain-``Var``
-    # rematerialization boundary cannot be built at that level (it would drop the batch /
-    # tangent axis), so checkpoint is *transparent* there: run the segment instrumented at
-    # the live level so it differentiates correctly (no memory saving in that nested case).
+    # A live ``vmap`` presents (some) inputs as ``BatchTracer``s. We get genuine memory
+    # savings via the identity ``vmap(checkpoint(f)) == checkpoint(vmap(f))``: lower the
+    # batch into the checkpoint -- build the boundary one level down over the *physical*
+    # (batch-at-front) operands and re-wrap the batched outputs (see ``_checkpoint_under_vmap``).
+    if any(
+        isinstance(leaf, BatchTracer) and leaf.bdim is not None for leaf in in_leaves
+    ):
+        return _checkpoint_under_vmap(runner, in_leaves, in_treedef)
+    # A live ``jvp`` (or ``eval_shape``, or a ``vmap`` under which this segment is entirely
+    # batch-independent) presents the inputs as other ``Tracer``s. A plain-``Var`` boundary
+    # cannot be built at the tangent level without dropping the tangent axis, so checkpoint
+    # is *transparent* there: run the segment instrumented at the live level so it
+    # differentiates correctly (no memory saving in that nested case).
     if any(isinstance(leaf, Tracer) for leaf in in_leaves):
         return runner(*args)
 
@@ -318,14 +389,17 @@ def checkpoint(f: Callable[..., PyTree]) -> Callable[..., PyTree]:
     Gradients match those of the un-checkpointed ``f`` (verified against finite differences);
     only peak memory differs. ``f`` must be deterministic in its inputs+weights.
 
-    Composition. The rematerialization boundary is built under a single reverse pass --
-    ``grad`` / ``value_and_grad`` / ``weights.grad`` -- which is where the memory saving
-    applies. Under a live ``jvp`` or ``vmap`` (e.g. ``jvp(grad(f))`` HVPs, ``vmap(f)``)
-    checkpoint is *transparent*: it passes through and differentiates correctly, but does
-    not save memory in that nested case (a boundary can't be built at the tracer level
-    without dropping the tangent/batch axis). Reverse-over-reverse differentiation of a
-    checkpointed segment (``grad(grad(...))`` / ``jacrev`` of its gradient) is unsupported
-    and raises; use the forward-over-reverse route (``jacfwd(grad(f))``) for a Hessian.
+    Composition. The rematerialization boundary is built under a single reverse pass
+    (``grad`` / ``value_and_grad`` / ``weights.grad``) and under a live ``vmap`` -- both
+    save memory. Under ``vmap`` checkpoint lowers the batch into the boundary
+    (``vmap(checkpoint(f)) == checkpoint(vmap(f))``), so ``grad(vmap(checkpoint(f)))`` and
+    the per-sample ``vmap(grad(checkpoint(f)))`` rematerialize the batched activations;
+    nested ``vmap`` composes too. Under a live ``jvp`` (e.g. ``jvp(grad(f))`` HVPs)
+    checkpoint is *transparent*: it differentiates correctly but does not save memory in
+    that case (a boundary can't be built at the tangent level without dropping the tangent
+    axis). Reverse-over-reverse differentiation of a checkpointed segment
+    (``grad(grad(...))`` / ``jacrev`` of its gradient) is unsupported and raises; use the
+    forward-over-reverse route (``jacfwd(grad(f))``) for a Hessian.
     """
     from pycograd.tracer import _INSTRUMENTED, _make_runner
 

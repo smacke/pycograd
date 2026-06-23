@@ -198,10 +198,17 @@ def test_checkpoint_hessian_jacfwd_of_grad():
     assert np.allclose(H_p, H_c, atol=1e-10)
 
 
-# --- transparency under vmap ------------------------------------------------
-# Same story for vmap: inputs are BatchTracers, checkpoint passes through, gradients
-# (full-batch and per-sample) must match the un-checkpointed function.
+# --- genuine memory savings under vmap --------------------------------------
+# Under a live vmap, checkpoint lowers the batch into the boundary
+# (vmap(checkpoint(f)) == checkpoint(vmap(f))) so the batched activations are dropped and
+# rematerialized. The call-counter asserts the segment runs TWICE (capture + remat) -- the
+# observable proxy that a boundary was built and memory was actually saved (not passed
+# through) -- while gradients (full-batch and per-sample) match the un-checkpointed function.
+_VM_CALLS = {"n": 0}
+
+
 def vm_seg(x):
+    _VM_CALLS["n"] += 1
     return np.tanh(x @ Wv)  # noqa: F821
 
 
@@ -226,8 +233,10 @@ def test_checkpoint_inside_vmap_then_grad():
     Wv = rng.standard_normal((4, 4))
     X = rng.standard_normal((6, 4))
     _, g_p = value_and_grad(_grad_of_vmap_plain)(X)
+    _VM_CALLS["n"] = 0
     _, g_c = value_and_grad(_grad_of_vmap_ckpt)(X)
     assert np.allclose(g_p[0], g_c[0], atol=1e-10)
+    assert _VM_CALLS["n"] == 2  # capture + backward remat: the boundary was built
 
 
 def test_checkpoint_per_sample_vmap_of_grad():
@@ -235,9 +244,80 @@ def test_checkpoint_per_sample_vmap_of_grad():
     Wv = rng.standard_normal((4, 4))
     X = rng.standard_normal((6, 4))
     G_p = np.asarray(vmap(grad(vm_f))(X)[0])
+    _VM_CALLS["n"] = 0
     G_c = np.asarray(vmap(grad(vm_f_ckpt))(X)[0])
     assert G_c.shape == (6, 4)
     assert np.allclose(G_p, G_c, atol=1e-10)
+    assert _VM_CALLS["n"] == 2  # rematerialized under the per-sample path too
+
+
+def _shared_block(x, W):
+    return np.tanh(x @ W)
+
+
+def _shared_f(x, W):
+    return np.sum(_shared_block(x, W) ** 2)
+
+
+def _shared_f_ckpt(x, W):
+    return np.sum(checkpoint(_shared_block)(x, W) ** 2)
+
+
+def test_checkpoint_vmap_grad_shared_param():
+    # Per-sample gradient w.r.t. a *shared* parameter (in_axes=(0, None)): the param is
+    # tiled to a genuine batched operand, and checkpoint must keep the per-sample (B,*) axis.
+    X = rng.standard_normal((5, 4))
+    W = rng.standard_normal((4, 3))
+    gp = vmap(grad(_shared_f), in_axes=(0, None))(X, W)
+    gc = vmap(grad(_shared_f_ckpt), in_axes=(0, None))(X, W)
+    assert np.asarray(gc[1]).shape == (5, 4, 3)
+    assert np.allclose(np.asarray(gp[0]), np.asarray(gc[0]), atol=1e-10)
+    assert np.allclose(np.asarray(gp[1]), np.asarray(gc[1]), atol=1e-10)
+
+
+def _amb_vm_block(x):
+    return np.tanh(x @ w1) @ w2  # noqa: F821 -- ambient weights
+
+
+def _amb_vm_plain():
+    return np.sum(vmap(lambda x: np.sum(_amb_vm_block(x) ** 2))(Xvm))  # noqa: F821
+
+
+def _amb_vm_ckpt():
+    return np.sum(
+        vmap(lambda x: np.sum(checkpoint(_amb_vm_block)(x) ** 2))(Xvm)
+    )  # noqa: F821
+
+
+def test_checkpoint_grad_vmap_ambient_weights():
+    # grad(vmap(checkpoint)) with ambient weights.grad: weight grads (summed over the batch)
+    # must match the un-checkpointed function and actually flow through the remat.
+    global Xvm
+    Xvm = rng.standard_normal((6, 4))
+    model = params(w1=rng.standard_normal((4, 5)), w2=rng.standard_normal((5, 3)))
+    with model:
+        _, g_p = model.grad(_amb_vm_plain)
+        _, g_c = model.grad(_amb_vm_ckpt)
+    for k in ("w1", "w2"):
+        assert np.any(g_c[k] != 0)
+        assert np.allclose(g_p[k], g_c[k], atol=1e-10)
+
+
+def _nested_plain(Xb):
+    return np.sum(vmap(vmap(vm_f))(Xb))
+
+
+def _nested_ckpt(Xb):
+    return np.sum(vmap(vmap(vm_f_ckpt))(Xb))
+
+
+def test_checkpoint_nested_vmap():
+    global Wv
+    Wv = rng.standard_normal((4, 4))
+    X = rng.standard_normal((3, 6, 4))
+    _, g_p = value_and_grad(_nested_plain)(X)
+    _, g_c = value_and_grad(_nested_ckpt)(X)
+    assert np.allclose(g_p[0], g_c[0], atol=1e-10)
 
 
 # --- unsupported corner fails clearly ---------------------------------------

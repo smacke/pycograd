@@ -122,8 +122,11 @@ value, (g,) = value_and_grad(loss)(x)   # same gradient as without checkpoint, l
 
 Works with positional `grad` / `value_and_grad` and the ambient `weights.grad` training
 loop, over arbitrary pytree outputs, and nests. `f` must be deterministic in its
-inputs/weights (it is re-run to recover the activations). Under a live `jvp`/`vmap`
-checkpoint is transparent (correct gradients, no memory saving in that nested case).
+inputs/weights (it is re-run to recover the activations). It also saves memory **under
+`vmap`** — `vmap(checkpoint(f))` lowers the batch into the boundary
+(`vmap(checkpoint(f)) == checkpoint(vmap(f))`), so `grad(vmap(checkpoint(f)))` and the
+per-sample `vmap(grad(checkpoint(f)))` rematerialize the batched activations. Under a live
+`jvp` checkpoint is transparent (correct gradients, no memory saving in that case).
 
 ## Devices / backends
 

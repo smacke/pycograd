@@ -133,13 +133,19 @@ it is gated by the foundation.
   the **ambient `weights.grad`** path (ambient weights enter by globals and the live
   binding is gone by backward time, so checkpoint discovers the weight `Var`s a
   segment touches via a small active-bindings registry and re-binds them for the
-  remat), over **arbitrary pytree** outputs, and **nests**. Under a live `jvp`/`vmap`
-  the inputs are tracers and a `Var` boundary can't be built without dropping the
-  tangent/batch axis, so checkpoint is *transparent* there (correct grads, no memory
-  saving in that nested case); reverse-over-reverse of a checkpointed segment
-  (`grad(grad)` / `jacrev` of its gradient) raises with a pointer to the
-  forward-over-reverse `jacfwd(grad)` Hessian. Constraint: `f` must be deterministic
-  in its inputs+weights (RNG/dropout-in-`f` replay is a follow-up).
+  remat), over **arbitrary pytree** outputs, and **nests**. It also saves memory
+  **under `vmap`**: checkpoint lowers the batch into the boundary
+  (`vmap(checkpoint(f)) == checkpoint(vmap(f))` — physicalize the batched inputs, build
+  the boundary one level down, re-wrap the batched outputs), so
+  `grad(vmap(checkpoint(f)))`, the per-sample `vmap(grad(checkpoint(f)))` (including
+  per-sample gradients of a shared param), and nested `vmap(vmap(...))` all
+  rematerialize the batched activations. Under a live `jvp` the inputs are tangent
+  tracers and a `Var` boundary can't be built without dropping the tangent axis, so
+  checkpoint is *transparent* there (correct grads, no memory saving in that case);
+  reverse-over-reverse of a checkpointed segment (`grad(grad)` / `jacrev` of its
+  gradient) raises with a pointer to the forward-over-reverse `jacfwd(grad)` Hessian.
+  Constraint: `f` must be deterministic in its inputs+weights (RNG/dropout-in-`f`
+  replay is a follow-up).
 - **Explicit tape lifetime.** Free graphs deterministically; `no_grad` context;
   guard against the tape/`_INSTRUMENTED` caches growing unbounded. Crucial:
   medium. Feasibility: medium.
