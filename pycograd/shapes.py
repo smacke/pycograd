@@ -42,8 +42,8 @@ from pycograd._typing import (
     Prim,
     Shape,
 )
-from pycograd.params import Param, _TieRef
-from pycograd.tensor import Var, _is_numeric
+from pycograd.params import Param, Weight, _TieRef
+from pycograd.tensor import Var, _is_numeric, _value
 from pycograd.trace import MainTrace, Trace, Tracer, new_main
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
 
@@ -400,6 +400,10 @@ def _aval(x: AbstractVal) -> ShapedArray:
         return x
     if isinstance(x, ShapeDtypeStruct):
         return ShapedArray(x.shape, x.dtype)
+    if isinstance(x, Weight):
+        x = _value(
+            x
+        )  # an ambient-parameter proxy -> its live array/Var (sizes like Param)
     if isinstance(x, Var):
         return ShapedArray(x.value.shape, x.value.dtype)
     if isinstance(x, Param):

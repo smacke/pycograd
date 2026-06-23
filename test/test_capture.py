@@ -15,6 +15,7 @@ from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import (  # noqa: E402
     _CONST,
     _INPUT,
+    Const,
     Graph,
     Node,
     Ref,
@@ -82,6 +83,35 @@ def test_capture_grad_roundtrip(cid, loss, argf):
     assert lr and len(lr) == len(lf)
     for a, b in zip(lr, lf):
         assert np.allclose(a, b, atol=1e-9)
+
+
+# An ambient-DSL forward reading weights injected by `with weights:` -- module-level so the
+# instrumented capture runner (recompiled from source) sees them as globals.
+def _dsl_weight_forward(x):
+    return np.sum(np.tanh(x @ cew + ceb))  # noqa: F821  (ambient weights)
+
+
+def test_capture_composes_with_ambient_weights():
+    from pycograd.params import Weight, params
+
+    weights = params(cew=_rng(2).standard_normal((3, 2)), ceb=np.zeros(2))
+    X = _rng(1).standard_normal((4, 3))
+    with weights:
+        g = capture(_dsl_weight_forward, X)
+        ref = _dsl_weight_forward(
+            X
+        )  # eager reference (ambient weights resolve to numpy)
+
+    # The weights are sized by their real shapes, not () -- so x @ cew is (4, 3) @ (3, 2).
+    assert any(nd.prim is ops._matmul and nd.aval.shape == (4, 2) for nd in g.nodes)
+    # ...and captured as concrete-array constants (a snapshot), not live Weight proxies.
+    const_vals = [a.value for nd in g.nodes for a in nd.args if isinstance(a, Const)]
+    assert any(
+        getattr(c, "shape", None) == (3, 2) for c in const_vals
+    )  # cew, snapshotted
+    assert not any(isinstance(c, Weight) for c in const_vals)
+    # Because it's a snapshot, the graph evaluates OUTSIDE the `with` block and matches eager.
+    assert np.allclose(float(_value(eval_graph(g, X))), float(_value(ref)), atol=1e-9)
 
 
 def test_graph_pretty_listing():

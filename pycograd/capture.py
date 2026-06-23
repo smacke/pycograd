@@ -22,8 +22,9 @@ from typing import Any, Callable, Iterator, Sequence, cast
 import numpy as np
 
 from pycograd._typing import BindArg, Boxed, Prim
+from pycograd.params import Param, Weight
 from pycograd.shapes import _ABS_FOR, ShapedArray, ShapeDtypeStruct, _aval
-from pycograd.tensor import Var
+from pycograd.tensor import Var, _value
 from pycograd.trace import Trace, Tracer, bind, new_main
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
 
@@ -120,6 +121,23 @@ class Graph:
                 "or use Graph.to_dot() to get DOT source and render it yourself."
             ) from e
         return graphviz.Source(self.to_dot())
+
+    def _repr_mimebundle_(
+        self, include: Any = None, exclude: Any = None
+    ) -> "dict[str, Any]":  # pragma: no cover - notebook display
+        """Rich display for Jupyter: a bare ``graph`` in a cell auto-renders to SVG when
+        ``graphviz`` (the package *and* the ``dot`` binary) is available, and always
+        offers the pretty text listing -- so it degrades gracefully to the listing when
+        graphviz is not installed. (``repr`` stays the one-line summary regardless.)"""
+        bundle: dict[str, Any] = {"text/plain": self.pretty()}
+        try:
+            import graphviz
+
+            svg = graphviz.Source(self.to_dot()).pipe(format="svg").decode("utf-8")
+            bundle["image/svg+xml"] = svg
+        except Exception:
+            pass  # no graphviz package / no ``dot`` on PATH -> text listing only
+        return bundle
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +329,19 @@ def _arg_aval(a: BindArg) -> object:
     return a
 
 
+def _snapshot(a: BindArg) -> Any:
+    """The concrete value to store for a captured constant. Resolves an ambient-parameter
+    proxy (:class:`~pycograd.params.Weight`) or :class:`~pycograd.params.Param` to its live
+    array, and a base ``Var`` to its value -- so the graph is a *snapshot* decoupled from
+    any live ``with weights:`` binding (it stays valid, and renders, after the block exits).
+    """
+    if isinstance(a, Param):
+        a = a.value
+    elif isinstance(a, Weight):
+        a = _value(a)
+    return a.value if isinstance(a, Var) else a
+
+
 class GraphTrace(Trace):
     """Records each primitive as a :class:`Node` and sizes it with the abstract rules,
     mirroring ``AbstractTrace`` (the recording is the only addition)."""
@@ -324,13 +355,14 @@ class GraphTrace(Trace):
             return Ref(a.id)
         if isinstance(a, (list, tuple)):
             return type(a)(self._spec(e) for e in a)
-        return Const(a)
+        return Const(_snapshot(a))
 
     def pure(self, val: Boxed) -> GraphTracer:
         # A constant raised into the level -- record a const node. (Rarely hit: most
         # constants reach ``process_primitive`` as raw args and inline as ``Const``.)
-        av = _aval(cast(Any, val))
-        nid = self._builder.add(_CONST, (), {"value": val}, av)
+        value = _snapshot(val)
+        av = _aval(cast(Any, value))
+        nid = self._builder.add(_CONST, (), {"value": value}, av)
         return GraphTracer(self, nid, av)
 
     lift = pure
@@ -358,7 +390,7 @@ class GraphTrace(Trace):
         node (a model that returns a constant / a base-level ``Var``)."""
         if isinstance(leaf, GraphTracer):
             return leaf.id
-        value = leaf.value if isinstance(leaf, Var) else leaf
+        value = _snapshot(leaf)
         return self._builder.add(_CONST, (), {"value": value}, _aval(cast(Any, value)))
 
 
