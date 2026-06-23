@@ -28,6 +28,7 @@ from pycograd.functional import (
     streaming_conv1d,
     streaming_conv1d_init,
 )
+from pycograd.params import ParamDict
 from pycograd.tree import PyTree
 
 # NOTE: these demo functions are recompiled by pyccolo during instrumentation,
@@ -908,3 +909,45 @@ def _init_wavenet(
     ]
     out_w = s * rn((c, c, 1))  # 1x1 output projection
     return blocks, out_w
+
+
+# ---------------------------------------------------------------------------
+# Streaming convolutions through the ambient-DSL buffer mechanism (a spike).
+#
+# The streaming step functions are state-in / state-out: the caller threads a
+# ``(cache, count)`` tuple by hand. ``batch_norm`` shows the alternative -- carry
+# non-gradient state as ``buffer[...]`` leaves in a ``ParamDict`` and advance them
+# via :meth:`ParamDict.update_buffers`. :func:`streaming_conv1d_layer` does exactly
+# that for a conv: weight/bias and the streaming state all live in ``model``, so a
+# user threads *nothing* -- one call per chunk advances the buffers in place.
+#
+# Design notes (the two questions the followup flagged):
+#
+# * **Encoding the integer count.** Streaming state is ``(cache_array, count_int)``;
+#   buffers are arrays. The ``count`` (a stride-skip; always 0 for stride 1) is
+#   stored as a *length-1 float* buffer -- ``update_buffers`` coerces with
+#   ``current_dtype()`` (float), and the small counts round-trip exactly, read back
+#   with ``int(round(...))``. No dedicated int-dtype buffer is needed.
+# * **Cache shape.** The conv1d cache is fixed-length ``(kW-1)*dilation`` -- a
+#   stable, in-place, export-friendly buffer shape. ``update_buffers`` itself does
+#   *not* check shape (it just reassigns ``leaf.value``), so the transpose dual's
+#   variable-length output tail also threads fine for pure-numpy inference; only a
+#   fixed shape is needed if the buffer must also lower to a torch/ONNX buffer.
+def streaming_conv1d_layer(
+    x: Tensor, model: ParamDict, name: str = "conv", stride: int = 1, dilation: int = 1
+) -> Array:
+    """One streaming :func:`streaming_conv1d` step with weight, bias, and streaming
+    state all carried in ``model``'s leaves (``{name}_w`` / ``{name}_b`` weights;
+    ``{name}_cache`` / ``{name}_count`` buffers), advanced via ``update_buffers``.
+    Returns the output chunk; the caller threads no tuples. Plain-numpy inference."""
+    w = np.asarray(model[name + "_w"].value)
+    b = np.asarray(model[name + "_b"].value)
+    cache = np.asarray(model[name + "_cache"].value)
+    count = int(round(float(np.asarray(model[name + "_count"].value).reshape(-1)[0])))
+    y, (new_cache, new_count) = streaming_conv1d(
+        x, w, b, (cache, count), stride=stride, dilation=dilation
+    )
+    model.update_buffers(
+        {name + "_cache": new_cache, name + "_count": np.array([float(new_count)])}
+    )
+    return np.asarray(y)

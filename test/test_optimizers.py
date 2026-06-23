@@ -16,12 +16,14 @@ from pycograd import (  # noqa: E402
     DataLoader,
     batches,
     buffer,
+    causal_conv1d,
     clip_grad_norm,
     constant_lr,
     cosine_decay,
     frozen,
     params,
     step_decay,
+    streaming_conv1d_init,
     tied,
     value_and_grad,
 )
@@ -32,6 +34,7 @@ from pycograd.examples.models import (  # noqa: E402
     logistic_loss,
     logistic_param_loss,
     mlp_tree_loss,
+    streaming_conv1d_layer,
 )
 
 # --- module-level targets (so getsource works under instrumentation) --------
@@ -110,6 +113,42 @@ def test_buffer_is_held_by_optimizer_but_updatable():
     assert np.allclose(m["bn"].value, [1.0, 2.0, 3.0])
     with pytest.raises(ValueError, match="not a mutable buffer"):
         m.update_buffers({"w": np.zeros(2)})
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+def test_streaming_conv_state_threads_through_buffers(stride):
+    # Followup-4 spike: a streaming conv1d driven entirely through a ParamDict --
+    # weight/bias as trainable leaves, the (cache, count) streaming state as
+    # buffers advanced via update_buffers. The caller threads no tuples; chunking
+    # the sequence must still reproduce the parallel causal_conv1d.
+    rng = np.random.default_rng(0)
+    c_out, c_in, k, dil, batch = 4, 3, 3, 2, 2
+    cache, count = streaming_conv1d_init(c_in, k, dil, batch=batch)
+    model = params(
+        conv_w=0.1 * rng.standard_normal((c_out, c_in, k)),
+        conv_b=rng.standard_normal(c_out),
+        conv_cache=buffer[cache],  # fixed-length overlap, written in place
+        conv_count=buffer[np.array([float(count)])],  # int count as a length-1 float
+    )
+    x = rng.standard_normal((batch, c_in, 13))
+    outs, i, j, sizes = [], 0, 0, [2, 1, 3, 2, 4, 1]
+    while i < x.shape[2]:
+        c = sizes[j % len(sizes)]
+        outs.append(
+            streaming_conv1d_layer(
+                x[:, :, i : i + c], model, "conv", stride=stride, dilation=dil
+            )
+        )
+        i, j = i + c, j + 1
+    streamed = np.concatenate(outs, axis=2)
+    ref = np.asarray(
+        causal_conv1d(
+            x, model["conv_w"].value, model["conv_b"].value, stride=stride, dilation=dil
+        )
+    )
+    assert streamed.shape == ref.shape
+    assert np.allclose(streamed, ref, atol=1e-10)
+    assert model["conv_cache"].mutable  # state really lived in the buffers
 
 
 def test_tied_params_stay_equal():
