@@ -917,7 +917,7 @@ def _vjp_unary_derivs() -> dict[Prim, Callable[[Boxed], Boxed]]:
 
 
 def _vjp_unary_for(prim: Callable[..., Var]) -> Callable[..., list[Boxed]]:
-    derivs = _VJP_UNARY_DERIVS
+    derivs = _UNARY_DERIV
 
     def rule(
         primals: tuple[Var, ...],
@@ -1304,8 +1304,7 @@ def _vjp_remat(
 
 def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
     vjp_for: dict[Prim, Callable[..., list[Boxed]]] = {
-        prim: _vjp_unary_for(cast(Callable[..., Var], prim))
-        for prim in _VJP_UNARY_DERIVS
+        prim: _vjp_unary_for(cast(Callable[..., Var], prim)) for prim in _UNARY_DERIV
     }
     vjp_for.update(
         {
@@ -1339,7 +1338,11 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
     return vjp_for
 
 
-_VJP_UNARY_DERIVS: dict[Prim, Callable[[Boxed], Boxed]] = _vjp_unary_derivs()
+# The local derivative ``f'(x)`` of each elementwise-unary primitive, as a ``bind``-
+# expression. The **single source** for these derivatives: ``_vjp_unary_for`` builds the
+# reverse rule ``g * f'(x)`` from it, and ``forward.py``'s jvp builds the forward rule
+# ``f'(x) * dx`` from it -- so e.g. ``1 - tanh²`` is written once, not once per direction.
+_UNARY_DERIV: dict[Prim, Callable[[Boxed], Boxed]] = _vjp_unary_derivs()
 _VJP_FOR: dict[Prim, Callable[..., list[Boxed]]] = _build_vjp_for()
 
 

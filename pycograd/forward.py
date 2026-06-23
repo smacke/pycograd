@@ -558,72 +558,15 @@ def _compare_for(prim: Prim) -> Rule:
 
 
 # ---------------------------------------------------------------------------
-# Local-derivative helpers for the elementwise-unary rules (written with ops so the
-# tangent rides ``bind`` and composes/nests).
+# The smooth-unary local derivatives now live once, in ``ops._UNARY_DERIV`` (both the
+# forward jvp and the reverse vjp build their rules from it). Only ``abs`` stays here:
+# its derivative is a value-dependent ``sign`` mask, not a ``bind``-expression.
 # ---------------------------------------------------------------------------
-def _d_exp(x: Boxed) -> Boxed:
-    return bind(ops.d_exp, x)
-
-
-def _d_log(x: Boxed) -> Boxed:
-    return bind(ops.d_reciprocal, x)  # 1/x
-
-
-def _d_sin(x: Boxed) -> Boxed:
-    return bind(ops.d_cos, x)
-
-
-def _d_cos(x: Boxed) -> Boxed:
-    return bind(ops.d_neg, bind(ops.d_sin, x))
-
-
-def _d_tanh(x: Boxed) -> Boxed:
-    t = bind(ops.d_tanh, x)
-    return bind(ops.d_sub, 1.0, bind(ops.d_mul, t, t))  # 1 - tanh(x)**2
-
-
-def _d_sqrt(x: Boxed) -> Boxed:
-    return bind(ops.d_div, 0.5, bind(ops.d_sqrt, x))  # 1/(2*sqrt(x))
-
-
-def _d_sigmoid(x: Boxed) -> Boxed:
-    s = bind(ops.d_sigmoid, x)
-    return bind(ops.d_mul, s, bind(ops.d_sub, 1.0, s))  # sigmoid(x)*(1-sigmoid(x))
-
-
-def _d_sinh(x: Boxed) -> Boxed:
-    return bind(ops.d_cosh, x)
-
-
-def _d_cosh(x: Boxed) -> Boxed:
-    return bind(ops.d_sinh, x)
-
-
-def _d_arctan(x: Boxed) -> Boxed:
-    return bind(ops.d_reciprocal, bind(ops.d_add, 1.0, bind(ops.d_mul, x, x)))
-
-
-def _d_log1p(x: Boxed) -> Boxed:
-    return bind(ops.d_reciprocal, bind(ops.d_add, 1.0, x))  # 1/(1+x)
-
-
-def _d_expm1(x: Boxed) -> Boxed:
-    return bind(ops.d_exp, x)
-
-
 def _d_abs(x: Boxed) -> Boxed:
     # ``np.sign`` has no differentiable primitive (it is piecewise constant), so the
     # local derivative of ``abs`` is computed on the primal value directly. ``x`` here is
     # the primal (a Var/array or a lower-level tracer); pull its value to host.
     return _xp().sign(np.asarray(cast(Any, _value(cast(Any, x)))))
-
-
-def _d_square(x: Boxed) -> Boxed:
-    return bind(ops.d_mul, 2.0, x)
-
-
-def _d_reciprocal(x: Boxed) -> Boxed:
-    return bind(ops.d_neg, bind(ops.d_reciprocal, bind(ops.d_mul, x, x)))  # -1/x**2
 
 
 # ---------------------------------------------------------------------------
@@ -651,23 +594,10 @@ def _process_unknown(prim: Prim) -> "NoReturn":
 # Rule registry, keyed by primitive.
 # ---------------------------------------------------------------------------
 def _build_jvp_for() -> dict[Prim, Rule]:
-    unary_deriv = {
-        ops.d_exp: _d_exp,
-        ops.d_log: _d_log,
-        ops.d_sin: _d_sin,
-        ops.d_cos: _d_cos,
-        ops.d_tanh: _d_tanh,
-        ops.d_sqrt: _d_sqrt,
-        ops.d_sigmoid: _d_sigmoid,
-        ops.d_sinh: _d_sinh,
-        ops.d_cosh: _d_cosh,
-        ops.d_arctan: _d_arctan,
-        ops.d_log1p: _d_log1p,
-        ops.d_expm1: _d_expm1,
-        ops.d_abs: _d_abs,
-        ops.d_square: _d_square,
-        ops.d_reciprocal: _d_reciprocal,
-    }
+    # The smooth-unary local derivatives are the *shared* ``ops._UNARY_DERIV`` table (the
+    # reverse rules use the same one), so ``1 - tanh²`` etc. is written once. ``abs`` is
+    # special (its derivative is a value-dependent ``sign`` mask, not a bind-expression).
+    unary_deriv = {**ops._UNARY_DERIV, ops.d_abs: _d_abs}
     jvp_for: dict[Prim, Rule] = {
         prim: _unary_for(deriv)(prim) for prim, deriv in unary_deriv.items()
     }
