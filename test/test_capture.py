@@ -10,7 +10,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd import ops, value_and_grad  # noqa: E402
+from pycograd import d_sigmoid, ops, value_and_grad  # noqa: E402
 from pycograd.capture import (  # noqa: E402
     _CONST,
     _INPUT,
@@ -21,7 +21,13 @@ from pycograd.capture import (  # noqa: E402
     eval_graph,
 )
 from pycograd.examples import models as M  # noqa: E402
-from pycograd.passes import constant_fold, cse, optimize  # noqa: E402
+from pycograd.passes import (  # noqa: E402
+    algebraic,
+    constant_fold,
+    cse,
+    fuse_gated_act,
+    optimize,
+)
 from pycograd.shapes import ShapeDtypeStruct  # noqa: E402
 from pycograd.tensor import _value  # noqa: E402
 from pycograd.tree import tree_flatten, tree_leaves  # noqa: E402
@@ -147,3 +153,49 @@ def test_optimize_preserves_semantics(cid, loss, argf):
     lf = [np.asarray(x) for arg in grads_ref for x in tree_leaves(arg)]
     for a, b in zip(lr, lf):
         assert np.allclose(a, b, atol=1e-9)
+
+
+# --- D3: algebraic simplification + fusion ----------------------------------
+def _alg_fn(x):
+    return np.sum(x * 1.0 + x * 0.0)  # x*1 -> x, x*0 -> zeros
+
+
+def test_algebraic_simplifies_identities():
+    x = _rng(0).standard_normal((3, 4))
+    g = capture(_alg_fn, x)
+    g2 = algebraic(g)
+    assert _n_ops(g2) < _n_ops(g)
+    assert np.allclose(
+        float(_value(eval_graph(g2, x))), float(_value(_alg_fn(x))), atol=1e-12
+    )
+
+
+def _explicit_gate_fn(x):
+    # Uses the d_sigmoid primitive (no np.sigmoid exists) so the graph carries a
+    # genuine d_sigmoid node for the fusion pass to match against d_tanh.
+    return np.sum(np.tanh(x) * d_sigmoid(x))
+
+
+def test_fuse_gated_act_rewrites_tanh_times_sigmoid():
+    x = _rng(1).standard_normal((3, 4))
+    g = capture(_explicit_gate_fn, x)
+    g2 = fuse_gated_act(g)
+    prims = [nd.prim for nd in g2.nodes]
+    assert ops.d_gated_act in prims
+    assert ops.d_tanh not in prims  # fused away
+    assert ops.d_sigmoid not in prims
+    assert ops.d_mul not in prims
+    # still evaluates equal to a composed-sigmoid reference (gate == tanh * sigmoid)
+    ref = float(np.sum(np.tanh(x) * (1.0 / (1.0 + np.exp(-x)))))
+    assert np.allclose(float(_value(eval_graph(g2, x))), ref, atol=1e-12)
+
+
+def test_fusion_skips_shared_subexpr():
+    # If the sigmoid feeds something else too, the fuse must not fire (use-count > 1).
+    def shared(x):
+        s = d_sigmoid(x)
+        return np.sum(np.tanh(x) * s + s)
+
+    x = _rng(2).standard_normal((2, 3))
+    g2 = fuse_gated_act(capture(shared, x))
+    assert ops.d_gated_act not in [nd.prim for nd in g2.nodes]
