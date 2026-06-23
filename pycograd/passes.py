@@ -139,27 +139,51 @@ def constant_fold(graph: Graph) -> Graph:
     return replace(graph, nodes=nodes)
 
 
-def _scalar_const(spec: Any, const_of: dict[int, object]) -> "float | None":
-    """The python scalar a 0-d constant operand holds (inline ``Const`` or ``Ref`` to a
-    scalar ``Const`` node), else ``None``. Used for shape-safe identity rewrites: a
-    *scalar* identity broadcasts into the other operand without changing its shape.
-    Guards by type -- a non-numeric constant (a ``slice`` from a ``getitem`` key, a
-    string subscript) is not a scalar identity."""
+def _const_value(spec: Any, const_of: dict[int, object]) -> object:
+    """The constant a spec holds (inline ``Const`` or ``Ref`` to a ``Const`` node, a
+    ``Var`` stripped to its value), else a sentinel ``_NOT_CONST``."""
     if isinstance(spec, Const):
         v: object = spec.value
     elif isinstance(spec, Ref) and spec.id in const_of:
         v = const_of[spec.id]
     else:
+        return _NOT_CONST
+    return _value(v) if isinstance(v, Var) else v
+
+
+_NOT_CONST = object()
+
+
+def _is_const_all(spec: Any, const_of: dict[int, object], target: float) -> bool:
+    """True if ``spec`` is a numeric constant whose every element equals ``target`` (a
+    scalar *or* array zero/one). Non-numeric constants -- a ``slice`` getitem key, a
+    string subscript -- are not identities."""
+    v = _const_value(spec, const_of)
+    if v is _NOT_CONST or isinstance(v, (bool, slice, str)) or v is None:
+        return False
+    try:
+        arr = np.asarray(v)
+    except (TypeError, ValueError):
+        return False
+    if arr.dtype == object or arr.size == 0:
+        return False
+    return bool(np.all(arr == target))
+
+
+def _shape_of(
+    spec: Any, shape_by_id: dict[int, Any], const_of: dict[int, object]
+) -> Any:
+    """The (host-side) shape an operand will have, from the producing node's aval or a
+    constant's array shape; ``None`` if unknown."""
+    if isinstance(spec, Ref):
+        return shape_by_id.get(spec.id)
+    v = _const_value(spec, const_of)
+    if v is _NOT_CONST:
         return None
-    if isinstance(v, Var):
-        v = _value(v)
-    if isinstance(v, bool):
+    try:
+        return np.shape(cast(Any, v))
+    except (TypeError, ValueError):
         return None
-    if isinstance(v, (int, float, np.number)):
-        return float(v)
-    if isinstance(v, np.ndarray) and v.ndim == 0:
-        return float(cast(Any, v))
-    return None
 
 
 def _result_spec(spec: Any) -> "tuple[str, Any] | None":
@@ -170,46 +194,68 @@ def _result_spec(spec: Any) -> "tuple[str, Any] | None":
     return None
 
 
-def _simplify(nd: Node, const_of: dict[int, object]) -> "tuple[str, Any] | None":
+def _simplify(
+    nd: Node, const_of: dict[int, object], shape_by_id: dict[int, Any]
+) -> "tuple[str, Any] | None":
+    """An algebraic rewrite for ``nd`` -- ``("ref", id)`` (node is an operand, drop it)
+    or ``("const", value)`` (node becomes a constant) -- else ``None``. The
+    shape guard ``operand.shape == out.shape`` is what makes an *array* (not just
+    scalar) identity safe: it proves the identity operand did not broadcast the kept
+    operand up to a larger shape."""
     from pycograd import ops
 
+    out_shape = nd.aval.shape
+    # Shape-only ops: a reshape / broadcast to a shape the input already has is a no-op.
+    if nd.prim is ops.d_reshape or nd.prim is ops.d_broadcast_to:
+        x = nd.args[0]
+        if _shape_of(x, shape_by_id, const_of) == out_shape:
+            return _result_spec(x)
+        return None
     if len(nd.args) != 2:
         return None
     a, b = nd.args
-    sa, sb = _scalar_const(a, const_of), _scalar_const(b, const_of)
+    keep_a = _shape_of(a, shape_by_id, const_of) == out_shape
+    keep_b = _shape_of(b, shape_by_id, const_of) == out_shape
     if nd.prim is ops.d_add:  # x + 0, 0 + x
-        if sb == 0.0:
+        if _is_const_all(b, const_of, 0) and keep_a:
             return _result_spec(a)
-        if sa == 0.0:
+        if _is_const_all(a, const_of, 0) and keep_b:
             return _result_spec(b)
     elif nd.prim is ops.d_sub:  # x - 0
-        if sb == 0.0:
+        if _is_const_all(b, const_of, 0) and keep_a:
             return _result_spec(a)
     elif nd.prim is ops.d_mul:  # x * 1, 1 * x, x * 0, 0 * x
-        if sb == 1.0:
+        if _is_const_all(b, const_of, 1) and keep_a:
             return _result_spec(a)
-        if sa == 1.0:
+        if _is_const_all(a, const_of, 1) and keep_b:
             return _result_spec(b)
-        if sb == 0.0 or sa == 0.0:
-            return ("const", np.zeros(nd.aval.shape, dtype=nd.aval.dtype))
+        if _is_const_all(b, const_of, 0) or _is_const_all(a, const_of, 0):
+            return ("const", np.zeros(out_shape, dtype=nd.aval.dtype))
     elif nd.prim is ops.d_div:  # x / 1
-        if sb == 1.0:
+        if _is_const_all(b, const_of, 1) and keep_a:
             return _result_spec(a)
     return None
 
 
 def algebraic(graph: Graph) -> Graph:
-    """Peephole algebraic identities with a *scalar* identity operand (so the result
-    shape provably equals the kept operand's): ``x+0``, ``0+x``, ``x-0``, ``x*1``,
-    ``1*x``, ``x/1`` collapse to ``x``; ``x*0`` / ``0*x`` collapse to a zero const."""
+    """Shape-aware peephole algebraic identities. Using each node's inferred aval, a
+    zero/one identity operand -- *scalar or array* -- collapses ``x+0``, ``0+x``,
+    ``x-0``, ``x*1``, ``1*x``, ``x/1`` to ``x`` and ``x*0`` / ``0*x`` to a zero const,
+    and a ``reshape`` / ``broadcast_to`` to the input's own shape drops out. The
+    ``operand.shape == out.shape`` guard keeps the array cases shape-safe."""
     const_of: dict[int, object] = {
         nd.id: nd.params["value"] for nd in graph.nodes if nd.prim is _CONST
     }
+    shape_by_id: dict[int, Any] = {nd.id: nd.aval.shape for nd in graph.nodes}
     remap: dict[int, int] = {}
     nodes: list[Node] = []
     for nd in graph.nodes:
         nd = replace(nd, args=tuple(_map_spec(s, remap) for s in nd.args))
-        res = _simplify(nd, const_of) if nd.prim not in (_INPUT, _CONST) else None
+        res = (
+            _simplify(nd, const_of, shape_by_id)
+            if nd.prim not in (_INPUT, _CONST)
+            else None
+        )
         if res is None:
             nodes.append(nd)
         elif res[0] == "ref":

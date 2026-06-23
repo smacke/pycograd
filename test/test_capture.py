@@ -170,6 +170,22 @@ def test_algebraic_simplifies_identities():
     )
 
 
+def _alg_shape_fn(x):
+    a = np.reshape(x, x.shape)  # reshape to the same shape -> x
+    b = x + (x * 0.0)  # x*0 -> zeros array; x + zeros (matching shape) -> x
+    return np.sum(a + b)
+
+
+def test_algebraic_shape_aware_identities():
+    x = _rng(7).standard_normal((3, 4))
+    g = capture(_alg_shape_fn, x)
+    g2 = algebraic(g)
+    assert _n_ops(g2) < _n_ops(g)  # reshape-to-same and the array identity both drop
+    assert np.allclose(
+        float(_value(eval_graph(g2, x))), float(_value(_alg_shape_fn(x))), atol=1e-12
+    )
+
+
 def _explicit_gate_fn(x):
     # Uses the d_sigmoid primitive (no np.sigmoid exists) so the graph carries a
     # genuine d_sigmoid node for the fusion pass to match against d_tanh.
