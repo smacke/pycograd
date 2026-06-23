@@ -80,6 +80,7 @@ from pycograd.ops import (
     d_exp,
     d_expand_dims,
     d_expm1,
+    d_gated_act,
     d_hstack,
     d_log,
     d_log1p,
@@ -161,6 +162,7 @@ from pycograd.tree import (
 # interception); these read more naturally than the ``d_`` names at a call site.
 einsum = d_einsum
 cumsum = d_cumsum
+gated_act = d_gated_act  # tanh(f) * sigmoid(s), the WaveNet / GLU gate
 
 try:
     __version__ = version("pycograd")
@@ -333,4 +335,6 @@ __all__ = [
     "einsum",
     "d_cumsum",
     "cumsum",
+    "d_gated_act",
+    "gated_act",
 ]

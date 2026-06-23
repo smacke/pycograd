@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT, d_sigmoid
+from pycograd.ops import _INTERCEPT, d_gated_act, d_sigmoid
 
 
 def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
@@ -220,6 +220,10 @@ class TFBackend(Backend):
         # ``d_sigmoid`` is tape-only (no numpy callable in ``_INTERCEPT``); map the
         # primitive directly to tf.math.sigmoid so a direct call lowers.
         self._intercept[d_sigmoid] = adapters["sigmoid"]
+        # ``d_gated_act`` (tanh(f)*sigmoid(s)) is likewise tape-only; lower natively.
+        self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
+            "sigmoid"
+        ](s)
 
     def _is_tensor(self, x: object) -> bool:
         tf = self._tf

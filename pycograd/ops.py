@@ -200,6 +200,34 @@ def d_where(cond: Array, a: Operand, b: Operand) -> Var:
     return out
 
 
+def d_gated_act(f: Operand, s: Operand) -> Var:
+    # Fused gated activation ``tanh(f) * sigmoid(s)`` (the WaveNet / GLU gate). A fused
+    # primitive: one tape node and one VJP instead of a tanh/sigmoid/multiply chain, and
+    # the compile backends lower it to a native ``tanh*sigmoid`` (see their intercepts).
+    # Tape-only (no numpy name, so no ``_RULES`` callable) -- user code calls it directly,
+    # so under an enclosing transform an operand is a higher-level tracer; dispatch through
+    # ``bind`` so the registered jvp/vmap/abstract rule runs (the ``d_sigmoid`` pattern).
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(f, Tracer) or isinstance(s, Tracer):
+        return cast(Var, bind(d_gated_act, f, s))
+    f, s, xp = _lift(f), _lift(s), _xp()
+    tanh_f = xp.tanh(f.value)
+    sig_s = xp.reciprocal(1.0 + xp.exp(-s.value))
+    out = Var(tanh_f * sig_s, _parents=(f, s))
+
+    def _backward() -> None:
+        # d/df = g * sigmoid(s) * (1 - tanh(f)^2);  d/ds = g * tanh(f) * sigmoid(s)(1-sigmoid(s))
+        df = out.grad * sig_s * (1 - tanh_f * tanh_f)
+        ds = out.grad * tanh_f * sig_s * (1 - sig_s)
+        f.grad = _accumulate(f.grad, _unbroadcast(df, f.value.shape))
+        s.grad = _accumulate(s.grad, _unbroadcast(ds, s.value.shape))
+
+    out._backward = _backward
+    _record_vjp(out, d_gated_act, (f, s))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Operator primitives.
 #
@@ -934,6 +962,21 @@ def _vjp_mul(
     return [_b(d_mul, g, b), _b(d_mul, g, a)]
 
 
+def _vjp_gated_act(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # gate = tanh(f) * sigmoid(s); built bind-riding so the cotangent graph differentiates.
+    f, s = operands
+    sig = _b(d_sigmoid, s)
+    tanh_f = _b(d_tanh, f)
+    df = _b(d_mul, g, _b(d_mul, sig, _b(d_sub, 1.0, _b(d_mul, tanh_f, tanh_f))))
+    ds = _b(d_mul, g, _b(d_mul, tanh_f, _b(d_mul, sig, _b(d_sub, 1.0, sig))))
+    return [df, ds]
+
+
 def _vjp_div(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -1255,6 +1298,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_sub: _vjp_sub,
             d_neg: _vjp_neg,
             d_mul: _vjp_mul,
+            d_gated_act: _vjp_gated_act,
             d_div: _vjp_div,
             d_pow: _vjp_pow,
             _matmul: _vjp_matmul,

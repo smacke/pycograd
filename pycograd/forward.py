@@ -274,6 +274,24 @@ def _mul_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
+def _gated_act_rule(trace: JVPTrace, f: Boxed, s: Boxed) -> JVPTracer:
+    # gate = tanh(f) * sigmoid(s); jvp = (∂/∂f)·df + (∂/∂s)·ds.
+    tf, ts = trace._raise(f), trace._raise(s)
+    primal_out = bind(ops.d_gated_act, tf.primal, ts.primal)
+    sig = bind(ops.d_sigmoid, ts.primal)
+    tanh_f = bind(ops.d_tanh, tf.primal)
+    df_coeff = bind(
+        ops.d_mul, sig, bind(ops.d_sub, 1.0, bind(ops.d_mul, tanh_f, tanh_f))
+    )
+    ds_coeff = bind(ops.d_mul, tanh_f, bind(ops.d_mul, sig, bind(ops.d_sub, 1.0, sig)))
+    tangent_out = bind(
+        ops.d_add,
+        bind(ops.d_mul, df_coeff, tf.tangent),
+        bind(ops.d_mul, ds_coeff, ts.tangent),
+    )
+    return _result(trace, primal_out, tangent_out)
+
+
 def _div_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_div, ta.primal, tb.primal)
@@ -661,6 +679,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_neg: _linear_for(ops.d_neg),
             # nonlinear binary.
             ops.d_mul: _mul_rule,
+            ops.d_gated_act: _gated_act_rule,
             ops.d_div: _div_rule,
             ops.d_pow: _pow_rule,
             ops._matmul: _matmul_rule,

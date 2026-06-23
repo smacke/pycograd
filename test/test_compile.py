@@ -20,7 +20,7 @@ import pytest
 
 import pycograd.compile as C
 import pycograd.transforms as T
-from pycograd import d_sigmoid, frozen
+from pycograd import d_sigmoid, frozen, gated_act
 from pycograd.examples import models as M
 from pycograd.tree import tree_leaves
 
@@ -45,8 +45,21 @@ def _rng(seed):
     return np.random.default_rng(seed)
 
 
+def _gated_act_loss(w):
+    # Exercise the fused ``gated_act`` primitive: each backend must lower it to its
+    # native ``tanh(f) * sigmoid(s)`` and match pycograd's gradient.
+    half = w.shape[1] // 2
+    return np.sum(gated_act(w[:, :half], w[:, half:]) ** 2)
+
+
 # (id, loss_fn, args_factory, backends that support it)
 _CASES = [
+    (
+        "gated_act",
+        _gated_act_loss,
+        lambda: (_rng(5).standard_normal((4, 8)),),
+        {"jax", "torch", "tf"},
+    ),
     (
         "mlp_tree",
         M.mlp_tree_loss,

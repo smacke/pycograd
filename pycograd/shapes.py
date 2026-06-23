@@ -829,6 +829,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_add: abstract_binary,
             ops.d_sub: abstract_binary,
             ops.d_mul: abstract_binary,
+            ops.d_gated_act: abstract_binary,
             ops.d_div: abstract_binary,
             ops.d_neg: abstract_unary,
             ops.d_pow: abstract_binary,

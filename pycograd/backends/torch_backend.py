@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT, d_sigmoid
+from pycograd.ops import _INTERCEPT, d_gated_act, d_sigmoid
 
 if TYPE_CHECKING:
     import torch
@@ -234,6 +234,10 @@ class TorchBackend(Backend):
         # ``d_sigmoid`` call lowers instead of running its xp-based body (xp is None
         # under a delegate backend).
         self._intercept[d_sigmoid] = adapters["sigmoid"]
+        # ``d_gated_act`` (tanh(f)*sigmoid(s)) is likewise tape-only; lower natively.
+        self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
+            "sigmoid"
+        ](s)
 
     def _as_tensor(self, x: BackendArray) -> BackendArray:
         return _as_torch(self._torch, x)
