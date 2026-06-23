@@ -979,6 +979,23 @@ def _vjp_mul(
     return [_b(d_mul, g, b), _b(d_mul, g, a)]
 
 
+# Shared local derivatives for the elementwise nonlinear binaries -- like ``_UNARY_DERIV``,
+# each is written once and consumed by *both* the reverse rule (below) and the forward jvp
+# (``forward.py``), so e.g. ``b*a**(b-1)`` and the gate coefficients are not restated.
+def _pow_base_deriv(a: Boxed, b: Boxed) -> Boxed:
+    # d(a**b)/da = b * a**(b-1). ``b`` may be a raw constant exponent or a tracer.
+    return _b(d_mul, b, _b(d_pow, a, _b(d_sub, b, 1.0)))
+
+
+def _gated_act_coeffs(f: Boxed, s: Boxed) -> "tuple[Boxed, Boxed]":
+    # gate = tanh(f) * sigmoid(s); returns (d/df, d/ds) of the gate w.r.t. its inputs.
+    sig = _b(d_sigmoid, s)
+    tanh_f = _b(d_tanh, f)
+    df_coeff = _b(d_mul, sig, _b(d_sub, 1.0, _b(d_mul, tanh_f, tanh_f)))
+    ds_coeff = _b(d_mul, tanh_f, _b(d_mul, sig, _b(d_sub, 1.0, sig)))
+    return df_coeff, ds_coeff
+
+
 def _vjp_gated_act(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -987,11 +1004,8 @@ def _vjp_gated_act(
 ) -> list[Boxed]:
     # gate = tanh(f) * sigmoid(s); built bind-riding so the cotangent graph differentiates.
     f, s = operands
-    sig = _b(d_sigmoid, s)
-    tanh_f = _b(d_tanh, f)
-    df = _b(d_mul, g, _b(d_mul, sig, _b(d_sub, 1.0, _b(d_mul, tanh_f, tanh_f))))
-    ds = _b(d_mul, g, _b(d_mul, tanh_f, _b(d_mul, sig, _b(d_sub, 1.0, sig))))
-    return [df, ds]
+    df_coeff, ds_coeff = _gated_act_coeffs(f, s)
+    return [_b(d_mul, g, df_coeff), _b(d_mul, g, ds_coeff)]
 
 
 def _vjp_div(
@@ -1017,7 +1031,7 @@ def _vjp_pow(
     a, _b_operand = operands
     pa, pb = primals
     p = pb.value
-    ga = _b(d_mul, g, _b(d_mul, p, _b(d_pow, a, p - 1)))
+    ga = _b(d_mul, g, _pow_base_deriv(a, p))
     return [ga, None]
 
 

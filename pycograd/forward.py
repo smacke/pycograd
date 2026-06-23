@@ -278,12 +278,9 @@ def _gated_act_rule(trace: JVPTrace, f: Boxed, s: Boxed) -> JVPTracer:
     # gate = tanh(f) * sigmoid(s); jvp = (∂/∂f)·df + (∂/∂s)·ds.
     tf, ts = trace._raise(f), trace._raise(s)
     primal_out = bind(ops.d_gated_act, tf.primal, ts.primal)
-    sig = bind(ops.d_sigmoid, ts.primal)
-    tanh_f = bind(ops.d_tanh, tf.primal)
-    df_coeff = bind(
-        ops.d_mul, sig, bind(ops.d_sub, 1.0, bind(ops.d_mul, tanh_f, tanh_f))
-    )
-    ds_coeff = bind(ops.d_mul, tanh_f, bind(ops.d_mul, sig, bind(ops.d_sub, 1.0, sig)))
+    # The gate coefficients (d/df, d/ds) are the *shared* ``ops._gated_act_coeffs`` -- the
+    # reverse rule builds from the same helper, so they are written once.
+    df_coeff, ds_coeff = ops._gated_act_coeffs(tf.primal, ts.primal)
     tangent_out = bind(
         ops.d_add,
         bind(ops.d_mul, df_coeff, tf.tangent),
@@ -311,15 +308,9 @@ def _pow_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     # d(a**b) = b*a**(b-1)*da + a**b*log(a)*db. Drop the exponent-tangent term when the
     # exponent is constant (its tangent is zero), which is the common case (``x**2``) and
     # avoids ``log`` of a non-positive base.
-    da_term = bind(
-        ops.d_mul,
-        bind(
-            ops.d_mul,
-            tb.primal,
-            bind(ops.d_pow, ta.primal, bind(ops.d_sub, tb.primal, 1.0)),
-        ),
-        ta.tangent,
-    )
+    # ``b*a**(b-1)`` is the *shared* ``ops._pow_base_deriv`` (the reverse rule builds from
+    # the same helper); only the exponent-tangent term below is forward-mode-specific.
+    da_term = bind(ops.d_mul, ops._pow_base_deriv(ta.primal, tb.primal), ta.tangent)
     if _is_zero(tb.tangent):
         tangent_out: Boxed = da_term
     else:
