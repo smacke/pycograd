@@ -260,6 +260,92 @@ def test_causal_conv1d_vmap_and_eval_shape():
     assert sh.shape == (1, 3, 7)
 
 
+# --- grouped & depthwise convolutions ---------------------------------------
+def _ref_grouped(conv, x, w, b, groups, **kw):
+    # Reference: slice the channels into ``groups`` blocks and run the plain
+    # (ungrouped) conv on each, then concatenate -- the definition of a grouped conv.
+    cin_g, cout_g = x.shape[1] // groups, w.shape[0] // groups
+    parts = []
+    for g in range(groups):
+        xg = x[:, g * cin_g : (g + 1) * cin_g]
+        wg = w[g * cout_g : (g + 1) * cout_g]
+        bg = None if b is None else b[g * cout_g : (g + 1) * cout_g]
+        parts.append(np.asarray(conv(xg, wg, bg, **kw)))
+    return np.concatenate(parts, axis=1)
+
+
+def test_grouped_conv2d_matches_per_group_loop():
+    rng = np.random.default_rng(20)
+    x = rng.standard_normal((2, 6, 5, 5))
+    w = rng.standard_normal((9, 2, 3, 3))  # (C_out, C_in/groups, kH, kW), groups=3
+    b = rng.standard_normal(9)
+    got = np.asarray(conv2d(x, w, b, stride=1, pad=1, groups=3))
+    ref = _ref_grouped(conv2d, x, w, b, 3, stride=1, pad=1)
+    assert got.shape == (2, 9, 5, 5)
+    assert np.allclose(got, ref)
+
+
+def test_grouped_conv1d_matches_per_group_loop():
+    rng = np.random.default_rng(21)
+    x = rng.standard_normal((2, 6, 11))
+    w = rng.standard_normal((4, 3, 3))  # (C_out, C_in/groups, k), groups=2
+    b = rng.standard_normal(4)
+    got = np.asarray(conv1d(x, w, b, stride=2, pad=1, dilation=2, groups=2))
+    ref = _ref_grouped(conv1d, x, w, b, 2, stride=2, pad=1, dilation=2)
+    assert np.allclose(got, ref)
+
+
+def test_depthwise_conv1d_matches_per_channel():
+    rng = np.random.default_rng(22)
+    x = rng.standard_normal((2, 4, 10))
+    w = rng.standard_normal((4, 1, 3))  # depthwise: groups == C_in, one filter each
+    got = np.asarray(conv1d(x, w, groups=4, pad=1))
+    ref = _ref_grouped(conv1d, x, w, None, 4, pad=1)
+    assert np.allclose(got, ref)
+
+
+def _depthwise_conv1d_loss(x, w, b):
+    return np.sum(conv1d(x, w, b, groups=4, pad=1) ** 2)
+
+
+def test_depthwise_conv1d_grad_matches_finite_diff():
+    rng = np.random.default_rng(23)
+    x = rng.standard_normal((2, 4, 7))
+    w = rng.standard_normal((4, 1, 3))
+    b = rng.standard_normal(4)
+    _assert_grads_match(_depthwise_conv1d_loss, (x, w, b))
+
+
+def _stream_grouped_conv1d(x, w, b, stride, dilation, groups):
+    state = streaming_conv1d_init(x.shape[1], w.shape[2], dilation, x.shape[0])
+    outs, i, j = [], 0, 0
+    while i < x.shape[2]:
+        c = _CHUNKS[j % len(_CHUNKS)]
+        y, state = streaming_conv1d(
+            x[:, :, i : i + c],
+            w,
+            b,
+            state,
+            stride=stride,
+            dilation=dilation,
+            groups=groups,
+        )
+        outs.append(np.asarray(y))
+        i, j = i + c, j + 1
+    return np.concatenate(outs, axis=2)
+
+
+def test_streaming_grouped_conv1d_matches_causal():
+    rng = np.random.default_rng(24)
+    x = rng.standard_normal((2, 6, 13))
+    w = rng.standard_normal((9, 2, 3))  # groups=3
+    b = rng.standard_normal(9)
+    streamed = _stream_grouped_conv1d(x, w, b, stride=1, dilation=2, groups=3)
+    parallel = np.asarray(causal_conv1d(x, w, b, stride=1, dilation=2, groups=3))
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
 # --- pooling ----------------------------------------------------------------
 def test_max_pool2d_forward_and_grad():
     rng = np.random.default_rng(3)

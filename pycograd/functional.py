@@ -193,19 +193,32 @@ def conv2d(
     stride: int = 1,
     pad: int = 0,
     dilation: int = 1,
+    groups: int = 1,
 ) -> Tensor:
     """2-D cross-correlation. ``x`` is ``(N, C_in, H, W)``, ``w`` is
-    ``(C_out, C_in, kH, kW)``, optional bias ``b`` is ``(C_out,)``; returns
-    ``(N, C_out, H_out, W_out)``. ``dilation`` spaces the kernel taps apart."""
-    c_out, c_in, kh, kw = w.shape[0], w.shape[1], w.shape[2], w.shape[3]
+    ``(C_out, C_in/groups, kH, kW)``, optional bias ``b`` is ``(C_out,)``; returns
+    ``(N, C_out, H_out, W_out)``. ``dilation`` spaces the kernel taps apart.
+    ``groups`` splits the channels into independent groups (the torch weight
+    layout): output group ``g`` sees only input group ``g``; ``groups == C_in``
+    (with ``C_out`` a multiple of ``C_in``) is a depthwise convolution."""
+    c_out, c_in_g, kh, kw = w.shape[0], w.shape[1], w.shape[2], w.shape[3]
     x = _pad2d(x, pad, pad)
-    n, _, h, ww = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
+    n, c_in, h, ww = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
     h_out = (h - (kh - 1) * dilation - 1) // stride + 1
     w_out = (ww - (kw - 1) * dilation - 1) // stride + 1
     k, i, j = _im2col_indices(c_in, kh, kw, stride, h_out, w_out, dilation)
     cols = x[:, k, i, j]  # (N, C_in*kH*kW, H_out*W_out) -- the im2col gather
-    w_col = np.reshape(w, (c_out, c_in * kh * kw))
-    out = np.einsum("oc,ncp->nop", w_col, cols)  # (N, C_out, H_out*W_out)
+    if groups == 1:
+        w_col = np.reshape(w, (c_out, c_in * kh * kw))
+        out = np.einsum("oc,ncp->nop", w_col, cols)  # (N, C_out, H_out*W_out)
+    else:
+        # Split the channel-major im2col axis (and C_out) into ``groups`` blocks
+        # and contract each group independently in one batched einsum.
+        p = h_out * w_out
+        cols_g = np.reshape(cols, (n, groups, c_in_g * kh * kw, p))
+        w_g = np.reshape(w, (groups, c_out // groups, c_in_g * kh * kw))
+        out_g = np.einsum("goc,ngcp->ngop", w_g, cols_g)  # (N, G, C_out/G, P)
+        out = np.reshape(out_g, (n, c_out, p))
     out = np.reshape(out, (n, c_out, h_out, w_out))
     if b is not None:
         out = out + np.reshape(b, (1, c_out, 1, 1))
@@ -219,17 +232,19 @@ def conv1d(
     stride: int = 1,
     pad: int = 0,
     dilation: int = 1,
+    groups: int = 1,
 ) -> Tensor:
-    """1-D cross-correlation. ``x`` is ``(N, C_in, L)``, ``w`` is ``(C_out, C_in, k)``;
-    returns ``(N, C_out, L_out)``. A height-1 ``conv2d`` underneath. ``dilation``
-    spaces the kernel taps apart (atrous/WaveNet convolutions)."""
-    c_out, c_in, kk = w.shape[0], w.shape[1], w.shape[2]
+    """1-D cross-correlation. ``x`` is ``(N, C_in, L)``, ``w`` is
+    ``(C_out, C_in/groups, k)``; returns ``(N, C_out, L_out)``. A height-1
+    ``conv2d`` underneath. ``dilation`` spaces the kernel taps apart
+    (atrous/WaveNet convolutions); ``groups`` gives grouped / depthwise convs."""
+    c_out, c_in_g, kk = w.shape[0], w.shape[1], w.shape[2]
     if pad > 0:
-        z = np.zeros((x.shape[0], c_in, pad))
+        z = np.zeros((x.shape[0], x.shape[1], pad))
         x = np.concatenate([z, x, z], axis=2)
-    x4 = np.reshape(x, (x.shape[0], c_in, 1, x.shape[2]))
-    w4 = np.reshape(w, (c_out, c_in, 1, kk))
-    out = conv2d(x4, w4, b, stride=stride, pad=0, dilation=dilation)
+    x4 = np.reshape(x, (x.shape[0], x.shape[1], 1, x.shape[2]))
+    w4 = np.reshape(w, (c_out, c_in_g, 1, kk))
+    out = conv2d(x4, w4, b, stride=stride, pad=0, dilation=dilation, groups=groups)
     return np.reshape(out, (out.shape[0], c_out, out.shape[3]))
 
 
@@ -239,6 +254,7 @@ def causal_conv1d(
     b: Optional[Tensor] = None,
     stride: int = 1,
     dilation: int = 1,
+    groups: int = 1,
 ) -> Tensor:
     """1-D *causal* convolution: left-pad the length axis by ``(k-1)*dilation``
     zeros (and nothing on the right), so output position ``t`` depends only on
@@ -252,7 +268,7 @@ def causal_conv1d(
     # ``vmap`` (a plain ``np.zeros`` would be an unbatched concatenate operand).
     z = x[:, :, :1] * 0.0 * np.ones((1, 1, pad))
     x = np.concatenate([z, x], axis=2)  # left pad only
-    return conv1d(x, w, b, stride=stride, pad=0, dilation=dilation)
+    return conv1d(x, w, b, stride=stride, pad=0, dilation=dilation, groups=groups)
 
 
 def _pool2d(x: Tensor, k: int, stride: Optional[int], reduce_: str) -> Tensor:
@@ -361,6 +377,7 @@ def streaming_conv1d(
     state: "Optional[tuple[np.ndarray, int]]" = None,
     stride: int = 1,
     dilation: int = 1,
+    groups: int = 1,
 ) -> "tuple[np.ndarray, tuple[np.ndarray, int]]":
     """One incremental step of a causal :func:`conv1d` over the next chunk ``x``
     ``(N, C_in, L_chunk)``, returning ``(y, new_state)``. Caches the trailing
@@ -380,7 +397,9 @@ def streaming_conv1d(
     if xa.shape[2] < recep:  # not enough context yet -- keep buffering
         empty = np.zeros((xa.shape[0], w.shape[0], 0))
         return empty, (xa, leftover)
-    y = np.asarray(conv1d(xa, w, b, stride=stride, pad=0, dilation=dilation))
+    y = np.asarray(
+        conv1d(xa, w, b, stride=stride, pad=0, dilation=dilation, groups=groups)
+    )
     t = stride * y.shape[2]  # input samples now fully consumed
     return y, (xa[:, :, t:], max(0, t - xa.shape[2]))
 
