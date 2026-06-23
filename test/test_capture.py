@@ -11,6 +11,7 @@ import pytest
 np = pytest.importorskip("numpy")
 
 from pycograd import d_sigmoid, ops, value_and_grad  # noqa: E402
+from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import (  # noqa: E402
     _CONST,
     _INPUT,
@@ -81,6 +82,45 @@ def test_capture_grad_roundtrip(cid, loss, argf):
     assert lr and len(lr) == len(lf)
     for a, b in zip(lr, lf):
         assert np.allclose(a, b, atol=1e-9)
+
+
+def test_graph_pretty_listing():
+    args = (M._init_mlp_tree(_rng(1)),)
+    g = capture(M.mlp_tree_loss, *args)
+    s = g.pretty()
+    assert s.startswith("graph(") and s.rstrip().endswith("}")
+    assert "outputs:" in s
+    assert "matmul" in s and "maximum" in s  # relu is np.maximum(x, 0)
+    assert "-> f64[]" in s  # the scalar loss output
+    assert "{axis=1, keepdims=True}" in s  # params shown (the softmax reduction)
+    # every op node appears as "%id = ..."
+    for nd in g.nodes:
+        if nd.prim not in (_INPUT, _CONST):
+            assert f"%{nd.id} =" in s
+    assert str(g) == s  # print(graph) shows the listing...
+    assert repr(g).startswith("Graph(") and "ops" in repr(g)  # ...repr stays terse
+
+
+def test_graph_to_dot():
+    args = (M._init_mlp_tree(_rng(1)),)
+    g = capture(M.mlp_tree_loss, *args)
+    dot = g.to_dot()
+    assert dot.startswith("digraph G {") and dot.rstrip().endswith("}")
+    assert "->" in dot  # has edges
+    assert dot.count("->") >= _n_ops(g)  # at least one edge feeding each op
+    assert "peripheries=2" in dot  # the output node is marked
+    assert "fillcolor=lightblue" in dot  # inputs are drawn distinctly
+    # every node id is declared exactly once
+    for nd in g.nodes:
+        assert f"  {nd.id} [" in dot
+
+
+def test_grad_graph_pretty_lists_value_and_grads():
+    gg = grad_graph(capture(M.mlp_tree_loss, *(M._init_mlp_tree(_rng(1)),)))
+    s = gg.pretty()
+    assert s.startswith("graph(") and "outputs:" in s
+    out_line = next(ln for ln in s.splitlines() if ln.strip().startswith("outputs:"))
+    assert all(f"%{o}" in out_line for o in gg.outputs)  # value + every grad listed
 
 
 def test_capture_records_a_graph():

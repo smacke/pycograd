@@ -17,7 +17,7 @@ differentiates -- exactly as the original).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Iterator, Sequence, cast
 
 import numpy as np
 
@@ -85,6 +85,146 @@ class Graph:
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         n = sum(1 for nd in self.nodes if nd.prim not in (_INPUT, _CONST))
         return f"Graph({len(self.inputs)} in, {n} ops, {len(self.outputs)} out)"
+
+    def __str__(self) -> str:  # pragma: no cover - debug aid
+        return pretty(self)
+
+    def pretty(self) -> str:
+        """A jaxpr-style text listing of the graph (nodes in SSA order), e.g.::
+
+            graph(%0:f64[4,3], %1:f64[3,2]) {
+              %2 = matmul %0 %1 -> f64[4,2]
+              %3 = tanh %2 -> f64[4,2]
+              ...
+              outputs: %7
+            }
+
+        ``print(graph)`` shows this; ``repr(graph)`` stays the one-line summary."""
+        return pretty(self)
+
+    def to_dot(self) -> str:
+        """Graphviz DOT source for the graph. Render it with e.g.
+        ``open("g.dot","w").write(graph.to_dot())`` then ``dot -Tpng g.dot -o g.png``,
+        or :meth:`render` for inline display when the ``graphviz`` package is installed.
+        """
+        return to_dot(self)
+
+    def render(self) -> Any:  # pragma: no cover - optional dependency
+        """A ``graphviz.Source`` (renders inline in Jupyter). Requires the optional
+        ``graphviz`` Python package; otherwise use :meth:`to_dot`."""
+        try:
+            import graphviz
+        except ImportError as e:  # keep graphviz an optional, not a hard, dependency
+            raise ImportError(
+                "Graph.render() needs the 'graphviz' package (pip install graphviz); "
+                "or use Graph.to_dot() to get DOT source and render it yourself."
+            ) from e
+        return graphviz.Source(self.to_dot())
+
+
+# ---------------------------------------------------------------------------
+# Human-readable rendering of a captured graph (text listing + Graphviz DOT). Pure
+# string formatting, no dependencies -- the heavy bits stay optional (see Graph.render).
+# ---------------------------------------------------------------------------
+def _dtype_str(dt: Any) -> str:
+    dt = np.dtype(dt)
+    return "bool" if dt.kind == "b" else f"{dt.kind}{dt.itemsize * 8}"
+
+
+def _aval_str(av: ShapeDtypeStruct) -> str:
+    return f"{_dtype_str(av.dtype)}[{','.join(str(d) for d in av.shape)}]"
+
+
+def _prim_name(prim: Prim) -> str:
+    if prim is _INPUT:
+        return "input"
+    if prim is _CONST:
+        return "const"
+    name = getattr(prim, "__name__", str(prim))
+    return name[2:] if name.startswith("d_") else name.lstrip("_")
+
+
+def _truncate(s: str, n: int = 32) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _const_str(v: Any) -> str:
+    try:
+        arr = np.asarray(v)
+    except Exception:  # pragma: no cover - genuinely opaque operand
+        return _truncate(repr(v))
+    if arr.ndim == 0 and arr.dtype.kind in "fiub":
+        return _truncate(repr(arr.item()))  # a scalar -> its value
+    if arr.dtype != object and arr.ndim > 0:
+        return f"{_dtype_str(arr.dtype)}[{','.join(map(str, arr.shape))}]"  # array -> shape
+    return _truncate(repr(v))  # string (einsum subscripts), slice, index tuple, ...
+
+
+def _arg_str(spec: ArgSpec) -> str:
+    if isinstance(spec, Ref):
+        return f"%{spec.id}"
+    if isinstance(spec, Const):
+        return _const_str(spec.value)
+    if isinstance(spec, (list, tuple)):
+        return "[" + ", ".join(_arg_str(s) for s in spec) + "]"
+    return _truncate(repr(spec))
+
+
+def _params_str(params: dict) -> str:
+    items = [(k, v) for k, v in params.items() if k != "value"]
+    if not items:
+        return ""
+    return " {" + ", ".join(f"{k}={_truncate(repr(v))}" for k, v in items) + "}"
+
+
+def _iter_refs(spec: ArgSpec) -> "Iterator[int]":
+    if isinstance(spec, Ref):
+        yield spec.id
+    elif isinstance(spec, (list, tuple)):
+        for s in spec:
+            yield from _iter_refs(s)
+
+
+def pretty(graph: "Graph") -> str:
+    """A jaxpr-style text listing of ``graph`` (see :meth:`Graph.pretty`)."""
+    header = ", ".join(f"%{i}:{_aval_str(graph.nodes[i].aval)}" for i in graph.inputs)
+    lines = [f"graph({header}) {{"]
+    for nd in graph.nodes:
+        if nd.prim is _INPUT:
+            continue  # shown in the header
+        if nd.prim is _CONST:
+            rhs = f"const {_const_str(nd.params['value'])}"
+        else:
+            args = " ".join(_arg_str(s) for s in nd.args)
+            rhs = f"{_prim_name(nd.prim)} {args}{_params_str(nd.params)}".rstrip()
+        lines.append(f"  %{nd.id} = {rhs} -> {_aval_str(nd.aval)}")
+    lines.append("  outputs: " + ", ".join(f"%{o}" for o in graph.outputs))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def to_dot(graph: "Graph") -> str:
+    """Graphviz DOT source for ``graph`` (see :meth:`Graph.to_dot`)."""
+    outs = set(graph.outputs)
+    lines = [
+        "digraph G {",
+        "  rankdir=TB;",
+        '  node [shape=box, fontname="monospace"];',
+    ]
+    for nd in graph.nodes:
+        if nd.prim is _INPUT:
+            attrs = f'label="%{nd.id} in\\n{_aval_str(nd.aval)}", shape=ellipse, style=filled, fillcolor=lightblue'
+        elif nd.prim is _CONST:
+            attrs = f'label="%{nd.id} const\\n{_const_str(nd.params["value"])}", shape=ellipse, style=filled, fillcolor=lightyellow'
+        else:
+            attrs = f'label="%{nd.id} {_prim_name(nd.prim)}\\n{_aval_str(nd.aval)}"'
+        if nd.id in outs:
+            attrs += ", peripheries=2"  # double border marks a graph output
+        lines.append(f"  {nd.id} [{attrs}];")
+        for src in {r for s in nd.args for r in _iter_refs(s)}:
+            lines.append(f"  {src} -> {nd.id};")
+    lines.append("}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
