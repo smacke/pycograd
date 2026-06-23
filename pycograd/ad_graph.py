@@ -66,8 +66,8 @@ def _decompose(prim: Any, args: tuple, params: dict) -> "tuple[list, dict]":
         return [args[0]], {"axes": axes}
     if prim is ops.d_concatenate or prim is ops.d_stack:  # ([parts], axis=...)
         return list(args[0]), dict(params)
-    if prim is ops.d_where:  # (cond, a, b); cond is a param, a/b the operands
-        return [args[1], args[2]], {"cond": _const(args[0]), **params}
+    if prim is ops.d_where:  # (cond, a, b) -- all operands; cond gets no cotangent
+        return list(args), dict(params)
     return list(args), dict(params)
 
 
@@ -158,6 +158,14 @@ def _g_stack(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed
     return grads
 
 
+def _g_where(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # where(cond, a, b): g flows to a where cond, to b elsewhere; cond is stop-gradient.
+    # cond is a graph node here (a computed mask), so build the masks as graph nodes.
+    cond, _a, _b_op = operands
+    cf = _b(ops.d_mul, cond, 1.0)  # bool -> float, in the graph
+    return [None, _b(ops.d_mul, g, cf), _b(ops.d_mul, g, _b(ops.d_sub, 1.0, cf))]
+
+
 def _g_pow(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
     # x**p with constant exponent p: d/dx = p * x**(p-1). The exponent is a Const operand
     # (a value, not a graph node), matching the eager rule (no grad to the exponent).
@@ -176,6 +184,7 @@ _VJP_GRAPH: dict[Any, GraphVJP] = {
     ops.d_min: _g_reduce_select(ops.d_min),
     ops.d_mean: _g_mean,
     ops.d_stack: _g_stack,
+    ops.d_where: _g_where,
     ops.d_pow: _g_pow,
 }
 
