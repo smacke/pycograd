@@ -20,7 +20,7 @@ import pytest
 
 import pycograd.compile as C
 import pycograd.transforms as T
-from pycograd import d_sigmoid, frozen, gated_act
+from pycograd import conv1d, conv2d, d_sigmoid, frozen, gated_act
 from pycograd.examples import models as M
 from pycograd.tree import tree_leaves
 
@@ -52,6 +52,22 @@ def _gated_act_loss(w):
     return np.sum(gated_act(w[:, :half], w[:, half:]) ** 2)
 
 
+# Conv lowers to the backend's *native* conv (jax lax.conv / torch F.conv2d); the
+# gradient parity vs pycograd's im2col conv validates that native lowering. tf is
+# excluded: its conv wants NHWC/HWIO and has limited grouped-conv support (like the
+# transformer case is jax/torch only for ``.T``).
+def _conv2d_loss(x, w, b):
+    return np.sum(conv2d(x, w, b, stride=2, pad=1) ** 2)
+
+
+def _conv2d_grouped_loss(x, w, b):
+    return np.sum(conv2d(x, w, b, stride=1, pad=1, dilation=2, groups=2) ** 2)
+
+
+def _conv1d_loss(x, w, b):
+    return np.sum(conv1d(x, w, b, stride=1, pad=2, dilation=2) ** 2)
+
+
 # (id, loss_fn, args_factory, backends that support it)
 _CASES = [
     (
@@ -59,6 +75,36 @@ _CASES = [
         _gated_act_loss,
         lambda: (_rng(5).standard_normal((4, 8)),),
         {"jax", "torch", "tf"},
+    ),
+    (
+        "conv2d",
+        _conv2d_loss,
+        lambda: (
+            _rng(6).standard_normal((2, 3, 8, 8)),
+            _rng(7).standard_normal((4, 3, 3, 3)),
+            _rng(8).standard_normal(4),
+        ),
+        {"jax", "torch"},
+    ),
+    (
+        "conv2d_grouped",
+        _conv2d_grouped_loss,
+        lambda: (
+            _rng(6).standard_normal((2, 4, 7, 7)),
+            _rng(7).standard_normal((6, 2, 3, 3)),
+            _rng(8).standard_normal(6),
+        ),
+        {"jax", "torch"},
+    ),
+    (
+        "conv1d",
+        _conv1d_loss,
+        lambda: (
+            _rng(6).standard_normal((2, 3, 9)),
+            _rng(7).standard_normal((4, 3, 3)),
+            _rng(8).standard_normal(4),
+        ),
+        {"jax", "torch"},
     ),
     (
         "mlp_tree",

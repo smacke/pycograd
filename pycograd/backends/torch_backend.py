@@ -18,7 +18,7 @@ are routed in through float32 and bf16 results back out through float32.
 from __future__ import annotations
 
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Mapping, cast
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast
 
 import numpy as np
 
@@ -238,6 +238,26 @@ class TorchBackend(Backend):
         self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
             "sigmoid"
         ](s)
+        # Lower the composed im2col ``conv2d`` to torch's *native* conv (a direct
+        # NCHW / OIHW map), so the compiled net runs cuDNN/MKLDNN convolutions and
+        # torch autograd supplies the backward -- instead of tracing the gather +
+        # einsum. Keyed by the ``functional.conv2d`` object, so a call site swaps to
+        # this; the numpy path (no intercept entry) keeps the composed conv and its
+        # im2col autodiff. ``conv1d`` / ``causal_conv1d`` route through ``conv2d``.
+        from pycograd.functional import conv2d as _conv2d
+
+        def _torch_conv2d(
+            x: BackendArray,
+            w: BackendArray,
+            b: Optional[BackendArray] = None,
+            stride: int = 1,
+            pad: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+        ) -> BackendArray:
+            return torch.nn.functional.conv2d(x, w, b, stride, pad, dilation, groups)
+
+        self._intercept[_conv2d] = _torch_conv2d
 
     def _as_tensor(self, x: BackendArray) -> BackendArray:
         return _as_torch(self._torch, x)

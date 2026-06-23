@@ -13,7 +13,7 @@ won't ``jit`` -- static nets (the common case) are fine.
 from __future__ import annotations
 
 from types import ModuleType
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Optional
 
 import numpy as np
 
@@ -76,6 +76,35 @@ class JaxBackend(Backend):
         self._intercept[d_sigmoid] = jax.nn.sigmoid
         # ``d_gated_act`` (tanh(f)*sigmoid(s)) is likewise tape-only; lower it natively.
         self._intercept[d_gated_act] = lambda f, s: jnp.tanh(f) * jax.nn.sigmoid(s)
+        # Lower the composed im2col ``conv2d`` to XLA's native conv via
+        # ``lax.conv_general_dilated`` (NCHW input / OIHW kernel, matching pycograd's
+        # layout; ``rhs_dilation`` = kernel dilation, ``feature_group_count`` = groups),
+        # so the compiled net runs an XLA convolution and jax autodiff supplies the
+        # backward -- instead of tracing the gather + einsum. The numpy path keeps the
+        # composed conv. ``conv1d`` / ``causal_conv1d`` route through ``conv2d``.
+        from pycograd.functional import conv2d as _conv2d
+
+        def _jax_conv2d(
+            x: BackendArray,
+            w: BackendArray,
+            b: Optional[BackendArray] = None,
+            stride: int = 1,
+            pad: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+        ) -> BackendArray:
+            out = jax.lax.conv_general_dilated(
+                x,
+                w,
+                window_strides=(stride, stride),
+                padding=[(pad, pad), (pad, pad)],
+                rhs_dilation=(dilation, dilation),
+                dimension_numbers=("NCHW", "OIHW", "NCHW"),
+                feature_group_count=groups,
+            )
+            return out if b is None else out + jnp.reshape(b, (1, -1, 1, 1))
+
+        self._intercept[_conv2d] = _jax_conv2d
 
     def _is_tensor(self, x: object) -> bool:
         return isinstance(x, (self._jax.Array, self._jax.core.Tracer))
