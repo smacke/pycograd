@@ -61,7 +61,7 @@ def _decompose(prim: Any, args: tuple, params: dict) -> "tuple[list, dict]":
     if prim is ops.d_transpose:  # (x[, axes])
         axes = _const(args[1]) if len(args) > 1 else None
         return [args[0]], {"axes": axes}
-    if prim is ops.d_concatenate:  # ([parts], axis=...)
+    if prim is ops.d_concatenate or prim is ops.d_stack:  # ([parts], axis=...)
         return list(args[0]), dict(params)
     if prim is ops.d_where:  # (cond, a, b); cond is a param, a/b the operands
         return [args[1], args[2]], {"cond": _const(args[0]), **params}
@@ -70,11 +70,111 @@ def _decompose(prim: Any, args: tuple, params: dict) -> "tuple[list, dict]":
 
 # ---------------------------------------------------------------------------
 # Per-primitive graph-building VJP rules for the ops whose eager rule reads a primal's
-# *data* (a mask) rather than just its shape. Populated by ``ad_graph_mask`` (G2);
-# falls back to ``_VJP_FOR`` for everything else.
+# *data* (a mask), or which are composed (not in ``_VJP_FOR``) yet recorded as one node
+# because the trace routes them through ``bind`` (``stack``, ``mean``). ``_vjp_on_graph``
+# consults this first, falling back to ``_VJP_FOR`` for everything else.
 # ---------------------------------------------------------------------------
 GraphVJP = Callable[..., "list[Boxed]"]
-_VJP_GRAPH: dict[Any, GraphVJP] = {}
+
+
+def _b(prim: Any, *args: Any, **kw: Any) -> Boxed:
+    return bind(prim, *args, **kw)
+
+
+def _mask_to_float(cond: Boxed) -> Boxed:
+    return _b(ops.d_mul, cond, 1.0)  # bool comparison node -> float, in the graph
+
+
+def _g_abs(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # d|x|/dx = sign(x), built as graph nodes (where(x>0,1,where(x<0,-1,0))).
+    (x,) = operands
+    sign = _b(
+        ops.d_where,
+        _b(ops.d_gt, x, 0.0),
+        1.0,
+        _b(ops.d_where, _b(ops.d_lt, x, 0.0), -1.0, 0.0),
+    )
+    return [_b(ops.d_mul, g, sign)]
+
+
+def _g_select(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # maximum/minimum: gradient flows to whichever operand equals the output (ties to a),
+    # the mask `(a == out)` built from the operand and output graph values.
+    a, _b_op = operands
+    mask = _mask_to_float(_b(ops.d_eq, a, out))
+    return [_b(ops.d_mul, g, mask), _b(ops.d_mul, g, _b(ops.d_sub, 1.0, mask))]
+
+
+def _g_reduce_select(reducer_prim: Any) -> GraphVJP:
+    def rule(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+        # max/min reduction: gradient flows to the arg-extremum, split on ties. Recompute
+        # the keepdims extremum so the mask `(x == kept)` broadcasts against x.
+        (x,) = operands
+        axis = params.get("axis")
+        keepdims = params.get("keepdims", False)
+        kept = _b(reducer_prim, x, axis=axis, keepdims=True)
+        mask = _mask_to_float(_b(ops.d_eq, x, kept))
+        count = _b(ops.d_sum, mask, axis=axis, keepdims=True)
+        norm = _b(ops.d_div, mask, count)
+        gg = g if (axis is None or keepdims) else ops._expand_dims_multi(g, axis)
+        return [_b(ops.d_mul, gg, norm)]
+
+    return rule
+
+
+def _reduced_count(shape: "tuple[int, ...]", axis: Any) -> int:
+    if axis is None:
+        return int(np.prod(shape, dtype=np.int64)) if shape else 1
+    axes = axis if isinstance(axis, tuple) else (axis,)
+    return int(np.prod([shape[a] for a in axes], dtype=np.int64)) if axes else 1
+
+
+def _g_mean(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # mean is sum / count -- not in _VJP_FOR, so build it here: broadcast the cotangent
+    # back over the reduced axes and divide by the number of elements averaged.
+    (x,) = operands
+    axis = params.get("axis")
+    keepdims = params.get("keepdims", False)
+    xshape = _shape_of(x)
+    n = float(_reduced_count(xshape, axis))
+    gg = g if (axis is None or keepdims) else ops._expand_dims_multi(g, axis)
+    return [_b(ops.d_div, _b(ops.d_broadcast_to, gg, xshape), n)]
+
+
+def _g_stack(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # stack(parts, axis): the cotangent of part i is g sliced at index i along axis (an
+    # int index removes that axis -- the inverse of the new axis stack inserted). Not in
+    # _VJP_FOR (stack is composed eagerly), so built here.
+    axis = params.get("axis", 0)
+    gnd = len(cast(Any, g).aval.shape)
+    ax = axis % gnd
+    grads: list[Boxed] = []
+    for i in range(len(operands)):
+        key = tuple(i if d == ax else slice(None) for d in range(gnd))
+        grads.append(_b(ops.d_getitem, g, key))
+    return grads
+
+
+def _g_pow(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
+    # x**p with constant exponent p: d/dx = p * x**(p-1). The exponent is a Const operand
+    # (a value, not a graph node), matching the eager rule (no grad to the exponent).
+    a, b = operands
+    if isinstance(b, GraphTracer):
+        raise NotImplementedError("grad_graph: pow with a non-constant exponent")
+    ga = _b(ops.d_mul, g, _b(ops.d_mul, b, _b(ops.d_pow, a, b - 1)))
+    return [ga, None]
+
+
+_VJP_GRAPH: dict[Any, GraphVJP] = {
+    ops.d_abs: _g_abs,
+    ops.d_maximum: _g_select,
+    ops.d_minimum: _g_select,
+    ops.d_max: _g_reduce_select(ops.d_max),
+    ops.d_min: _g_reduce_select(ops.d_min),
+    ops.d_mean: _g_mean,
+    ops.d_stack: _g_stack,
+    ops.d_pow: _g_pow,
+}
 
 
 def _vjp_on_graph(

@@ -586,6 +586,15 @@ def abstract_broadcast_to(x: AbstractVal, shape: Shape) -> ShapedArray:
     return ShapedArray(tuple(int(d) for d in target), a.dtype)
 
 
+def abstract_scatter(
+    g: AbstractVal, key: object, shape: Shape, dtype: DTypeLike
+) -> ShapedArray:
+    # The internal scatter (a getitem VJP) produces a buffer of the given shape/dtype.
+    # Reached only when ``grad_graph`` records a backward pass; harmless elsewhere.
+    target = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+    return ShapedArray(tuple(int(d) for d in target), np.dtype(cast(Any, dtype)))
+
+
 def abstract_expand_dims(x: AbstractVal, axis: int) -> ShapedArray:
     a = _aval(x)
     pos = axis if axis >= 0 else axis + a.ndim + 1
@@ -856,6 +865,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_transpose: abstract_transpose,
             ops.d_reshape: abstract_reshape,
             ops.d_broadcast_to: abstract_broadcast_to,
+            ops._scatter: abstract_scatter,
             ops.d_expand_dims: abstract_expand_dims,
             ops.d_concatenate: abstract_concatenate,
             ops.d_stack: abstract_stack,

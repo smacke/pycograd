@@ -10,6 +10,7 @@ np = pytest.importorskip("numpy")
 from pycograd import value_and_grad  # noqa: E402
 from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import capture, eval_graph  # noqa: E402
+from pycograd.examples import models as M  # noqa: E402
 from pycograd.tensor import _value  # noqa: E402
 from pycograd.tree import tree_leaves  # noqa: E402
 
@@ -51,3 +52,48 @@ def test_grad_graph_reshape_einsum_roundtrip():
     _grads_match(
         grad_graph(capture(_reshape_einsum_loss, x, w)), (x, w), _reshape_einsum_loss
     )
+
+
+# --- G2: mask ops (relu / max-reduce / abs / pow) ---------------------------
+def _relu_softmax_loss(x, w):
+    h = np.maximum(x @ w, 0.0)  # relu -> d_maximum (select mask)
+    m = np.max(h, axis=1, keepdims=True)  # d_max (reduce-select mask)
+    e = np.exp(h - m)
+    p = e / np.sum(e, axis=1, keepdims=True)
+    return np.sum(p * p)
+
+
+def test_grad_graph_relu_softmax_roundtrip():
+    x, w = _rng(4).standard_normal((4, 5)), _rng(5).standard_normal((5, 3))
+    _grads_match(
+        grad_graph(capture(_relu_softmax_loss, x, w)), (x, w), _relu_softmax_loss
+    )
+
+
+def _abs_pow_loss(x):
+    return np.sum(np.abs(x) + x**2 * 0.5)  # abs (sign mask) + pow (const exponent)
+
+
+def test_grad_graph_abs_pow_roundtrip():
+    x = _rng(6).standard_normal((3, 4))
+    _grads_match(grad_graph(capture(_abs_pow_loss, x)), (x,), _abs_pow_loss)
+
+
+# --- G2: the full example models (the finite-diff-checked "don't regress" bar) ---
+_MODELS = [
+    ("mlp_tree", M.mlp_tree_loss, lambda: (M._init_mlp_tree(_rng(1)),)),
+    ("rnn", M.rnn_loss, lambda: (M._init_rnn(_rng(3), vocab=len(M._CHAR_VOCAB)),)),
+    ("gru", M.gru_loss, lambda: (M._init_gru(_rng(3), vocab=len(M._CHAR_VOCAB)),)),
+    ("lstm", M.lstm_loss, lambda: (M._init_lstm(_rng(3), vocab=len(M._CHAR_VOCAB)),)),
+    (
+        "rwkv",
+        M.rwkv_loss,
+        lambda: M._init_rwkv(_rng(2), vocab=12, d_model=8, n_blocks=2),
+    ),
+]
+
+
+@pytest.mark.parametrize("cid,loss,argf", _MODELS, ids=[c[0] for c in _MODELS])
+def test_grad_graph_models_roundtrip(cid, loss, argf):
+    args = argf()
+    _grads_match(grad_graph(capture(loss, *args)), args, loss)
