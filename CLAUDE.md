@@ -64,3 +64,20 @@ for a framework object — never a bare `object`/`Any`.
   referenced aliases keep `Union`/`Optional` rather than PEP 604 `|`).
 - `mypy` and `ruff` are configured; run `make check` (blackcheck + lint +
   typecheck) before declaring done.
+
+## Notebooks / demos: use pipescript syntax
+
+Write the examples in the `notebooks/` demos using the pipescript ambient DSL
+(the `|>` pipe surface), not plain `def f(x): ...`. Match the existing demos:
+a `params{ w = ...; b = frozen[...] } as weights:` block for parameters, and
+`|>` pipelines for the forward — e.g.
+`forward = $ |> $ @ w + b |> np.maximum(0.0, $) |> np.sum($)`.
+
+- `$` is the piped value (the hole) for that stage. **Repeated anonymous `$`
+  in one stage makes *separate* positional holes** (`$ * $` is a 2-arg lambda).
+  To reuse the *same* piped value within a stage, use a **named** placeholder:
+  `$v * $v` (square), `np.tanh($v) * np.tanh($v)` (same input twice).
+- The graph/transform tools compose with pipes: `capture(forward, x)`,
+  `grad_graph(...)`, `vjp_graph(forward, x)`, and `weights.grad(objective)` all
+  work on a `|>` pipeline (validate new notebooks by executing them with
+  `jupyter nbconvert --execute`). `%load_ext pycograd` enables the DSL.
