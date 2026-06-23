@@ -10,11 +10,21 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd import value_and_grad  # noqa: E402
-from pycograd.capture import _CONST, _INPUT, capture, eval_graph  # noqa: E402
+from pycograd import ops, value_and_grad  # noqa: E402
+from pycograd.capture import (  # noqa: E402
+    _CONST,
+    _INPUT,
+    Graph,
+    Node,
+    Ref,
+    capture,
+    eval_graph,
+)
 from pycograd.examples import models as M  # noqa: E402
+from pycograd.passes import constant_fold, cse, optimize  # noqa: E402
+from pycograd.shapes import ShapeDtypeStruct  # noqa: E402
 from pycograd.tensor import _value  # noqa: E402
-from pycograd.tree import tree_leaves  # noqa: E402
+from pycograd.tree import tree_flatten, tree_leaves  # noqa: E402
 
 
 def _rng(seed):
@@ -77,3 +87,63 @@ def test_capture_records_a_graph():
     n_ops = sum(1 for nd in graph.nodes if nd.prim not in (_INPUT, _CONST))
     assert n_ops > 0
     assert len(graph.outputs) == 1
+
+
+# --- D2: passes -------------------------------------------------------------
+def _n_ops(graph):
+    return sum(1 for nd in graph.nodes if nd.prim not in (_INPUT, _CONST))
+
+
+def _redundant_fn(x):
+    a = np.tanh(x)
+    b = np.tanh(x)  # identical to a -> CSE merges
+    dead = np.exp(x)  # noqa: F841  -- unused -> DCE removes
+    return np.sum(a * b)
+
+
+def test_cse_merges_and_dce_drops():
+    x = _rng(0).standard_normal((3, 4))
+    g = capture(_redundant_fn, x)
+    base = _n_ops(g)  # tanh, tanh, exp, mul, sum
+    assert _n_ops(cse(g)) == base - 1  # the duplicate tanh merged
+    g_opt = optimize(g)
+    assert _n_ops(g_opt) == base - 2  # duplicate tanh merged + dead exp removed
+    assert np.allclose(
+        float(_value(eval_graph(g_opt, x))), float(_value(_redundant_fn(x)))
+    )
+
+
+def test_constant_fold_collapses_const_subgraph():
+    # Hand-built graph: add(const 2, const 3) folds to a single const 5.
+    sds = ShapeDtypeStruct((), np.dtype("float64"))
+    _, td = tree_flatten(np.array(0.0))
+    nodes = [
+        Node(0, _CONST, (), {"value": np.array(2.0)}, sds),
+        Node(1, _CONST, (), {"value": np.array(3.0)}, sds),
+        Node(2, ops.d_add, (Ref(0), Ref(1)), {}, sds),
+    ]
+    g = Graph(nodes, inputs=[], outputs=[2], out_treedef=td)
+    folded = constant_fold(g)
+    assert folded.nodes[2].prim is _CONST
+    assert np.allclose(float(_value(eval_graph(g))), 5.0)
+    assert np.allclose(float(_value(eval_graph(folded))), 5.0)
+
+
+@pytest.mark.parametrize("cid,loss,argf", _CASES, ids=_IDS)
+def test_optimize_preserves_semantics(cid, loss, argf):
+    args = argf()
+    g = optimize(capture(loss, *args))
+    assert np.allclose(
+        float(_value(eval_graph(g, *args))), float(_value(loss(*args))), atol=1e-9
+    )
+
+    def replay(*a):
+        return eval_graph(g, *a)
+
+    replay._pycograd_run_directly = True
+    _, grads_replay = value_and_grad(replay)(*args)
+    _, grads_ref = value_and_grad(loss)(*args)
+    lr = [np.asarray(x) for arg in grads_replay for x in tree_leaves(arg)]
+    lf = [np.asarray(x) for arg in grads_ref for x in tree_leaves(arg)]
+    for a, b in zip(lr, lf):
+        assert np.allclose(a, b, atol=1e-9)

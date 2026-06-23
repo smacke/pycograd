@@ -127,6 +127,7 @@ from pycograd.params import (
     register_pipescript_params_macro,
     tied,
 )
+from pycograd.passes import optimize
 from pycograd.shapes import (
     Dim,
     ShapedArray,
@@ -210,9 +211,10 @@ __all__ = [
     # compile to other frameworks (torch / tf / jax)
     "compile_to",
     "get_backend",
-    # graph-capture IR
+    # graph-capture IR + optimization passes
     "capture",
     "eval_graph",
+    "optimize",
     "Graph",
     # device / array backend seam (numpy default, cupy for GPU)
     "device",
