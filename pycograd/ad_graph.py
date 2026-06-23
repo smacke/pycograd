@@ -14,6 +14,11 @@ The one impedance-match: a captured node stores ``bind``'s positional args, but 
 rule wants the ``_record_vjp`` (operands, params) split -- e.g. ``einsum``'s subscripts
 is a positional arg in the node but a ``param`` to the rule. ``_decompose`` recovers
 that split per primitive.
+
+This is the *graph-mode* reverse path (mechanism #3, the VJP-rule variant;
+:mod:`pycograd.transpose` is the ``transpose ∘ linearize`` variant). For why it coexists
+with the two eager reverse paths, see the "Three reverse-mode mechanisms" overview in
+:mod:`pycograd.tensor`.
 """
 from __future__ import annotations
 

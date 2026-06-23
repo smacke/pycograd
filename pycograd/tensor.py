@@ -7,6 +7,47 @@ accumulate gradients. The convenience methods (``sum``/``mean``/``__pow__``/``T`
 ...) delegate to the differentiable primitives in :mod:`pycograd.ops`; those
 imports are deferred to function bodies so this module has no import-time
 dependency on ``ops`` (which imports ``Var`` from here).
+
+----------------------------------------------------------------------------------
+Three reverse-mode mechanisms (and why they coexist)
+----------------------------------------------------------------------------------
+pycograd computes a gradient three different ways. They are *not* three copies of the
+calculus -- the local derivatives live once (forward's ``_JVP_FOR`` + the shared
+``ops._UNARY_DERIV`` / ``_pow_base_deriv`` / ``_gated_act_coeffs`` tables, which the
+reverse rules also build from). They are three *execution strategies*, each the right
+trade for a different job:
+
+1. **Base eager tape** -- ``Var.backward()`` raw pass (this file). First-order ``grad``
+   / ``value_and_grad`` with nothing enclosing them. Each op attaches a per-node
+   ``_backward`` closure when it runs (e.g. ``d_tanh`` stores ``lambda a, g: g*(1-v*v)``
+   reusing the cached ``v``); the reverse pass calls those closures, mutating numpy
+   ``.grad`` directly. Raw numpy on cached values -- no dispatch, no tape allocation.
+   *Why a separate strategy:* it is the hot path (all training), so it must be fast.
+
+2. **Differentiable backward** -- ``_backward_differentiable`` (this file). Higher-order
+   eager: ``grad(grad(f))``, ``jvp(grad(f))``, Hessians/HVPs -- i.e. a ``grad`` nested
+   inside another ``grad``/``jvp`` (triggered when ``num_transform_levels() > 0``). It
+   walks the same tape but accumulates each cotangent as a *bind-riding* ``Var``/tracer
+   via ``ops._VJP_FOR``, so the cotangent graph is itself differentiable and the
+   enclosing transform can differentiate the gradient.
+   *Why not just reuse #1:* the base closures emit raw, non-differentiable arrays, so
+   they cannot feed an outer transform. *Why not just reuse #2 for #1 too:* pointing the
+   first-order pass at ``_VJP_FOR`` was benchmarked ~2x slower -- every cotangent op
+   redispatches through the trace stack, allocates a throwaway tape node, and recomputes
+   cached primals. So the split is a deliberate speed-vs-composability trade, not an
+   oversight (see the ``backward`` docstring for the exact trigger).
+
+3. **Graph mode** -- ``ad_graph.grad_graph`` / ``transpose.vjp_graph`` (opt-in via
+   ``capture`` / ``jit``). Reverse mode on the capture IR, so forward *and* backward live
+   in one graph the optimization passes can work across (e.g. CSE merging a recomputed
+   ``sigmoid``). ``grad_graph`` applies the VJP rules to a captured forward; ``vjp_graph``
+   instead *derives* reverse from forward as ``transpose ∘ linearize`` (linearize reuses
+   the JVP rules; transpose flips only the linear ops). Neither is on the eager hot path.
+   *Why a third strategy:* eager reverse (#1/#2) is a tape, not a graph, so it cannot be
+   optimized across the forward/backward boundary; the IR can.
+
+The unifying idea: one set of derivatives, executed as a raw closure (#1, speed), a
+bind-riding tracer (#2, composability), or graph nodes (#3, optimization).
 """
 from __future__ import annotations
 

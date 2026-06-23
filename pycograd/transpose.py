@@ -6,7 +6,12 @@
 tangents (primal-derived values become residual constants). ``transpose`` then flips
 that linear graph with a small, derivative-free ``_TRANSPOSE`` table. The local
 derivatives (``cos``, ``1-tanh²``, …) therefore live only in the JVP rules; reverse
-mode is a transpose of them, not a second copy. See the plan for the full rationale.
+mode is a transpose of them, not a second copy.
+
+This is the *graph-mode* reverse path (mechanism #3). For why it coexists with the two
+eager reverse paths -- the fast base ``.grad`` tape and the higher-order
+``_backward_differentiable`` -- see the "Three reverse-mode mechanisms" overview in
+:mod:`pycograd.tensor`.
 """
 from __future__ import annotations
 
