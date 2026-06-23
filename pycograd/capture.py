@@ -243,7 +243,14 @@ def capture(f: Callable[..., PyTree], *args: PyTree) -> Graph:
     """Trace ``f(*args)`` and return the recorded :class:`Graph`. Numeric input leaves
     become graph inputs; everything else is recorded as it executes. Has the same
     limitations as ``eval_shape``: no data-dependent Python control flow, and apply
-    at the outermost level (not inside a live ``vmap``/``jvp``)."""
+    at the outermost level (not inside a live ``vmap``/``jvp``).
+
+    Captures the *forward* only. ``capture(value_and_grad(f))`` does not compose:
+    pycograd's reverse pass is not ``bind``-expressed at the base level (the
+    base-vs-higher-order split in ``ops.py``), so a trace cannot record it. To get a
+    fused *backward*, optimize the captured forward (fusing e.g. ``tanh*sigmoid`` to
+    ``d_gated_act``) and differentiate the result through :func:`eval_graph` -- the
+    fused primitive's VJP then runs (one backward op, not three)."""
     from pycograd.tracer import _INSTRUMENTED, _make_runner
 
     runner = _INSTRUMENTED.get(f)

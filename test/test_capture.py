@@ -199,3 +199,31 @@ def test_fusion_skips_shared_subexpr():
     x = _rng(2).standard_normal((2, 3))
     g2 = fuse_gated_act(capture(shared, x))
     assert ops.d_gated_act not in [nd.prim for nd in g2.nodes]
+
+
+# --- D4: the backward benefits from forward fusion --------------------------
+# Capturing value_and_grad(f) into one graph does NOT compose -- pycograd's reverse
+# pass is not bind-expressed at the base level (the base-vs-higher-order split), so a
+# trace cannot record it. But fusing the *forward* graph still improves the backward:
+# differentiating the optimized graph through eval_graph runs the *fused* primitive's
+# VJP (one backward op for d_gated_act instead of three for tanh/sigmoid/mul).
+def _gate_loss(x):
+    return np.sum(np.tanh(x) * d_sigmoid(x))
+
+
+def test_optimized_forward_gives_a_fused_backward():
+    x = _rng(5).standard_normal((3, 4))
+    g = optimize(capture(_gate_loss, x))  # fuses tanh*sigmoid -> d_gated_act
+    assert ops.d_gated_act in [nd.prim for nd in g.nodes]
+
+    def replay(a):
+        return eval_graph(g, a)
+
+    replay._pycograd_run_directly = True
+    # Gradient through the fused graph uses d_gated_act's VJP; check vs the analytic
+    # derivative of sum(tanh(x) * sigmoid(x)).
+    _, (grad_fused,) = value_and_grad(replay)(x)
+    s = 1.0 / (1.0 + np.exp(-x))
+    t = np.tanh(x)
+    ref = s * (1 - t * t) + t * s * (1 - s)
+    assert np.allclose(np.asarray(grad_fused), ref, atol=1e-9)
