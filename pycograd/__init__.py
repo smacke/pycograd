@@ -11,6 +11,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pycograd import random
 from pycograd._typing import Operand, Tensor
 from pycograd.backends import activate, device, get_backend
+from pycograd.capture import Graph, capture, eval_graph
 from pycograd.checkpoint import checkpoint
 from pycograd.compile import compile_to
 from pycograd.data import DataLoader, batches
@@ -209,6 +210,10 @@ __all__ = [
     # compile to other frameworks (torch / tf / jax)
     "compile_to",
     "get_backend",
+    # graph-capture IR
+    "capture",
+    "eval_graph",
+    "Graph",
     # device / array backend seam (numpy default, cupy for GPU)
     "device",
     "activate",
