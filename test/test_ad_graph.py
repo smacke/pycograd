@@ -7,10 +7,11 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd import value_and_grad  # noqa: E402
+from pycograd import d_sigmoid, ops, value_and_grad  # noqa: E402
 from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import capture, eval_graph  # noqa: E402
 from pycograd.examples import models as M  # noqa: E402
+from pycograd.passes import optimize  # noqa: E402
 from pycograd.tensor import _value  # noqa: E402
 from pycograd.tree import tree_leaves  # noqa: E402
 
@@ -97,3 +98,35 @@ _MODELS = [
 def test_grad_graph_models_roundtrip(cid, loss, argf):
     args = argf()
     _grads_match(grad_graph(capture(loss, *args)), args, loss)
+
+
+# --- G3: cross-pass optimization (CSE across the forward/backward boundary) --
+def _n_prim(graph, prim):
+    return sum(1 for nd in graph.nodes if nd.prim is prim)
+
+
+def _sigmoid_loss(x):
+    # sigmoid's VJP is g * sigmoid(x) * (1 - sigmoid(x)) -- it *recomputes* sigmoid(x),
+    # so the combined graph has the forward's sigmoid(x) plus two in the backward.
+    return np.sum(d_sigmoid(x))
+
+
+def test_cross_pass_cse_merges_recomputed_sigmoid():
+    x = _rng(7).standard_normal((3, 4))
+    combined = grad_graph(capture(_sigmoid_loss, x))
+    before = _n_prim(combined, ops.d_sigmoid)
+    opt = optimize(combined)
+    after = _n_prim(opt, ops.d_sigmoid)
+    assert before >= 3  # 1 forward + 2 recomputed in the VJP
+    assert after == 1  # CSE merged them across the forward/backward boundary
+    # ...and it still computes the right gradient.
+    _, (gx,) = eval_graph(opt, x)
+    s = 1.0 / (1.0 + np.exp(-x))
+    assert np.allclose(np.asarray(_value(gx)), s * (1 - s), atol=1e-9)
+
+
+def test_optimize_preserves_grad_graph_semantics():
+    # optimize() over the combined forward+backward graph must keep value AND grads.
+    args = (M._init_mlp_tree(_rng(1)),)
+    opt = optimize(grad_graph(capture(M.mlp_tree_loss, *args)))
+    _grads_match(opt, args, M.mlp_tree_loss)
