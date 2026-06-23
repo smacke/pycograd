@@ -463,6 +463,111 @@ def streaming_conv_transpose1d(
     return y[:, :, :t], (y[:, :, t:], max(0, t - y.shape[2]))
 
 
+# ---------------------------------------------------------------------------
+# 2-D streaming: stream over a single (time / frame) axis -- the last one (W) --
+# while the other spatial axis (H) is processed whole each step. This is the 1-D
+# state logic above lifted to ``(N, C, H, L_chunk)``, with the cache running along
+# W and H carried as a passenger. Streaming over both spatial axes at once is out
+# of scope (a separate two-axis bookkeeping problem); the W axis is the streaming
+# direction for video frames / spectrogram columns.
+# ---------------------------------------------------------------------------
+def streaming_conv2d_init(
+    num_channels: int,
+    height: int,
+    kernel_w: int,
+    dilation: int = 1,
+    batch: int = 1,
+) -> "tuple[np.ndarray, int]":
+    """Causal zero-seed state for :func:`streaming_conv2d`: a buffer of
+    ``(kW-1)*dilation`` leading zero *columns* (shaped ``(batch, C, height,
+    pad)``), so streaming a clip frame-by-frame reproduces a W-causal conv2d over
+    the whole clip. ``height`` is fixed (only the W axis streams)."""
+    pad = (kernel_w - 1) * dilation
+    return np.zeros((batch, num_channels, height, pad)), 0
+
+
+def streaming_conv2d(
+    x: Tensor,
+    w: Tensor,
+    b: Optional[Tensor] = None,
+    state: "Optional[tuple[np.ndarray, int]]" = None,
+    stride: int = 1,
+    dilation: int = 1,
+    pad_h: int = 0,
+) -> "tuple[np.ndarray, tuple[np.ndarray, int]]":
+    """One incremental step of a W-causal :func:`conv2d` over the next frame chunk
+    ``x`` ``(N, C, H, L_chunk)``, returning ``(y, new_state)``. Streams along W
+    exactly as :func:`streaming_conv1d` does along L (caching the trailing
+    ``(kW-1)*dilation`` columns); the H axis is convolved whole each step, padded
+    symmetrically by ``pad_h`` (a plain spatial pad, re-applied per chunk -- the
+    cache holds raw, un-H-padded columns). Seed ``state`` from
+    :func:`streaming_conv2d_init` for causal behavior."""
+    xa = np.asarray(_value(x))
+    cached, leftover = (None, 0) if state is None else state
+    if cached is not None:
+        xa = np.concatenate([cached, xa], axis=3)
+    if leftover > 0:  # discard W columns skipped by a stride that outran a chunk
+        drop = min(leftover, xa.shape[3])
+        xa, leftover = xa[:, :, :, drop:], leftover - drop
+    recep_w = (w.shape[3] - 1) * dilation + 1
+    if xa.shape[3] < recep_w:  # not enough W context yet -- keep buffering
+        h_out = (
+            xa.shape[2] + 2 * pad_h - (w.shape[2] - 1) * dilation - 1
+        ) // stride + 1
+        empty = np.zeros((xa.shape[0], w.shape[0], h_out, 0))
+        return empty, (xa, leftover)
+    xp = xa
+    if pad_h > 0:  # symmetric pad on H only (axis 2); W stays causal via the cache
+        z = np.zeros((xa.shape[0], xa.shape[1], pad_h, xa.shape[3]))
+        xp = np.concatenate([z, xa, z], axis=2)
+    y = np.asarray(conv2d(xp, w, b, stride=stride, pad=0, dilation=dilation))
+    t = stride * y.shape[3]  # W columns now fully consumed
+    return y, (xa[:, :, :, t:], max(0, t - xa.shape[3]))
+
+
+def streaming_conv_transpose2d_init() -> None:
+    """Initial state for :func:`streaming_conv_transpose2d` -- ``None`` (it caches
+    *output* columns, of which there are none to start), as for the 1-D dual."""
+    return None
+
+
+def streaming_conv_transpose2d(
+    x: Tensor,
+    w: Tensor,
+    b: Optional[Tensor] = None,
+    state: "Optional[tuple[np.ndarray, int]]" = None,
+    stride: int = 1,
+    dilation: int = 1,
+) -> "tuple[np.ndarray, tuple[np.ndarray, int]]":
+    """One incremental step of a :func:`conv_transpose2d` streaming along W over the
+    next frame chunk ``x`` ``(N, C_out, H, L_chunk)``, returning ``(finalized_y,
+    new_state)``. The W-axis dual of :func:`streaming_conv2d`, mirroring
+    :func:`streaming_conv_transpose1d` (cache the output-column overlap, undo the
+    duplicated bias, finalize ``stride * L_chunk`` columns); H is upsampled whole
+    each step. **End-of-stream flush:** concatenate the final ``state[0]`` after the
+    loop. Streaming from ``state=None`` reproduces :func:`conv_transpose2d`."""
+    xa = np.asarray(_value(x))
+    bias = None if b is None else np.asarray(_value(b))
+    c_out = w.shape[1]  # transpose swaps channels: weight's C_in is the output
+    y = np.asarray(
+        conv_transpose2d(xa, w, bias, stride=stride, pad=0, dilation=dilation)
+    )
+    post_y, post_t = (None, 0) if state is None else state
+    if post_t > 0:  # bias-only columns a large stride left between footprints
+        init_y = np.zeros((y.shape[0], c_out, y.shape[2], post_t))
+        if bias is not None:
+            init_y = init_y + np.reshape(bias, (1, c_out, 1, 1))
+        y = np.concatenate([init_y, y], axis=3)
+    if post_y is not None:  # sum the W overlap, undoing the duplicated bias
+        n = min(post_y.shape[3], y.shape[3])
+        merged = post_y[:, :, :, :n] + y[:, :, :, :n]
+        if bias is not None:
+            merged = merged - np.reshape(bias, (1, c_out, 1, 1))
+        y = np.concatenate([merged, post_y[:, :, :, n:], y[:, :, :, n:]], axis=3)
+    t = stride * xa.shape[3]  # W columns now fully settled
+    return y[:, :, :, :t], (y[:, :, :, t:], max(0, t - y.shape[3]))
+
+
 def upsample_nearest2d(x: Tensor, scale: int) -> Tensor:
     """Nearest-neighbor upsample of the last two (spatial) axes by an integer
     ``scale``: ``(N, C, H, W) -> (N, C, H*scale, W*scale)``, each output pixel a

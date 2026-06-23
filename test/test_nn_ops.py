@@ -13,6 +13,7 @@ from pycograd import (  # noqa: E402
     conv1d,
     conv2d,
     conv_transpose1d,
+    conv_transpose2d,
     cumsum,
     eval_shape,
     jvp,
@@ -20,8 +21,12 @@ from pycograd import (  # noqa: E402
     one_hot,
     streaming_conv1d,
     streaming_conv1d_init,
+    streaming_conv2d,
+    streaming_conv2d_init,
     streaming_conv_transpose1d,
     streaming_conv_transpose1d_init,
+    streaming_conv_transpose2d,
+    streaming_conv_transpose2d_init,
     value_and_grad,
     vmap,
 )
@@ -282,6 +287,77 @@ def test_streaming_conv_transpose1d_dilation_matches_parallel(stride, dilation):
     b = rng.standard_normal(3)
     streamed = _stream_conv_transpose1d(x, w, b, stride, dilation)
     parallel = np.asarray(conv_transpose1d(x, w, b, stride=stride, dilation=dilation))
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
+# --- 2-D streaming (single axis: stream over W, H processed whole) -----------
+def _ref_w_causal_conv2d(x, w, b, stride, dilation, pad_h):
+    # The parallel reference: left-pad W by (kW-1)*dilation, symmetric-pad H by
+    # pad_h, then a plain conv2d -- what streaming_conv2d reproduces frame by frame.
+    pad_w = (w.shape[3] - 1) * dilation
+    xp = np.pad(x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, 0)))
+    return np.asarray(conv2d(xp, w, b, stride=stride, pad=0, dilation=dilation))
+
+
+def _stream_conv2d(x, w, b, stride, dilation, pad_h):
+    state = streaming_conv2d_init(
+        x.shape[1], x.shape[2], w.shape[3], dilation, x.shape[0]
+    )
+    outs, i, j = [], 0, 0
+    while i < x.shape[3]:
+        c = _CHUNKS[j % len(_CHUNKS)]
+        y, state = streaming_conv2d(
+            x[:, :, :, i : i + c],
+            w,
+            b,
+            state,
+            stride=stride,
+            dilation=dilation,
+            pad_h=pad_h,
+        )
+        outs.append(np.asarray(y))
+        i, j = i + c, j + 1
+    return np.concatenate(outs, axis=3)
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dilation", [1, 2])
+@pytest.mark.parametrize("pad_h", [0, 1])
+def test_streaming_conv2d_matches_w_causal(stride, dilation, pad_h):
+    rng = np.random.default_rng(30)
+    x = rng.standard_normal((2, 3, 5, 13))  # (N, C, H, W) -- stream over W
+    w = rng.standard_normal((4, 3, 3, 3))
+    b = rng.standard_normal(4)
+    streamed = _stream_conv2d(x, w, b, stride, dilation, pad_h)
+    parallel = _ref_w_causal_conv2d(x, w, b, stride, dilation, pad_h)
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-9)
+
+
+def _stream_conv_transpose2d(x, w, b, stride, dilation):
+    state = streaming_conv_transpose2d_init()
+    outs, i, j = [], 0, 0
+    while i < x.shape[3]:
+        c = _CHUNKS[j % len(_CHUNKS)]
+        y, state = streaming_conv_transpose2d(
+            x[:, :, :, i : i + c], w, b, state, stride=stride, dilation=dilation
+        )
+        outs.append(np.asarray(y))
+        i, j = i + c, j + 1
+    outs.append(np.asarray(state[0]))  # end-of-stream flush of the cached W tail
+    return np.concatenate(outs, axis=3)
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dilation", [1, 2])
+def test_streaming_conv_transpose2d_matches_parallel(stride, dilation):
+    rng = np.random.default_rng(31)
+    x = rng.standard_normal((2, 4, 4, 9))  # (N, C_out, H, W)
+    w = rng.standard_normal((4, 3, 3, 3))  # (C_out, C_in, kH, kW)
+    b = rng.standard_normal(3)
+    streamed = _stream_conv_transpose2d(x, w, b, stride, dilation)
+    parallel = np.asarray(conv_transpose2d(x, w, b, stride=stride, dilation=dilation))
     assert streamed.shape == parallel.shape
     assert np.allclose(streamed, parallel, atol=1e-9)
 
