@@ -14,9 +14,20 @@ from typing import cast
 import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Operand, Tensor
-from pycograd.functional import dropout, layer_norm, linear
+from pycograd.functional import (
+    causal_conv1d,
+    conv1d,
+    dropout,
+    layer_norm,
+    linear,
+    relu,
+)
 from pycograd.functional import scaled_dot_product_attention as attention
 from pycograd.functional import softmax as _softmax
+from pycograd.functional import (
+    streaming_conv1d,
+    streaming_conv1d_init,
+)
 from pycograd.tree import PyTree
 
 # NOTE: these demo functions are recompiled by pyccolo during instrumentation,
@@ -72,11 +83,9 @@ def logistic_param_loss(model: dict[str, Tensor]) -> Operand:
 
 # ---------------------------------------------------------------------------
 # A 2-layer feedforward net (ReLU hidden + softmax head), 3-way classifier.
+# ``relu`` is imported straight from ``pycograd.functional`` -- the canonical op,
+# instrumented on demand like everything here, so no local re-spelling is needed.
 # ---------------------------------------------------------------------------
-def relu(z: Tensor) -> Tensor:
-    return np.maximum(z, 0.0)
-
-
 def softmax(z: Tensor) -> Tensor:
     # Stable softmax over the class axis, from the first-class op in functional.
     return _softmax(z, axis=1)
@@ -804,3 +813,98 @@ def _lstm_accuracy(p: LSTMParams) -> float:
 
 def sin_sq(x: Tensor) -> Operand:
     return np.sum(np.sin(x * x))
+
+
+# ---------------------------------------------------------------------------
+# Dilated-causal WaveNet block: an end-to-end demo of streaming convolutions.
+#
+# Like the recurrent cells above, each form is a plain helper with no autodiff
+# rule -- built from ``causal_conv1d`` / ``conv1d`` and a gated activation, so it
+# differentiates on the numpy tape and ``vmap``\\s. The parallel :func:`wavenet`
+# runs a whole ``(N, C, L)`` sequence at once (training); :func:`wavenet_step`
+# runs it chunk-by-chunk for O(receptive-field) streaming inference, threading
+# one :func:`streaming_conv1d` state per block. The two agree position-for-
+# position (verified in the tests), exactly as ``rwkv_lm`` <-> ``rwkv_step``.
+#
+# Each block is the classic residual unit: a dilated causal conv to ``2*C``
+# channels, split into a filter/gate pair ``tanh(f) * sigmoid(g)``, a 1x1 residual
+# add, and a 1x1 skip tap. Only the dilated conv carries cross-chunk state (the
+# 1x1 convs and the pointwise nonlinearity are local); each layer's streaming
+# state caches that layer's own input, so the chunked dataflow stays exact. Block
+# ``i`` uses dilation ``2**i`` -- the standard exponentially-growing WaveNet stack.
+WaveNetBlockParams = dict[str, Tensor]
+WaveNetState = list  # list[tuple[Array, int]] -- one streaming_conv1d state per block
+
+
+def _wavenet_gate(conv: Tensor, c: int) -> Tensor:
+    # Split the ``2*C``-channel conv output into filter/gate halves and combine.
+    return cast(Tensor, np.tanh(conv[:, :c]) * sigmoid(conv[:, c:]))
+
+
+def wavenet(x: Tensor, blocks: list[WaveNetBlockParams], out_w: Tensor) -> Tensor:
+    # Parallel form. ``x`` is ``(N, C, L)``; stack dilated-causal residual blocks
+    # (dilation ``2**i``) and sum their skip taps into a 1x1 output projection.
+    h = x
+    skip_sum: Tensor = x * 0.0  # data-shaped zero seed (stays batched under vmap)
+    for i, bp in enumerate(blocks):
+        conv = causal_conv1d(h, bp["conv_w"], bp["conv_b"], dilation=2**i)
+        z = _wavenet_gate(conv, h.shape[1])
+        h = h + conv1d(z, bp["res_w"])  # 1x1 residual
+        skip_sum = skip_sum + conv1d(z, bp["skip_w"])  # 1x1 skip tap
+    return cast(Tensor, conv1d(relu(skip_sum), out_w))
+
+
+def wavenet_init_state(
+    blocks: list[WaveNetBlockParams], batch: int = 1
+) -> WaveNetState:
+    # One zero-seeded streaming_conv1d state per block's dilated causal conv.
+    return [
+        streaming_conv1d_init(
+            bp["conv_w"].shape[1], bp["conv_w"].shape[2], dilation=2**i, batch=batch
+        )
+        for i, bp in enumerate(blocks)
+    ]
+
+
+def wavenet_step(
+    x: Tensor,
+    blocks: list[WaveNetBlockParams],
+    out_w: Tensor,
+    state: WaveNetState,
+) -> tuple[Array, WaveNetState]:
+    # Streaming form: one chunk ``(N, C, L_chunk)`` in, the matching output chunk
+    # out, plus the advanced per-block states. Plain numpy -- no tape. For stride-1
+    # causal convs each block's output length equals the chunk length, so the
+    # residual/skip 1x1 convs line up and the cross-chunk context lives in state.
+    h = np.asarray(x)
+    skip_sum = np.zeros_like(h[:, : out_w.shape[1]])
+    new_state: WaveNetState = []
+    for i, bp in enumerate(blocks):
+        conv, st = streaming_conv1d(
+            h, bp["conv_w"], bp["conv_b"], state[i], dilation=2**i
+        )
+        new_state.append(st)
+        z = _wavenet_gate(conv, h.shape[1])
+        h = h + np.asarray(conv1d(z, bp["res_w"]))
+        skip_sum = skip_sum + np.asarray(conv1d(z, bp["skip_w"]))
+    return np.asarray(conv1d(relu(skip_sum), out_w)), new_state
+
+
+def _init_wavenet(
+    rng: np.random.Generator, channels: int, n_blocks: int, k: int = 2
+) -> tuple[list[WaveNetBlockParams], Array]:
+    # ``channels`` residual/skip width, ``k`` the (small) WaveNet kernel size.
+    s = 0.1
+    rn = rng.standard_normal
+    c = channels
+    blocks: list[WaveNetBlockParams] = [
+        {
+            "conv_w": s * rn((2 * c, c, k)),  # dilated causal conv -> filter|gate
+            "conv_b": np.zeros(2 * c),
+            "res_w": s * rn((c, c, 1)),  # 1x1 residual
+            "skip_w": s * rn((c, c, 1)),  # 1x1 skip
+        }
+        for _ in range(n_blocks)
+    ]
+    out_w = s * rn((c, c, 1))  # 1x1 output projection
+    return blocks, out_w

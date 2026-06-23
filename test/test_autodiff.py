@@ -45,6 +45,7 @@ from pycograd.examples.models import (  # noqa: E402
     _init_rwkv,
     _init_rwkv_block,
     _init_transformer,
+    _init_wavenet,
     _lstm_accuracy,
     _mlp_accuracy,
     _mlp_tree_accuracy,
@@ -73,6 +74,9 @@ from pycograd.examples.models import (  # noqa: E402
     softmax,
     transformer_block,
     transformer_loss,
+    wavenet,
+    wavenet_init_state,
+    wavenet_step,
     wkv,
 )
 
@@ -702,6 +706,53 @@ def test_rwkv_recurrent_matches_parallel():
         logits, state = rwkv_step(int(ids[t]), top, blocks, state)
         rows.append(logits)
     assert np.allclose(parallel, np.stack(rows), atol=1e-9)
+
+
+# --- WaveNet: dilated-causal streaming convolutions -------------------------
+# The chunk-by-chunk streaming form must reproduce the parallel form position
+# for position (the ``rwkv_step`` equivalence pattern, now for convolutions).
+_WAVENET_BLOCKS, _WAVENET_OUT_W = _init_wavenet(
+    np.random.default_rng(0), channels=4, n_blocks=3, k=2
+)
+_WAVENET_X = np.random.default_rng(1).standard_normal((2, 4, 16))
+_WAVENET_TARGET = np.random.default_rng(2).standard_normal((2, 4, 16))
+
+
+def wavenet_mse(blocks, out_w):
+    # Mean-squared error of the parallel WaveNet against a fixed target sequence.
+    return np.mean((wavenet(_WAVENET_X, blocks, out_w) - _WAVENET_TARGET) ** 2)
+
+
+def test_wavenet_streaming_matches_parallel():
+    parallel = np.asarray(wavenet(_WAVENET_X, _WAVENET_BLOCKS, _WAVENET_OUT_W))
+    state = wavenet_init_state(_WAVENET_BLOCKS, batch=_WAVENET_X.shape[0])
+    outs, i, j, sizes = [], 0, 0, [2, 1, 3, 2, 4, 1]  # uneven chunks
+    while i < _WAVENET_X.shape[2]:
+        c = sizes[j % len(sizes)]
+        y, state = wavenet_step(
+            _WAVENET_X[:, :, i : i + c], _WAVENET_BLOCKS, _WAVENET_OUT_W, state
+        )
+        outs.append(y)
+        i, j = i + c, j + 1
+    streamed = np.concatenate(outs, axis=2)
+    assert streamed.shape == parallel.shape
+    assert np.allclose(streamed, parallel, atol=1e-12)
+
+
+def test_wavenet_trains():
+    from pycograd.tree import tree_map
+
+    params = _init_wavenet(np.random.default_rng(0), channels=4, n_blocks=3, k=2)
+    first = last = None
+    for _ in range(60):
+        loss, grads = value_and_grad(wavenet_mse)(*params)
+        first = float(loss) if first is None else first
+        last = float(loss)
+        params = tuple(
+            tree_map(lambda p, g: p - 0.1 * g, arg, grad)
+            for arg, grad in zip(params, grads)
+        )
+    assert last < first  # gradient descent reduces the regression loss
 
 
 # --- RNN / GRU / LSTM: gated recurrent cells --------------------------------
