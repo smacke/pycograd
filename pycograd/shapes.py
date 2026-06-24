@@ -870,6 +870,9 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_reshape: abstract_reshape,
             ops.d_broadcast_to: abstract_broadcast_to,
             ops._scatter: abstract_scatter,
+            # identity remat/spill markers (pycograd.remat): shape/dtype pass through
+            ops._spill: abstract_unary,
+            ops._recompute: abstract_unary,
             ops.d_expand_dims: abstract_expand_dims,
             ops.d_concatenate: abstract_concatenate,
             ops.d_stack: abstract_stack,

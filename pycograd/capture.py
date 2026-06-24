@@ -117,6 +117,36 @@ class Graph:
         """
         return to_dot(self)
 
+    def cost(self, model: Any = None) -> Any:
+        """A static CPU / memory / disk :class:`~pycograd.cost.GraphCost` estimate for
+        this graph (no execution). ``model`` is an optional
+        :class:`~pycograd.cost.CostModel`; the default uses conservative NVMe-class
+        hardware constants. ``print(graph.cost())`` shows a per-node listing + totals.
+        """
+        from pycograd.cost import DEFAULT_COST_MODEL, cost_report
+
+        return cost_report(self, DEFAULT_COST_MODEL if model is None else model)
+
+    def plan_remat(self, budget: int, model: Any = None, **kwargs: Any) -> Any:
+        """Plan keep/spill/recompute for this (forward+backward) graph so its peak resident
+        memory fits ``budget`` bytes -- a :class:`~pycograd.remat.RematPlan`. ``model`` is an
+        optional :class:`~pycograd.cost.CostModel`; ``**kwargs`` (``exact``/``iters``) pass
+        through to :func:`~pycograd.remat.plan_remat`."""
+        from pycograd.cost import DEFAULT_COST_MODEL
+        from pycograd.remat import plan_remat
+
+        return plan_remat(
+            self, budget, DEFAULT_COST_MODEL if model is None else model, **kwargs
+        )
+
+    def eval_scheduled(self, *inputs: PyTree, store_dir: "str | None" = None) -> Any:
+        """Evaluate this graph (typically after :func:`~pycograd.remat.apply_remat_plan`)
+        with the memory-managed interpreter, returning ``(outputs, peak_resident_bytes)``.
+        See :func:`~pycograd.remat.eval_scheduled`."""
+        from pycograd.remat import eval_scheduled
+
+        return eval_scheduled(self, *inputs, store_dir=store_dir)
+
     def render(self) -> Any:  # pragma: no cover - optional dependency
         """A ``graphviz.Source`` (renders inline in Jupyter). Requires the optional
         ``graphviz`` Python package; otherwise use :meth:`to_dot`."""

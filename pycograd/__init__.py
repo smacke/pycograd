@@ -15,6 +15,14 @@ from pycograd.backends import activate, device, get_backend
 from pycograd.capture import Graph, capture, eval_graph
 from pycograd.checkpoint import checkpoint
 from pycograd.compile import compile_to
+from pycograd.cost import (
+    DEFAULT_COST_MODEL,
+    CostModel,
+    GraphCost,
+    NodeCost,
+    calibrate,
+    cost_report,
+)
 from pycograd.data import DataLoader, batches
 from pycograd.dtypes import current_dtype, dtype, resolve_dtype
 from pycograd.export import export_onnx, export_torchscript, to_torch_module
@@ -129,6 +137,13 @@ from pycograd.params import (
     tied,
 )
 from pycograd.passes import optimize
+from pycograd.remat import (
+    Decision,
+    RematPlan,
+    apply_remat_plan,
+    eval_scheduled,
+    plan_remat,
+)
 from pycograd.shapes import (
     Dim,
     ShapedArray,
@@ -219,6 +234,19 @@ __all__ = [
     "grad_graph",
     "jit",
     "Graph",
+    # static cost model over the capture IR (CPU / memory / disk)
+    "cost_report",
+    "CostModel",
+    "GraphCost",
+    "NodeCost",
+    "DEFAULT_COST_MODEL",
+    "calibrate",
+    # rematerialization / spill planning + memory-managed execution
+    "plan_remat",
+    "RematPlan",
+    "Decision",
+    "apply_remat_plan",
+    "eval_scheduled",
     # device / array backend seam (numpy default, cupy for GPU)
     "device",
     "activate",

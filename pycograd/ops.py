@@ -1316,6 +1316,50 @@ def _vjp_remat(
     return params["remat"].differentiable_vjp(operands, g)
 
 
+def _spill(x: Operand) -> Var:
+    """Identity marker: this value is paged to SSD after its forward uses and reloaded on
+    its backward use. Inserted by :mod:`pycograd.remat`'s ``apply_remat_plan``. The actual
+    disk I/O lives in the scheduled interpreter (``eval_scheduled``), so here ``_spill`` is
+    a pure value-identity -- ``eval_graph`` of a rewritten graph is byte-for-byte unchanged
+    -- with an identity VJP so an enclosing ``grad`` still flows straight through."""
+    x = _lift(x)
+    out = Var(x.value, _parents=(x,))
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, out.grad)
+
+    out._backward = _backward
+    _record_vjp(out, _spill, (x,), {})
+    return out
+
+
+def _recompute(x: Operand) -> Var:
+    """Identity marker: this value is dropped after its forward uses and rematerialized on
+    its backward use. The recompute counterpart to :func:`_spill` (see its note) -- a pure
+    value-identity with an identity VJP; the scheduled interpreter performs the on-demand
+    recomputation of the producing subgraph."""
+    x = _lift(x)
+    out = Var(x.value, _parents=(x,))
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, out.grad)
+
+    out._backward = _backward
+    _record_vjp(out, _recompute, (x,), {})
+    return out
+
+
+def _vjp_identity(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    """VJP of the identity markers :func:`_spill` / :func:`_recompute`: the single operand's
+    cotangent is the incoming cotangent, passed straight through."""
+    return [g]
+
+
 def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
     vjp_for: dict[Prim, Callable[..., list[Boxed]]] = {
         prim: _vjp_unary_for(cast(Callable[..., Var], prim)) for prim in _UNARY_DERIV
@@ -1347,6 +1391,8 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_minimum: _vjp_select,
             d_where: _vjp_where,
             _remat: _vjp_remat,
+            _spill: _vjp_identity,
+            _recompute: _vjp_identity,
         }
     )
     return vjp_for
