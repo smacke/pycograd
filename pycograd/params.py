@@ -34,6 +34,7 @@ from pycograd.ops import _INTERCEPT, _warn_wrapper
 from pycograd.tensor import Var, _is_numeric, _value, grad_recording
 
 if TYPE_CHECKING:
+    from pycograd.optimizers import Optimizer
     from pycograd.tree import PyTree
 
 
@@ -511,17 +512,25 @@ class ParamDict(dict):
 
     def grad(
         self,
-        objective: Callable[[], PyTree],
-        *,
+        objective: Callable[..., PyTree],
+        *args: object,
         backend: "str | None" = None,
         dtype: "DTypeLike | None" = None,
         jit: bool = False,
+        **kwargs: object,
     ) -> tuple[Array, ParamDict]:
-        """Run ``objective`` (a no-arg callable returning a scalar, built from this
-        model) with the weights bound to ``Var``s, backprop, and return
-        ``(value, grads)`` where ``grads`` is a ``ParamDict`` of gradients (``None``
-        at frozen weights). Tied weights share one gradient. Trainable leaves only;
-        nest by calling per sub-tree.
+        """Run ``objective`` (a callable returning a scalar, built from this model)
+        with the weights bound to ``Var``s, backprop, and return ``(value, grads)``
+        where ``grads`` is a ``ParamDict`` of gradients (``None`` at frozen weights).
+        Tied weights share one gradient. Trainable leaves only; nest by calling per
+        sub-tree.
+
+        ``objective`` is usually a no-arg callable that reads the weights and its data
+        by closure, but any ``*args`` / ``**kwargs`` passed here are forwarded to it
+        verbatim -- so the objective can instead be a *pure function of a minibatch*
+        (``weights.grad(loss, Xb, Yb)``) and the data flows in as an argument rather
+        than being closed over or re-sampled inside the pipe. This is what lets
+        :func:`pycograd.training.fit` feed fresh minibatches each step.
 
         With ``backend=`` (``"torch"`` / ``"jax"`` / ``"tf"``) the same ambient objective
         is instead run on that framework and differentiated by *its* autodiff -- the
@@ -536,7 +545,7 @@ class ParamDict(dict):
         -- so it fits full-batch loops, not minibatching that swaps the data each step.
         """
         if backend is not None and backend != "numpy":
-            return self._grad_via_backend(objective, backend, dtype, jit)
+            return self._grad_via_backend(objective, backend, dtype, jit, args, kwargs)
         from pycograd.tracer import _INSTRUMENTED, _make_runner
         from pycograd.transforms import _wrap_leaf
 
@@ -564,7 +573,9 @@ class ParamDict(dict):
         _ACTIVE_BINDINGS.append(self)
         try:
             with grad_recording():
-                out = runner()
+                # ``*args``/``**kwargs`` are forwarded verbatim (a minibatch, say); they
+                # are deliberately untyped ``object`` -- the objective decides their shape.
+                out = runner(*args, **kwargs)
         finally:
             _ACTIVE_BINDINGS.pop()
             self._live = prev
@@ -583,10 +594,12 @@ class ParamDict(dict):
 
     def _grad_via_backend(
         self,
-        objective: Callable[[], PyTree],
+        objective: Callable[..., PyTree],
         backend: str,
         dtype: DTypeLike | None,
         jit: bool,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
     ) -> tuple[Array, ParamDict]:
         """``grad`` on a delegate backend: bind each weight to a *backend tensor* in the
         ambient ``_live`` slot (instead of a ``Var``), run the instrumented objective under
@@ -627,7 +640,7 @@ class ParamDict(dict):
                         prev = getattr(self, "_live", None)
                         self._live = {k: _fill(plan[k], tensors, be) for k in self}
                         try:
-                            return runner()
+                            return runner(*args, **kwargs)
                         finally:
                             self._live = prev
 
@@ -660,10 +673,28 @@ class ParamDict(dict):
             )
             return np.asarray(value), grads
 
-    def step(self, grads: ParamDict, lr: float) -> None:
-        """One in-place SGD step: ``p.value -= lr * grad`` for each trainable leaf
-        (frozen / buffer leaves, whose gradient is ``None``, are left untouched). The
-        model's proxies read the updated values on the next call."""
+    def step(self, grads: ParamDict, opt: "float | Optimizer") -> None:
+        """Advance the weights one step **in place** so the ambient proxies read the
+        update on the next forward.
+
+        ``opt`` may be a float learning rate -- plain SGD ``p.value -= lr * grad`` for
+        each trainable leaf -- or an :class:`~pycograd.optimizers.Optimizer` (``Adam``,
+        ``SGD`` with momentum, ...). Note the contrast: :meth:`Optimizer.step` is
+        *functional* (it returns a fresh parameter pytree), so this method wraps it --
+        running ``opt.step(self, grads)`` and copying each result back into the live
+        ``Param`` leaves -- to keep the ambient-weights update in place. Frozen / buffer
+        leaves (gradient ``None``) are left untouched in either path; the optimizer
+        carries its own state across calls (momentum / Adam moments / step count)."""
+        from pycograd.optimizers import Optimizer
+
+        if isinstance(opt, Optimizer):
+            updated = cast(ParamDict, opt.step(self, grads))
+            for key in self:
+                leaf = self[key]
+                if isinstance(leaf, Param):
+                    leaf.value = cast(Param, updated[key]).value
+            return
+        lr = opt
         for key in self:
             leaf = self[key]
             g = grads.get(key)

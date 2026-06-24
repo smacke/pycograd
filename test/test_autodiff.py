@@ -13,13 +13,17 @@ np = pytest.importorskip("numpy")
 
 import pycograd as pg  # noqa: E402
 from pycograd import (  # noqa: E402
+    SGD,
+    Adam,
     AutodiffWarning,
+    DataLoader,
     Param,
     ParamDict,
     Var,
     Weight,
     d_sigmoid,
     detach,
+    fit,
     frozen,
     grad,
     gradient_descent,
@@ -1418,6 +1422,15 @@ def proxy_loss():
     return cross_entropy(proxy_forward(_PX), _PY)
 
 
+def proxy_loss_args(Xb, Yb):  # a parameterized objective: pure function of a minibatch
+    return cross_entropy(proxy_forward(Xb), Yb)
+
+
+def proxy_loss_batch(batch):  # the one-arg form `fit` feeds (a (Xb, Yb) tuple)
+    Xb, Yb = batch
+    return cross_entropy(proxy_forward(Xb), Yb)
+
+
 # Module-level so the pyccolo-instrumented runner (recompiled from source) can see the
 # counter as a global -- a closure over a test-local would be lost on recompile.
 _jit_trace_calls = {"n": 0}
@@ -1584,9 +1597,68 @@ def test_with_weights_grad_backend_frozen_leaf_is_none(backend):
 def test_step_updates_in_place_and_skips_frozen():
     weights = params(w=np.array([1.0, 2.0]), b=frozen(np.array([5.0, 6.0])))
     grads = ParamDict({"w": np.array([1.0, 1.0]), "b": None})
-    weights.step(grads, lr=0.1)
+    weights.step(grads, 0.1)
     assert np.allclose(weights["w"].value, [0.9, 1.9])
     assert np.allclose(weights["b"].value, [5.0, 6.0])  # frozen untouched
+
+
+def test_grad_forwards_args_to_objective():
+    # A parameterized objective (a pure function of a minibatch) must produce the same
+    # value/gradients as the no-arg closure form fed the whole dataset.
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        v_args, g_args = weights.grad(proxy_loss_args, _PX, _PY)
+        v_clo, g_clo = weights.grad(proxy_loss)
+    assert np.isclose(float(v_args), float(v_clo))
+    assert np.allclose(g_args["w"], g_clo["w"])
+    assert np.allclose(g_args["b"], g_clo["b"])
+
+
+def test_step_accepts_optimizer_in_place():
+    weights = params(w=_PW.copy(), b=frozen(_PB.copy()))  # freeze the bias
+    with weights:
+        _, grads = weights.grad(proxy_loss)
+    before = weights["w"].value.copy()
+    opt = SGD(lr=0.1)  # no momentum: equals plain p - lr*g
+    weights.step(grads, opt)
+    assert np.allclose(weights["w"].value, before - 0.1 * grads["w"])
+    assert np.allclose(weights["b"].value, _PB)  # frozen leaf untouched
+    assert opt.t == 1  # the optimizer carries its own step state
+
+
+def test_fit_minibatch_reduces_loss_and_reports_history():
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    seen: list[tuple[int, float]] = []
+    with weights:
+        history = fit(
+            weights,
+            proxy_loss_batch,
+            _PX,
+            _PY,
+            epochs=8,
+            batch_size=3,
+            opt=SGD(lr=0.5),
+            rng=np.random.default_rng(0),
+            on_epoch=lambda e, loss: seen.append((e, loss)),
+        )
+    assert len(history) == 8
+    assert [e for e, _ in seen] == list(range(8))
+    assert history[-1] < history[0]  # minibatch SGD made progress
+
+
+def test_fit_accepts_dataloader_and_rejects_ambiguous_data():
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    loader = DataLoader(
+        _PX, _PY, batch_size=3, shuffle=True, rng=np.random.default_rng(1)
+    )
+    with weights:
+        history = fit(weights, proxy_loss_batch, loader, epochs=3, opt=Adam(lr=0.1))
+    assert len(history) == 3
+    # A DataLoader and a batch_size together is ambiguous; loose arrays need a batch_size.
+    with pytest.raises(ValueError):
+        fit(weights, proxy_loss_batch, loader, epochs=1, opt=0.5, batch_size=3)
+    with pytest.raises(ValueError):
+        fit(weights, proxy_loss_batch, _PX, _PY, epochs=1, opt=0.5)
 
 
 def test_with_weights_inference_is_clean_and_training_updates():
