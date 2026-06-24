@@ -24,7 +24,7 @@ import numpy as np
 
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
-from pycograd.dtypes import current_dtype
+from pycograd.dtypes import current_dtype, is_integral_array
 from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 
@@ -32,6 +32,10 @@ def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
     """Convert ``x`` to a tf tensor in the active working dtype (bf16 via float32)."""
     if tf.is_tensor(x) or isinstance(x, tf.Variable):
         return x
+    if is_integral_array(x):
+        # An integer array is an index/label, not a differentiable float operand;
+        # preserve its dtype rather than casting to the working float dtype.
+        return tf.constant(np.asarray(x))
     dt = current_dtype()
     if dt.name == "bfloat16":
         # TF can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.

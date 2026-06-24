@@ -263,6 +263,46 @@ def test_autodiff_compose_power_distinct_from_power():
     )
 
 
+def test_leading_value_pipe_stage_with_integer_index_under_backend():
+    # ``|> idx |> forward`` must equal ``forward(idx)`` even when ``forward`` gathers a table
+    # with the integer index ``idx`` and runs under a delegate backend. Regression for a bug
+    # where the binop-arg coercion handler ran on the pipe seed ``idx`` (the ``|>`` lowers to
+    # a ``BitOr`` BinOp), the torch backend lifted that int index to a *float* tensor, and
+    # ``table[idx]`` then raised "tensors used as indices must be long, int, byte or bool".
+    pytest.importorskip("torch")
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np")
+        ip.run_cell("from pycograd import params")
+        ip.run_cell("rng = np.random.default_rng(0)")
+        ip.run_cell("idx = np.array([0, 3, 7, 2, 5, 1])")
+        ip.run_cell("Yt = np.eye(3)[[0, 1, 2, 0, 1, 2]]")
+        ip.run_cell(
+            "def softmax_ce(logits, onehot):\\n"
+            " z = logits - np.max(logits, axis=1, keepdims=True)\\n"
+            " logp = z - np.log(np.sum(np.exp(z), axis=1, keepdims=True))\\n"
+            " return -np.mean(np.sum(onehot * logp, axis=1))"
+        )
+        src = (
+            "with params{\\n"
+            "    table = rng.standard_normal((16, 8))\\n"
+            "    w = 0.3 * rng.standard_normal((8, 3))\\n"
+            "    b = np.zeros(3)\\n"
+            "} as weights:\\n"
+            "    forward = $ |> table[$] |> $ @ w + b\\n"
+            "    v_call, _ = weights.grad(|> forward(idx) |> softmax_ce($, Yt), backend='torch')\\n"
+            "    v_pipe, _ = weights.grad(|> idx |> forward |> softmax_ce($, Yt), backend='torch')\\n"
+        )
+        r = ip.run_cell(src)
+        assert r.error_in_exec is None, r.error_in_exec
+        v_call, v_pipe = float(ip.user_ns["v_call"]), float(ip.user_ns["v_pipe"])
+        assert np.allclose(v_call, v_pipe), (v_call, v_pipe)
+        print("OK")
+        """
+    )
+
+
 def test_autodiff_edited_pipe_lambda_not_stale():
     # Editing a pipe lambda and re-running must use the NEW pipeline, not a stale one.
     # The lambda's augmented node is recovered from the shared registry to re-instrument it;

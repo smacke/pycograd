@@ -24,7 +24,7 @@ import numpy as np
 
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Index, Prim, Shape
 from pycograd.backends import Backend
-from pycograd.dtypes import current_dtype
+from pycograd.dtypes import current_dtype, is_integral_array
 from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 if TYPE_CHECKING:
@@ -55,7 +55,12 @@ def _as_torch(
     dt = current_dtype() if np_dtype is None else np_dtype
     if isinstance(x, torch.Tensor):
         return x if device is None else x.to(device)
-    if dt.name == "bfloat16":
+    if is_integral_array(x):
+        # An integer array is an index/label, not a differentiable float operand;
+        # preserve its dtype rather than casting to the working float dtype (else
+        # ``table[idx]`` sees a float index and torch rejects it).
+        t = torch.as_tensor(np.asarray(x))
+    elif dt.name == "bfloat16":
         # torch can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
         t = torch.as_tensor(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
     else:

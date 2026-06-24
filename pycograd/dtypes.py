@@ -100,6 +100,21 @@ def current_dtype() -> np.dtype:
     return resolve_dtype(_DTYPE.get())
 
 
+def is_integral_array(x: object) -> bool:
+    """True if ``x`` is a numpy integer array or scalar.
+
+    Such a value is an index or categorical label -- non-differentiable -- so when a
+    delegate backend lifts it to a tensor it must keep its dtype rather than be cast to the
+    working float dtype (a float index breaks ``table[idx]``). Gated on numpy
+    arrays/generics so python scalars keep their historical (float) lifting. Booleans are
+    deliberately excluded: a numpy bool array is most often an arithmetic mask (e.g. a
+    dropout ``mask / keep_prob``) that needs the float dtype, so it keeps the historical
+    cast."""
+    if not isinstance(x, (np.ndarray, np.generic)):
+        return False
+    return np.issubdtype(x.dtype, np.integer)
+
+
 @contextlib.contextmanager
 def dtype(spec: DTypeLike | None) -> Iterator[np.dtype]:
     """Run the enclosed tape in a given working dtype (``"float32"``, ``"bf16"``, ...).

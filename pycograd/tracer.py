@@ -270,14 +270,41 @@ class AutodiffTracer(pyc.BaseTracer):
     ) -> Prim:
         return self.resolve_call(func)
 
+    def _operand_of_pipe(self, operand_node: object) -> bool:
+        """True if ``operand_node`` is an operand of a pipescript ``|>`` pipe.
+
+        pipescript lowers ``a |> f`` to a ``BitOr`` (``|``) ``BinOp`` tagged with its pipe
+        augmentations, so a pipe operand is the *piped value* (``a``) or the *stage function*
+        (``f``) -- neither is an arithmetic operand, so coercing it (below) is wrong: it would
+        e.g. float an integer index seed and break ``table[idx]`` downstream. We duck-type on
+        the parent ``BinOp`` carrying augmentations (mirroring pipescript's own
+        ``node_is_pipeline_bitor_op``) rather than importing pipescript, exactly as the
+        ``_COMPOSE_TOKEN`` check above does. A plain bitwise-or carries no augmentations, so
+        it is still coerced."""
+        parent = self.containing_ast_by_id.get(id(operand_node))
+        return (
+            isinstance(parent, ast.BinOp)
+            and isinstance(parent.op, ast.BitOr)
+            and bool(self.get_augmentations(id(parent)))
+        )
+
     @pyc.register_handler(pyc.after_left_binop_arg)
-    def handle_left_binop_arg(self, ret: Boxed, *_: object, **__: object) -> Boxed:
+    def handle_left_binop_arg(
+        self, ret: Boxed, node: object, *_: object, **__: object
+    ) -> Boxed:
         # Let the active backend promote a binop operand (e.g. a numpy data global
-        # meeting a torch/tf tensor). numpy/jax leave it unchanged.
+        # meeting a torch/tf tensor). numpy/jax leave it unchanged. A pipescript pipe
+        # stage is not an arithmetic operand, so leave its piped value/function alone.
+        if self._operand_of_pipe(node):
+            return ret
         return current_backend().coerce_operand(ret)
 
     @pyc.register_handler(pyc.after_right_binop_arg)
-    def handle_right_binop_arg(self, ret: Boxed, *_: object, **__: object) -> Boxed:
+    def handle_right_binop_arg(
+        self, ret: Boxed, node: object, *_: object, **__: object
+    ) -> Boxed:
+        if self._operand_of_pipe(node):
+            return ret
         return current_backend().coerce_operand(ret)
 
     # -- operator interception: route ops through the trace-level stack ---------

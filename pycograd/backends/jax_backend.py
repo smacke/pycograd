@@ -19,11 +19,21 @@ import numpy as np
 
 from pycograd._typing import Array, BackendArray, Prim
 from pycograd.backends import Backend
-from pycograd.dtypes import current_dtype
+from pycograd.dtypes import current_dtype, is_integral_array
 from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 # math.* names that don't exist verbatim on jnp.
 _NAME_OVERRIDE = {"atan": "arctan"}
+
+
+def _as_jnp(jnp: ModuleType, x: BackendArray) -> BackendArray:
+    """Convert ``x`` to a jnp array in the working dtype, preserving integer/bool dtype.
+
+    An integer/bool array is an index/mask/label, not a differentiable float operand, so
+    keep its dtype rather than casting to the working float dtype."""
+    if is_integral_array(x):
+        return jnp.asarray(np.asarray(x))
+    return jnp.asarray(np.asarray(x, dtype=current_dtype()))
 
 
 def _build_intercept(jnp: ModuleType) -> dict[Prim, Prim]:
@@ -126,11 +136,11 @@ class JaxBackend(Backend):
         return _unmapped(func, self._is_tensor)
 
     def lift(self, array: BackendArray) -> BackendArray:
-        return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
+        return _as_jnp(self._jnp, array)
 
     def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
         self._reject_device(device)  # per-leaf placement is torch-only for now
-        return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
+        return _as_jnp(self._jnp, array)
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
         # The tracer's ``after_{left,right}_binop_arg`` handlers run each ``@``/``+``/...
@@ -142,7 +152,7 @@ class JaxBackend(Backend):
         # and tf override this too; the numpy/cupy tape needs no coercion, hence the identity
         # default on the base ``Backend``.)
         if isinstance(value, (np.ndarray, np.generic)):
-            return self._jnp.asarray(np.asarray(value, dtype=current_dtype()))
+            return _as_jnp(self._jnp, value)
         return value
 
     def to_numpy(self, tensor: BackendArray) -> Array:

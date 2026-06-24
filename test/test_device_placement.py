@@ -72,6 +72,25 @@ def test_device_tag_is_a_noop_on_the_numpy_tape():
     assert np.allclose(np.asarray(g["w"]), 2.0)
 
 
+def test_torch_coerce_operand_preserves_integer_index_dtype():
+    """A delegate backend must lift an integer array (an index/label) keeping its integer
+    dtype, not cast it to the working float dtype -- otherwise a piped/binop-arg index
+    becomes a float tensor and ``table[idx]`` raises. Runs on CPU torch (no MPS needed).
+    """
+    _torch = pytest.importorskip("torch")
+    from pycograd.backends.torch_backend import TorchBackend
+
+    be = TorchBackend()  # CPU torch, still a delegate backend
+    idx = np.array([0, 3, 7, 2], dtype=np.int64)
+    t = be.coerce_operand(idx)
+    assert isinstance(t, _torch.Tensor) and not t.dtype.is_floating_point
+    # The lifted index can actually gather a table (the original failure was an IndexError).
+    table = be.lift(np.arange(40.0).reshape(10, 4))
+    assert table[t].shape == (4, 4)
+    # A float operand is still promoted to the working float dtype (unchanged behavior).
+    assert be.coerce_operand(np.ones(3)).dtype.is_floating_point
+
+
 # --- MPS offload tests (skip off-Metal) ------------------------------------------------
 torch = pytest.importorskip("torch")
 if not getattr(torch.backends, "mps", None) or not torch.backends.mps.is_available():
