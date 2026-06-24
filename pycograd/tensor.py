@@ -54,6 +54,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+from types import ModuleType
 from typing import Any, Callable, Iterator, cast
 
 import numpy as np
@@ -68,13 +69,14 @@ from pycograd.dtypes import current_dtype, resolve_dtype
 # library (numpy by default, cupy under ``device("cupy")``), so the same tape and
 # the same VJP rules run on whatever device that backend lives on.
 # ---------------------------------------------------------------------------
-def _xp() -> Any:
+def _xp() -> ModuleType:
     """The active backend's array module -- ``numpy`` unless a device is activated.
 
-    Typed ``Any`` because the module is chosen at runtime (numpy / cupy / ...); the
-    surface pycograd uses is the shared array-API subset both provide.
+    A ``ModuleType`` chosen at runtime (numpy / cupy / ...); attribute access stays
+    ``Any``, and the surface pycograd uses is the shared array-API subset both provide.
     """
-    return current_backend().array_module
+    # An array backend (the only kind with a live Var tape) always sets array_module.
+    return cast(ModuleType, current_backend().array_module)
 
 
 # ---------------------------------------------------------------------------
@@ -203,23 +205,26 @@ def _unwrap_weight(x: Operand) -> Var | ArrayLike:
 # the weight gradient. The flag tells it to keep results on the tape instead (the same
 # behavior as nesting under an outer transform). It does *not* fire for ``vmap(grad(g))``,
 # where each inner ``grad`` has already returned before ``vmap`` finishes.
-_GRAD_DEPTH = 0
+# Scoped like every other ambient flag in the project (a ``ContextVar``, cf.
+# ``_KEEP_BATCH_AXES`` above) so nested/concurrent grad passes don't clobber one global.
+_GRAD_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "pycograd_grad_depth", default=0
+)
 
 
 @contextlib.contextmanager
 def grad_recording() -> "Iterator[None]":
     """Mark a reverse-mode grad pass as in progress for its dynamic extent."""
-    global _GRAD_DEPTH
-    _GRAD_DEPTH += 1
+    token = _GRAD_DEPTH.set(_GRAD_DEPTH.get() + 1)
     try:
         yield
     finally:
-        _GRAD_DEPTH -= 1
+        _GRAD_DEPTH.reset(token)
 
 
 def grad_is_recording() -> bool:
     """True while a reverse-mode grad pass is recording (see :func:`grad_recording`)."""
-    return _GRAD_DEPTH > 0
+    return _GRAD_DEPTH.get() > 0
 
 
 def _value(x: Operand) -> ArrayLike:

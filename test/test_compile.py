@@ -20,7 +20,7 @@ import pytest
 
 import pycograd.compile as C
 import pycograd.transforms as T
-from pycograd import conv1d, conv2d, d_sigmoid, frozen, gated_act
+from pycograd import conv1d, conv2d, d_sigmoid, d_softmax, frozen, gated_act
 from pycograd.examples import models as M
 from pycograd.tree import tree_leaves
 
@@ -84,9 +84,12 @@ _CASES = [
             _rng(7).standard_normal((4, 3, 3, 3)),
             _rng(8).standard_normal(4),
         ),
-        {"jax", "torch"},
+        {"jax", "torch", "tf"},
     ),
     (
+        # tf excluded: TF's CPU Conv2DBackpropInput does not support grouped-conv
+        # gradients (the native lowering's forward is correct; this is a CPU-runtime
+        # limitation, and it works on GPU / jax / torch).
         "conv2d_grouped",
         _conv2d_grouped_loss,
         lambda: (
@@ -97,6 +100,8 @@ _CASES = [
         {"jax", "torch"},
     ),
     (
+        # tf excluded: this case uses ``dilation=2`` and TF's CPU conv backprop rejects
+        # dilation > 1 (again a CPU-runtime limitation, not a lowering bug).
         "conv1d",
         _conv1d_loss,
         lambda: (
@@ -221,6 +226,88 @@ def test_frozen_leaf_has_no_gradient(backend):
     _, (g,) = C.value_and_grad(M.mlp_tree_loss, backend=backend)(params)
     assert g["out"]["w"] is None  # frozen -> no gradient
     assert g["hidden"]["w"] is not None and g["out"]["b"] is not None
+
+
+def test_trainable_param_respects_ambient_dtype():
+    # A plain trainable Param must be planned at the ambient working dtype, like the
+    # tied-param and numeric-literal paths -- not pinned to float64. (Regression: the
+    # non-tied trainable path used ``dtype=float``, silently float64-ing the weight
+    # under ``with dtype("float32")``.)
+    from pycograd import dtype
+    from pycograd.params import Param
+
+    leaf = Param(np.ones(3, dtype=np.float64))
+    trainable: list = []
+    with dtype("float32"):
+        C._plan_leaf(leaf, trainable, {}, [])
+    assert trainable[0].dtype == np.float32
+
+
+def _softmax_all_axes_loss(x):
+    # ``axis=None`` must reduce softmax over ALL axes (the numpy reference), not just the
+    # last one -- so sum-of-squares of the distribution distinguishes the two behaviors.
+    y = d_softmax(x, axis=None)
+    return np.sum(y * y)
+
+
+@pytest.mark.parametrize("backend", ["jax", "torch", "tf"])
+def test_softmax_axis_none_reduces_all_axes(backend):
+    pytest.importorskip(_FRAMEWORK_MODULE[backend])
+    x = _rng(4).standard_normal((3, 4))
+    ref_v, (ref_g,) = T.value_and_grad(_softmax_all_axes_loss)(x)
+    cmp_v, (cmp_g,) = C.value_and_grad(_softmax_all_axes_loss, backend=backend)(x)
+    assert np.allclose(ref_v, cmp_v, atol=1e-9, rtol=1e-7), f"{backend} forward"
+    assert np.allclose(
+        np.asarray(ref_g), np.asarray(cmp_g), atol=1e-8, rtol=1e-6
+    ), f"{backend} grad"
+
+
+_STACK_CASES = {
+    "vstack_2d": (
+        lambda a, b: np.sum(np.vstack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal((3, 4)), _rng(2).standard_normal((3, 4))),
+    ),
+    "vstack_1d": (
+        lambda a, b: np.sum(np.vstack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal(4), _rng(2).standard_normal(4)),
+    ),
+    "hstack_2d": (
+        lambda a, b: np.sum(np.hstack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal((3, 4)), _rng(2).standard_normal((3, 4))),
+    ),
+    "hstack_1d": (
+        lambda a, b: np.sum(np.hstack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal(4), _rng(2).standard_normal(4)),
+    ),
+    "column_stack_2d": (
+        lambda a, b: np.sum(np.column_stack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal((3, 4)), _rng(2).standard_normal((3, 4))),
+    ),
+    "column_stack_1d": (
+        lambda a, b: np.sum(np.column_stack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal(3), _rng(2).standard_normal(3)),
+    ),
+    "dstack_2d": (
+        lambda a, b: np.sum(np.dstack([a, b]) ** 2),
+        lambda: (_rng(1).standard_normal((3, 4)), _rng(2).standard_normal((3, 4))),
+    ),
+}
+
+
+@pytest.mark.parametrize("cid", list(_STACK_CASES))
+def test_tf_list_stacking_parity(cid):
+    # vstack/hstack/column_stack/dstack used to be unmapped on tf (raised
+    # NotImplementedError) though torch/jax supported them; check tf now matches numpy.
+    pytest.importorskip("tensorflow")
+    fn, argf = _STACK_CASES[cid]
+    ref_v, ref_g = T.value_and_grad(fn)(*argf())
+    cmp_v, cmp_g = C.value_and_grad(fn, backend="tf")(*argf())
+    assert np.allclose(ref_v, cmp_v, atol=1e-9, rtol=1e-7), f"{cid} forward"
+    rf, cf = _flat_grads(ref_g), _flat_grads(cmp_g)
+    assert rf and len(rf) == len(cf)
+    for a, b in zip(rf, cf):
+        assert a.shape == b.shape
+        assert np.allclose(a, b, atol=1e-8, rtol=1e-6), f"{cid} grad"
 
 
 @pytest.mark.parametrize("backend", ["jax", "torch", "tf"])

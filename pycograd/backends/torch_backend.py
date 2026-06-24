@@ -18,7 +18,7 @@ are routed in through float32 and bf16 results back out through float32.
 from __future__ import annotations
 
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, cast
 
 import numpy as np
 
@@ -281,12 +281,19 @@ class TorchBackend(Backend):
         self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
             "sigmoid"
         ](s)
+
         # Fused stable softmax / logsumexp (tape-only): lower natively. torch spells the
-        # axis ``dim`` and needs a concrete dim (no ``None``), so default softmax to -1
-        # and reduce logsumexp over all axes when ``axis is None``.
-        self._intercept[d_softmax] = lambda x, axis=-1: torch.softmax(
-            self._operand(x), dim=-1 if axis is None else axis
-        )
+        # axis ``dim`` and needs a concrete dim (no ``None``), and ``axis=None`` means
+        # "over all axes" in the numpy reference -- so flatten/softmax/reshape for that
+        # case rather than silently reducing only the last axis. logsumexp likewise
+        # reduces over all axes when ``axis is None``.
+        def _torch_softmax(x: BackendArray, axis: object = -1) -> BackendArray:
+            t = self._operand(x)
+            if axis is None:
+                return torch.softmax(t.reshape(-1), dim=0).reshape(t.shape)
+            return torch.softmax(t, dim=axis)
+
+        self._intercept[d_softmax] = _torch_softmax
 
         def _torch_logsumexp(
             x: BackendArray, axis: object = None, keepdims: bool = False
@@ -437,9 +444,11 @@ class TorchBackend(Backend):
         # every step reuses it. (``torch.jit.trace`` can't be used here: it would run the
         # backward during tracing and freeze the first step's gradients as constants.)
         torch = self._torch
-        state: dict[str, object] = {"fn": None}
+        # ``fn`` is the compiled callable once built, the ``"eager"`` sentinel if
+        # compilation fell back, or ``None`` before the first call.
+        state: dict[str, "Callable[..., Any] | str | None"] = {"fn": None}
 
-        def build(example: list[BackendArray]) -> object:
+        def build(example: list[BackendArray]) -> "Callable[..., Any]":
             from torch.func import grad_and_value
             from torch.fx.experimental.proxy_tensor import make_fx
 

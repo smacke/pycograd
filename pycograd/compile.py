@@ -104,7 +104,7 @@ def _plan_leaf(
                 )
             return ("train", idx, leaf)
         idx = len(trainable)
-        trainable.append(np.asarray(leaf.value, dtype=float))
+        trainable.append(np.asarray(leaf.value, dtype=current_dtype()))
         devices.append(leaf.device)
         return ("train", idx, leaf)
     if _is_numeric(leaf):

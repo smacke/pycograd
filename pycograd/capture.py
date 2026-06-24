@@ -17,7 +17,7 @@ differentiates -- exactly as the original).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, cast
 
 import numpy as np
 
@@ -27,6 +27,12 @@ from pycograd.shapes import _ABS_FOR, ShapedArray, ShapeDtypeStruct, _aval
 from pycograd.tensor import Var, _value
 from pycograd.trace import Trace, Tracer, bind, new_main
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
+
+if TYPE_CHECKING:
+    import graphviz
+
+    from pycograd.cost import CostModel, GraphCost
+    from pycograd.remat import RematPlan
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +123,7 @@ class Graph:
         """
         return to_dot(self)
 
-    def cost(self, model: Any = None) -> Any:
+    def cost(self, model: "CostModel | None" = None) -> "GraphCost":
         """A static CPU / memory / disk :class:`~pycograd.cost.GraphCost` estimate for
         this graph (no execution). ``model`` is an optional
         :class:`~pycograd.cost.CostModel`; the default uses conservative NVMe-class
@@ -127,7 +133,9 @@ class Graph:
 
         return cost_report(self, DEFAULT_COST_MODEL if model is None else model)
 
-    def plan_remat(self, budget: int, model: Any = None, **kwargs: Any) -> Any:
+    def plan_remat(
+        self, budget: int, model: "CostModel | None" = None, **kwargs: Any
+    ) -> "RematPlan":
         """Plan keep/spill/recompute for this (forward+backward) graph so its peak resident
         memory fits ``budget`` bytes -- a :class:`~pycograd.remat.RematPlan`. ``model`` is an
         optional :class:`~pycograd.cost.CostModel`; ``**kwargs`` (``exact``/``iters``) pass
@@ -139,7 +147,9 @@ class Graph:
             self, budget, DEFAULT_COST_MODEL if model is None else model, **kwargs
         )
 
-    def eval_scheduled(self, *inputs: PyTree, store_dir: "str | None" = None) -> Any:
+    def eval_scheduled(
+        self, *inputs: PyTree, store_dir: "str | None" = None
+    ) -> "tuple[PyTree, int]":
         """Evaluate this graph (typically after :func:`~pycograd.remat.apply_remat_plan`)
         with the memory-managed interpreter, returning ``(outputs, peak_resident_bytes)``.
         See :func:`~pycograd.remat.eval_scheduled`."""
@@ -147,7 +157,7 @@ class Graph:
 
         return eval_scheduled(self, *inputs, store_dir=store_dir)
 
-    def render(self) -> Any:  # pragma: no cover - optional dependency
+    def render(self) -> "graphviz.Source":  # pragma: no cover - optional dependency
         """A ``graphviz.Source`` (renders inline in Jupyter). Requires the optional
         ``graphviz`` Python package; otherwise use :meth:`to_dot`."""
         try:

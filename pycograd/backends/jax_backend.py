@@ -169,7 +169,7 @@ class JaxBackend(Backend):
         jax, jnp = self._jax, self._jnp
         arrs = [jnp.asarray(np.asarray(leaf, dtype=current_dtype())) for leaf in leaves]
 
-        def f(ts: list) -> object:
+        def f(ts: list[BackendArray]) -> BackendArray:
             return jnp.asarray(scalar_fn(ts)).reshape(())
 
         if not arrs:
@@ -190,7 +190,7 @@ class JaxBackend(Backend):
         # into the compiled graph.)
         jax, jnp = self._jax, self._jnp
 
-        def f(ts: list) -> object:
+        def f(ts: list[BackendArray]) -> BackendArray:
             return jnp.asarray(scalar_fn(ts)).reshape(())
 
         compiled = jax.jit(jax.value_and_grad(f))

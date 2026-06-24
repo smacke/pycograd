@@ -150,6 +150,47 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
     def stack(seq: BackendArray, axis: int = 0) -> BackendArray:
         return tf.stack([as_t(s) for s in seq], axis=axis)
 
+    # numpy's vstack/hstack/column_stack/dstack are concatenations after a per-array
+    # at-least-Nd promotion (TF has no direct equivalents). Ranks are static under
+    # ``tf.function`` tracing, so promote off the concrete rank, mirroring numpy.
+    def _atleast_2d(t: BackendArray) -> BackendArray:
+        r = len(t.shape)
+        if r == 0:
+            return tf.reshape(t, (1, 1))
+        if r == 1:
+            return tf.reshape(t, (1, -1))  # (N,) -> (1, N), like np.atleast_2d
+        return t
+
+    def _atleast_3d(t: BackendArray) -> BackendArray:
+        r = len(t.shape)
+        if r == 0:
+            return tf.reshape(t, (1, 1, 1))
+        if r == 1:
+            return tf.reshape(t, (1, -1, 1))  # (N,) -> (1, N, 1)
+        if r == 2:
+            return tf.expand_dims(t, -1)  # (M, N) -> (M, N, 1)
+        return t
+
+    def vstack(seq: BackendArray) -> BackendArray:
+        return tf.concat([_atleast_2d(as_t(s)) for s in seq], axis=0)
+
+    def hstack(seq: BackendArray) -> BackendArray:
+        ts = [as_t(s) for s in seq]
+        # 1-D arrays concatenate along axis 0; otherwise along axis 1 (np.hstack).
+        axis = 0 if all(len(t.shape) <= 1 for t in ts) else 1
+        return tf.concat(ts, axis=axis)
+
+    def column_stack(seq: BackendArray) -> BackendArray:
+        # 1-D (N,) become columns (N, 1); 2-D pass through; then concat along axis 1.
+        cols = [
+            tf.reshape(t, (-1, 1)) if len(t.shape) == 1 else t
+            for t in (as_t(s) for s in seq)
+        ]
+        return tf.concat(cols, axis=1)
+
+    def dstack(seq: BackendArray) -> BackendArray:
+        return tf.concat([_atleast_3d(as_t(s)) for s in seq], axis=2)
+
     m = tf.math
     by_name: dict[str, Prim] = {
         "exp": unary(tf.exp),
@@ -187,6 +228,10 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
         "expand_dims": expand_dims,
         "concatenate": concatenate,
         "stack": stack,
+        "vstack": vstack,
+        "hstack": hstack,
+        "column_stack": column_stack,
+        "dstack": dstack,
     }
     return by_name
 
@@ -228,15 +273,56 @@ class TFBackend(Backend):
         self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
             "sigmoid"
         ](s)
+
         # Fused stable softmax / logsumexp (tape-only): lower to tf's native ops.
-        self._intercept[d_softmax] = lambda x, axis=-1: tf.nn.softmax(
-            _as_tf(tf, x), axis=-1 if axis is None else axis
-        )
+        # ``axis=None`` means "over all axes" in the numpy reference; tf.nn.softmax needs
+        # a concrete axis, so flatten/softmax/reshape for that case rather than silently
+        # reducing only the last axis.
+        def _tf_softmax(x: BackendArray, axis: Axis = -1) -> BackendArray:
+            t = _as_tf(tf, x)
+            if axis is None:
+                flat = tf.nn.softmax(tf.reshape(t, [-1]), axis=0)
+                return tf.reshape(flat, tf.shape(t))
+            return tf.nn.softmax(t, axis=axis)
+
+        self._intercept[d_softmax] = _tf_softmax
         self._intercept[d_logsumexp] = (
             lambda x, axis=None, keepdims=False: tf.reduce_logsumexp(
                 _as_tf(tf, x), axis=axis, keepdims=keepdims
             )
         )
+        # Lower the composed im2col ``conv2d`` to tf's native conv (as torch/jax do), so
+        # the compiled net runs a cuDNN/oneDNN convolution and the tape supplies the
+        # backward. pycograd is NCHW / OIHW; tf.nn.conv2d is NHWC / HWIO, so transpose in
+        # and out. The OIHW kernel already encodes ``in_channels = Cin/groups``, which tf
+        # reads back as the group count. The numpy path keeps the composed conv.
+        # NB: TF's *CPU* conv backward rejects dilation > 1 and grouped convs; those run
+        # on GPU (and the forward is correct everywhere). Other backends have no such gap.
+        from pycograd.functional import conv2d as _conv2d
+
+        def _tf_conv2d(
+            x: BackendArray,
+            w: BackendArray,
+            b: BackendArray = None,
+            stride: int = 1,
+            pad: int = 0,
+            dilation: int = 1,
+            groups: int = 1,
+        ) -> BackendArray:
+            xn = tf.transpose(_as_tf(tf, x), [0, 2, 3, 1])  # NCHW -> NHWC
+            wn = tf.transpose(_as_tf(tf, w), [2, 3, 1, 0])  # OIHW -> HWIO
+            padding = [[0, 0], [pad, pad], [pad, pad], [0, 0]] if pad else "VALID"
+            out = tf.nn.conv2d(
+                xn,
+                wn,
+                strides=[1, stride, stride, 1],
+                padding=padding,
+                dilations=[1, dilation, dilation, 1],
+            )
+            out = tf.transpose(out, [0, 3, 1, 2])  # NHWC -> NCHW
+            return out if b is None else out + tf.reshape(_as_tf(tf, b), (1, -1, 1, 1))
+
+        self._intercept[_conv2d] = _tf_conv2d
 
     def _is_tensor(self, x: object) -> bool:
         tf = self._tf

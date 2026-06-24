@@ -267,7 +267,7 @@ def _mappable(leaf: object) -> bool:
     return _is_array(leaf) or isinstance(leaf, (Var, BatchTracer))
 
 
-def _move_out(v: object, src: int, dst: int) -> object:
+def _move_out(v: Boxed, src: int, dst: int) -> Boxed:
     """Move a batched value's batch axis from ``src`` to ``dst`` on the way out, keeping
     a ``Var``/``BatchTracer`` on the tape/level (grad- and nesting-aware)."""
     if src == dst:
@@ -280,6 +280,10 @@ def _move_out(v: object, src: int, dst: int) -> object:
     return np.moveaxis(np.asarray(cast(Any, v)), src, dst)
 
 
+# NOTE: ``leaf: object`` here and in the ``_jvp_*`` helpers below: a transform-time
+# pytree leaf is genuinely heterogeneous -- a ``Leaf`` (Param/Weight/array/scalar/None)
+# *or* a tape ``Var`` / nested ``Tracer`` -- i.e. the union of ``Leaf`` and ``Boxed``, with
+# no narrower honest type. The bodies ``isinstance``-narrow before use.
 def _finish_vmap_leaf(
     leaf: object, level: int, batch: int, out_axis: int, nested: bool
 ) -> object:
@@ -778,7 +782,7 @@ def _maybe_per_sample_hvp(
     return primal_out, tangent_out
 
 
-def _phys_array(v: object) -> Array:
+def _phys_array(v: Boxed) -> Array:
     """The physical numpy array under a ``Var``/``BatchTracer`` (peeling nesting)."""
     cur = v
     while isinstance(cur, BatchTracer):
@@ -852,7 +856,7 @@ def _run_jvp(
     return primal_out, tangent_out
 
 
-def _coerce_top(v: object) -> object:
+def _coerce_top(v: Boxed) -> Boxed:
     if isinstance(v, Var):
         return np.asarray(_value(cast(Operand, v)))
     return v
@@ -881,7 +885,7 @@ def _jvp_inputs(pl: object, tl: object) -> tuple[object | None, object]:
     return Var(pv), Var(tv)
 
 
-def _jvp_materialize(v: object) -> object:
+def _jvp_materialize(v: object) -> Boxed:
     """Pull one output value to a concrete array (top level) or hand it down unchanged
     when it is still on an enclosing tape/level, so nesting keeps flowing.
 
@@ -899,13 +903,13 @@ def _jvp_materialize(v: object) -> object:
     return np.asarray(_value(cast(Operand, v)))
 
 
-def _jvp_primal(leaf: object, level: int) -> object:
+def _jvp_primal(leaf: object, level: int) -> Boxed:
     if isinstance(leaf, JVPTracer) and leaf._trace.main.level == level:
         return _jvp_materialize(leaf.primal)
     return _jvp_materialize(leaf)
 
 
-def _jvp_tangent(leaf: object, level: int) -> object:
+def _jvp_tangent(leaf: object, level: int) -> Boxed:
     """One tangent output leaf. A tracer at this level carries the propagated tangent; an
     output that does not depend on the input (not a tracer at this level) has a zero
     tangent shaped like the primal."""

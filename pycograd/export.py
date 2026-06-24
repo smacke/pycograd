@@ -17,7 +17,7 @@ torch is imported only when one of these functions is called.
 """
 from __future__ import annotations
 
-from typing import Sequence, cast
+from typing import TYPE_CHECKING, Sequence, cast
 
 from pycograd._typing import BackendArray, DTypeLike, Prim
 from pycograd.compile import compile_to
@@ -25,10 +25,13 @@ from pycograd.dtypes import _maybe_dtype
 from pycograd.params import Param
 from pycograd.tree import PyTree, tree_flatten, tree_unflatten
 
+if TYPE_CHECKING:
+    import torch
+
 
 def to_torch_module(
     fn: Prim, params: PyTree, *, dtype: DTypeLike | None = None
-) -> object:
+) -> "torch.nn.Module":
     """Wrap a net ``fn(params, *inputs)`` as a ``torch.nn.Module``.
 
     The returned module holds ``params``' leaves as trainable ``Parameter``s (frozen
@@ -83,8 +86,10 @@ def to_torch_module(
 
 
 def export_torchscript(
-    module: object, example_inputs: Sequence[BackendArray], path: str | None = None
-) -> object:
+    module: "torch.nn.Module",
+    example_inputs: Sequence[BackendArray],
+    path: str | None = None,
+) -> "torch.jit.ScriptModule":
     """Trace ``module`` (e.g. from :func:`to_torch_module`) to TorchScript.
 
     Returns the ``ScriptModule``; if ``path`` is given, also saves it there. The saved
@@ -99,7 +104,10 @@ def export_torchscript(
 
 
 def export_onnx(
-    module: object, example_inputs: Sequence[BackendArray], path: str, **kwargs: object
+    module: "torch.nn.Module",
+    example_inputs: Sequence[BackendArray],
+    path: str,
+    **kwargs: object,
 ) -> str:
     """Export ``module`` to ONNX at ``path`` (via ``torch.onnx.export``); returns ``path``.
 

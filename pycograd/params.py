@@ -303,7 +303,7 @@ class Weight:
             return cast(Array, be.coerce_operand(live))
         return cast(Array, live)
 
-    def _co(self, a: object, b: object) -> tuple[Any, Any]:
+    def _co(self, a: Array, b: Array) -> tuple[Array, Array]:
         """Co-locate two operands' devices under a delegate backend (the ambient auto-unify),
         so a CPU-resident slice can meet a GPU weight in one op. A no-op on the numpy/Var
         tape (no backend active) and when both operands are already on one device."""
@@ -440,8 +440,8 @@ class ParamDict(dict):
     # Live binding during a grad pass (name -> Var/array), and the injected-globals
     # bookkeeping for the context manager. Both are real instance attributes, set
     # via the leading-underscore path in ``__setattr__``.
-    _live: dict[str, object] | None = None
-    _scope: tuple[dict[str, object], list[str]] | None = None
+    _live: dict[str, BackendArray] | None = None
+    _scope: tuple[dict[str, BackendArray], list[str]] | None = None
 
     # Leading-underscore attributes are real instance state (e.g. the live-binding
     # used during a grad pass); every other name maps to a dict item.
@@ -541,7 +541,7 @@ class ParamDict(dict):
         from pycograd.transforms import _wrap_leaf
 
         tie_vars: dict[Hashable, Var] = {}
-        live: dict[str, object] = {}
+        live: dict[str, BackendArray] = {}
         grad_vars: dict[str, Var | None] = {}
         for key in self:
             leaf = self[key]
@@ -729,7 +729,7 @@ class ParamDict(dict):
                         self._slots.append((key, "weight", len(self._weights)))
                         self._weights.append(torch.nn.Parameter(tensor))
 
-            def _live_tensors(self) -> dict[str, object]:
+            def _live_tensors(self) -> dict[str, BackendArray]:
                 return {
                     key: (
                         self._weights[cast(int, ref)]

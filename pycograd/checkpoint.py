@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence, cast
 
 import numpy as np
 
-from pycograd._typing import Boxed
+from pycograd._typing import BackendArray, Boxed
 from pycograd.tensor import Var, _accumulate, _unbroadcast, _xp, grad_recording
 from pycograd.tree import Leaf, PyTree, TreeDef, tree_flatten, tree_unflatten
 
@@ -123,7 +123,7 @@ class _Remat:
         and return the inner output leaves. Rebinds each active model's full snapshot (so
         *tied* keys sharing one ``Var`` rebind consistently) for the dynamic extent of the
         call."""
-        saved: list[tuple["ParamDict", dict[str, object] | None]] = []
+        saved: list[tuple["ParamDict", dict[str, BackendArray] | None]] = []
         try:
             for model, snap in self.weight_bindings:
                 live = {
@@ -132,7 +132,7 @@ class _Remat:
                     if id(orig) in weight_for
                 }
                 saved.append((model, getattr(model, "_live", None)))
-                model._live = cast("dict[str, object]", live)
+                model._live = cast("dict[str, BackendArray]", live)
             with grad_recording():
                 out = self.runner(*call_args)
         finally:
