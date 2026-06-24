@@ -37,7 +37,8 @@ class NumpyBackend(Backend):
     def lift(self, array: BackendArray) -> Var:
         return Var(np.asarray(array, dtype=current_dtype()))
 
-    def const(self, array: BackendArray) -> BackendArray:
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        self._reject_device(device)  # the numpy/cupy tape is single-device
         # A raw numpy value: Var's operators auto-lift it when it meets a tape node,
         # so it participates in the forward without ever getting a gradient slot.
         return np.asarray(array, dtype=current_dtype())
@@ -51,7 +52,9 @@ class NumpyBackend(Backend):
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
+        self._reject_devices(devices)  # the numpy/cupy tape is single-device
         # Activate self across the whole forward + backward so the tape's primitives
         # resolve their array module (``_xp()``) to this backend during *both* passes --
         # essential for cupy, where the compile path calls this outside its inner

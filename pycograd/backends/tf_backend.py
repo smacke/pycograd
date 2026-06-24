@@ -251,7 +251,8 @@ class TFBackend(Backend):
     def lift(self, array: BackendArray) -> BackendArray:
         return _as_tf(self._tf, array)
 
-    def const(self, array: BackendArray) -> BackendArray:
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        self._reject_device(device)  # per-leaf placement is torch-only for now
         return _as_tf(self._tf, array)
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
@@ -266,7 +267,9 @@ class TFBackend(Backend):
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
+        self._reject_devices(devices)  # per-leaf placement is torch-only for now
         tf = self._tf
         ts = [tf.Variable(_as_tf(tf, leaf)) for leaf in leaves]
         with tf.GradientTape() as tape:
@@ -276,8 +279,11 @@ class TFBackend(Backend):
         return _tf_to_numpy(tf, out), [_tf_to_numpy(tf, g) for g in grads]
 
     def compile_grad(
-        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        self._reject_devices(devices)  # per-leaf placement is torch-only for now
         # Stage the tape into a static graph with tf.function: it traces the net once
         # (keyed by the leaves' shapes/dtypes) and reruns the graph thereafter. autograph
         # is off -- the net is already lowered by pyccolo, and AutoGraph's source rewrite

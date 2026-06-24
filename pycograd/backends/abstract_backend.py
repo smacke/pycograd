@@ -55,7 +55,8 @@ class AbstractBackend(Backend):
         arr = np.asarray(array)
         return ShapedArray(arr.shape, arr.dtype)
 
-    def const(self, array: BackendArray) -> ShapedArray:
+    def const(self, array: BackendArray, device: str | None = None) -> ShapedArray:
+        self._reject_device(device)
         return self.lift(array)
 
     def to_numpy(self, tensor: BackendArray) -> Array:
@@ -67,5 +68,6 @@ class AbstractBackend(Backend):
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
         raise NotImplementedError("the abstract backend computes shapes, not gradients")

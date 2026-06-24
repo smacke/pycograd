@@ -22,13 +22,17 @@ from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast
 
 import numpy as np
 
-from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
+from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Index, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
 from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 if TYPE_CHECKING:
     import torch
+
+# Sentinel for ``_as_tensor``'s ``device`` argument meaning "use the backend's compute
+# device". Distinct from ``None``, which is a *real* device (CPU) a leaf may be pinned to.
+_DEFAULT: object = object()
 
 
 def _torch_dtype(torch: ModuleType, np_dtype: np.dtype) -> "torch.dtype":
@@ -78,23 +82,35 @@ def _make_adapters(
 ) -> dict[str, Prim]:
     """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set.
 
-    ``as_t`` is the backend's device/dtype-aware tensor converter (so every operand the
-    adapters touch lands on the right device); ``device`` is threaded into the one spot
-    that builds a tensor directly rather than through ``as_t`` (the ``where`` condition).
+    ``as_t`` is the backend's operand converter: a fresh tensor (from numpy/scalar) lands
+    on the compute ``device``, but an *existing* tensor is left on its current device so
+    per-leaf placement (a CPU-resident leaf under a GPU compute device) survives. Where two
+    operands then disagree on device, ``_unify`` moves them to the compute device -- the
+    auto-unify that lets a CPU slice meet a GPU weight in a binary op. ``device`` is also
+    threaded into the one spot that builds a tensor directly (the ``where`` condition).
     """
+    _target = torch.device(device) if device is not None else torch.device("cpu")
+
+    def _unify(*ts: BackendArray) -> tuple[BackendArray, ...]:
+        """Move operands onto the compute device iff they span more than one device (so a
+        single-device subgraph -- e.g. the CPU embedding table -- never moves wholesale).
+        """
+        if len({t.device for t in ts if isinstance(t, torch.Tensor)}) <= 1:
+            return ts
+        return tuple(t.to(_target) if isinstance(t, torch.Tensor) else t for t in ts)
 
     def unary(name: str) -> Prim:
         fn = getattr(torch, name)
         return lambda x: fn(as_t(x))
 
     def matmul(a: BackendArray, b: BackendArray) -> BackendArray:
-        return torch.matmul(as_t(a), as_t(b))
+        return torch.matmul(*_unify(as_t(a), as_t(b)))
 
     def maximum(a: BackendArray, b: BackendArray) -> BackendArray:
-        return torch.maximum(as_t(a), as_t(b))
+        return torch.maximum(*_unify(as_t(a), as_t(b)))
 
     def minimum(a: BackendArray, b: BackendArray) -> BackendArray:
-        return torch.minimum(as_t(a), as_t(b))
+        return torch.minimum(*_unify(as_t(a), as_t(b)))
 
     def where(cond: BackendArray, a: BackendArray, b: BackendArray) -> BackendArray:
         if isinstance(cond, torch.Tensor):
@@ -103,7 +119,7 @@ def _make_adapters(
             c = torch.as_tensor(np.asarray(cond))
             if device is not None:
                 c = c.to(device)
-        return torch.where(c, as_t(a), as_t(b))
+        return torch.where(*_unify(c, as_t(a), as_t(b)))
 
     def clip(
         x: BackendArray, a_min: BackendArray = None, a_max: BackendArray = None
@@ -162,14 +178,14 @@ def _make_adapters(
         return torch.unsqueeze(as_t(x), axis)
 
     def concatenate(seq: BackendArray, axis: int = 0) -> BackendArray:
-        return torch.cat([as_t(s) for s in seq], dim=axis)
+        return torch.cat(list(_unify(*[as_t(s) for s in seq])), dim=axis)
 
     def stack(seq: BackendArray, axis: int = 0) -> BackendArray:
-        return torch.stack([as_t(s) for s in seq], dim=axis)
+        return torch.stack(list(_unify(*[as_t(s) for s in seq])), dim=axis)
 
     def listwise(name: str) -> Prim:
         fn = getattr(torch, name)
-        return lambda seq: fn([as_t(s) for s in seq])
+        return lambda seq: fn(list(_unify(*[as_t(s) for s in seq])))
 
     by_name: dict[str, Prim] = {
         "abs": unary("abs"),
@@ -245,7 +261,7 @@ class TorchBackend(Backend):
         # The torch device every tensor is placed on. ``None`` keeps tensors on the CPU
         # (the default torch backend); a subclass (e.g. ``mps``) names a device.
         self._device = device
-        adapters = _make_adapters(torch, self._as_tensor, device)
+        adapters = _make_adapters(torch, self._operand, device)
         self._intercept = {
             fn: adapters[getattr(fn, "__name__")]
             for fn in _INTERCEPT
@@ -264,13 +280,13 @@ class TorchBackend(Backend):
         # axis ``dim`` and needs a concrete dim (no ``None``), so default softmax to -1
         # and reduce logsumexp over all axes when ``axis is None``.
         self._intercept[d_softmax] = lambda x, axis=-1: torch.softmax(
-            self._as_tensor(x), dim=-1 if axis is None else axis
+            self._operand(x), dim=-1 if axis is None else axis
         )
 
         def _torch_logsumexp(
             x: BackendArray, axis: object = None, keepdims: bool = False
         ) -> BackendArray:
-            t = self._as_tensor(x)
+            t = self._operand(x)
             dim = tuple(range(t.ndim)) if axis is None else axis
             return torch.logsumexp(t, dim=dim, keepdim=keepdims)
 
@@ -303,10 +319,21 @@ class TorchBackend(Backend):
         substitute a supported dtype; everything else inherits :func:`current_dtype`."""
         return current_dtype()
 
-    def _as_tensor(self, x: BackendArray) -> BackendArray:
-        return _as_torch(
-            self._torch, x, device=self._device, np_dtype=self._working_np_dtype()
-        )
+    def _as_tensor(self, x: BackendArray, device: object = _DEFAULT) -> BackendArray:
+        """Lift ``x`` onto a device (the compute device by default; an explicit home device
+        for a leaf/const). An existing tensor is *moved* to the target -- so a leaf is
+        placed where it belongs, and a 0-d loss is pulled to the compute device."""
+        dev = self._device if device is _DEFAULT else cast("Optional[str]", device)
+        return _as_torch(self._torch, x, device=dev, np_dtype=self._working_np_dtype())
+
+    def _operand(self, x: BackendArray) -> BackendArray:
+        """Convert an *operand* for an op: a fresh tensor (from numpy/scalar) is created on
+        the compute device, but an existing tensor is left on its current device, so a
+        CPU-resident leaf survives until ``_unify`` reconciles it at a mixed-device op.
+        """
+        if isinstance(x, self._torch.Tensor):
+            return x
+        return self._as_tensor(x)
 
     @property
     def intercept(self) -> Mapping[Prim, Prim]:
@@ -318,8 +345,10 @@ class TorchBackend(Backend):
     def lift(self, array: BackendArray) -> BackendArray:
         return self._as_tensor(array)
 
-    def const(self, array: BackendArray) -> BackendArray:
-        return self._as_tensor(array)
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        # ``device`` (from a ``frozen``/plain leaf wrapped in ``on_cpu``/``on_device``) pins
+        # the constant to its home device; ``None`` uses the compute device.
+        return self._as_tensor(array, device=_DEFAULT if device is None else device)
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
         # Promote a numpy constant (e.g. a data global) so it can share an operator
@@ -328,16 +357,57 @@ class TorchBackend(Backend):
             return self._as_tensor(value)
         return value
 
+    def colocate(
+        self, a: BackendArray, b: BackendArray
+    ) -> tuple[BackendArray, BackendArray]:
+        # Two operands of an ambient ``Weight`` binop that disagree on device (a CPU slice
+        # meeting a GPU weight): move both to the compute device so the torch op succeeds.
+        torch = self._torch
+        if (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and a.device != b.device
+        ):
+            target = torch.device(self._device) if self._device else torch.device("cpu")
+            return a.to(target), b.to(target)
+        return a, b
+
+    def align_key(self, data: BackendArray, key: Index) -> Index:
+        # A tensor index for a gather must sit on the indexed tensor's device; move it
+        # there (e.g. a GPU-lifted index gathering a CPU-resident embedding table). A
+        # host/int/slice key is left untouched.
+        torch = self._torch
+        if (
+            isinstance(data, torch.Tensor)
+            and isinstance(key, torch.Tensor)
+            and key.device != data.device
+        ):
+            return key.to(data.device)
+        return key
+
     def to_numpy(self, tensor: BackendArray) -> Array:
         return _torch_to_numpy(self._torch, tensor)
+
+    def _lift_leaves(
+        self, leaves: list[BackendArray], devices: "list[str | None] | None"
+    ) -> list[BackendArray]:
+        """Lift each leaf onto its home device (``devices[i]``, or the compute device when
+        ``None``) -- so a CPU-tagged leaf is created on the CPU and keeps its gradient there
+        while the rest of the net runs on the compute device."""
+        devs = devices if devices is not None else [None] * len(leaves)
+        return [
+            self._as_tensor(leaf, device=_DEFAULT if d is None else d)
+            for leaf, d in zip(leaves, devs)
+        ]
 
     def grad_and_value(
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
         torch = self._torch
-        ts = [self._as_tensor(leaf).requires_grad_(True) for leaf in leaves]
+        ts = [t.requires_grad_(True) for t in self._lift_leaves(leaves, devices)]
         out = self._as_tensor(scalar_fn(ts)).reshape(())
         if ts:
             grads = torch.autograd.grad(out, ts, allow_unused=True)
@@ -349,7 +419,9 @@ class TorchBackend(Backend):
         return _torch_to_numpy(torch, out), [_torch_to_numpy(torch, g) for g in grads]
 
     def compile_grad(
-        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
         # torch.compile can't trace *through* pyccolo's dispatch directly -- Dynamo drops
         # the ``activate()`` contextvar, so a binop falls through to a numpy op on a grad
@@ -375,7 +447,7 @@ class TorchBackend(Backend):
         def run(
             leaves: list[BackendArray],
         ) -> tuple[BackendArray, list[BackendArray]]:
-            ts = [self._as_tensor(x) for x in leaves]
+            ts = self._lift_leaves(leaves, devices)
             if not ts:
                 out = self._as_tensor(scalar_fn(ts)).reshape(())
                 return _torch_to_numpy(torch, out), []
@@ -387,7 +459,7 @@ class TorchBackend(Backend):
                     fn = "eager"  # robust fallback: correct, just not compiled
                 state["fn"] = fn
             if fn == "eager":
-                return self.grad_and_value(scalar_fn, leaves)
+                return self.grad_and_value(scalar_fn, leaves, devices)
             grads, value = cast(Callable, fn)(ts)  # grad_and_value -> (grads, value)
             return _torch_to_numpy(torch, value), [
                 _torch_to_numpy(torch, g) for g in grads

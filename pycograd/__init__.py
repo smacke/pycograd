@@ -133,6 +133,8 @@ from pycograd.params import (
     Weight,
     buffer,
     frozen,
+    on_cpu,
+    on_device,
     param_values,
     params,
     register_pipescript_params_macro,
@@ -203,6 +205,8 @@ __all__ = [
     "frozen",
     "buffer",
     "tied",
+    "on_cpu",
+    "on_device",
     "params",
     "param_values",
     # transforms / training

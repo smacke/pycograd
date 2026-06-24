@@ -38,7 +38,8 @@ class CupyBackend(NumpyBackend):
     def lift(self, array: BackendArray) -> Var:
         return Var(cupy.asarray(array, dtype=current_dtype()))  # host -> device
 
-    def const(self, array: BackendArray) -> BackendArray:
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        self._reject_device(device)  # the cupy tape is single-device (one GPU)
         return cupy.asarray(array, dtype=current_dtype())
 
     def to_numpy(self, tensor: BackendArray) -> Array:

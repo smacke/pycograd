@@ -128,7 +128,8 @@ class JaxBackend(Backend):
     def lift(self, array: BackendArray) -> BackendArray:
         return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
-    def const(self, array: BackendArray) -> BackendArray:
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        self._reject_device(device)  # per-leaf placement is torch-only for now
         return self._jnp.asarray(np.asarray(array, dtype=current_dtype()))
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
@@ -152,7 +153,9 @@ class JaxBackend(Backend):
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
+        self._reject_devices(devices)  # per-leaf placement is torch-only for now
         jax, jnp = self._jax, self._jnp
         arrs = [jnp.asarray(np.asarray(leaf, dtype=current_dtype())) for leaf in leaves]
 
@@ -165,8 +168,11 @@ class JaxBackend(Backend):
         return np.asarray(value), [np.asarray(g) for g in grads]
 
     def compile_grad(
-        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
+        self._reject_devices(devices)  # per-leaf placement is torch-only for now
         # jit the value-and-grad once; XLA caches the compiled program keyed by the leaves'
         # shapes/dtypes, so reusing this closure across training steps traces the net a
         # single time. (scalar_fn closes over the weights' ambient binding, but jit re-runs

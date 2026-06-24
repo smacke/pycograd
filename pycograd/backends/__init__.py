@@ -72,9 +72,43 @@ class Backend:
     def lift(self, array: BackendArray) -> BackendArray:
         raise NotImplementedError
 
-    def const(self, array: BackendArray) -> BackendArray:
-        """Lift ``array`` as a non-differentiated constant (frozen params, literals)."""
+    def const(self, array: BackendArray, device: str | None = None) -> BackendArray:
+        """Lift ``array`` as a non-differentiated constant (frozen params, literals).
+
+        ``device`` pins a frozen leaf to a home device on a delegate backend that supports
+        it (torch/mps); backends without per-leaf placement reject a non-``None`` value.
+        """
+        self._reject_device(device)
         return self.lift(array)
+
+    def _reject_device(self, device: str | None) -> None:
+        """Raise unless ``device`` is ``None`` -- the default for backends that place every
+        tensor on one device (numpy/cupy/jax/tf). The torch family overrides placement and
+        does not call this."""
+        if device is not None:
+            raise ValueError(
+                f"backend {self.name!r} does not support per-leaf device placement; "
+                "on_cpu(...)/on_device(...) require the 'torch' or 'mps' backend"
+            )
+
+    def colocate(
+        self, a: BackendArray, b: BackendArray
+    ) -> "tuple[BackendArray, BackendArray]":
+        """Move two binary-operator operands onto a common device so the op succeeds.
+
+        Identity by default (single-device backends). A delegate backend that supports
+        per-leaf placement (torch/mps) overrides this to move the operand whose device
+        differs from its compute device onto it -- the auto-unify the ambient ``Weight``
+        proxy applies so a CPU-resident slice can meet a GPU weight."""
+        return (a, b)
+
+    def align_key(self, data: BackendArray, key: Index) -> Index:
+        """Return ``key`` placed on ``data``'s device for a gather ``data[key]``.
+
+        Identity by default; a delegate backend that supports per-leaf placement moves a
+        *tensor* index onto the indexed tensor's device, so a CPU-resident table can be
+        gathered with a GPU index and the small slice stays on the table's device."""
+        return key
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
         """Coerce a binary-operator operand for this backend, or return it unchanged.
@@ -94,11 +128,27 @@ class Backend:
         self,
         scalar_fn: Callable[[list[BackendArray]], BackendArray],
         leaves: list[BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> tuple[BackendArray, list[BackendArray]]:
+        """Run ``scalar_fn(lifted_leaves) -> scalar`` under the framework's autodiff and
+        return ``(value, [grad per leaf])`` as numpy.
+
+        ``devices`` (one entry per leaf, or ``None``) is the per-leaf home device a delegate
+        backend lifts each leaf onto; single-device backends ignore an all-``None`` list and
+        reject any real device via :meth:`_reject_devices`."""
         raise NotImplementedError
 
+    def _reject_devices(self, devices: "list[str | None] | None") -> None:
+        """Reject a per-leaf device list unless it is empty / all ``None`` (see
+        :meth:`_reject_device`)."""
+        if devices:
+            for d in devices:
+                self._reject_device(d)
+
     def compile_grad(
-        self, scalar_fn: Callable[[list[BackendArray]], BackendArray]
+        self,
+        scalar_fn: Callable[[list[BackendArray]], BackendArray],
+        devices: "list[str | None] | None" = None,
     ) -> Callable[[list[BackendArray]], tuple[BackendArray, list[BackendArray]]]:
         """Return a *reusable* ``leaves -> (value, [grad per leaf])`` callable.
 
@@ -110,7 +160,7 @@ class Backend:
         every step. Callers cache the returned closure across steps and feed it the current
         leaf values; it is valid only while the net's structure and the scalar_fn's non-leaf
         inputs (e.g. data baked in by closure) stay fixed."""
-        return lambda leaves: self.grad_and_value(scalar_fn, leaves)
+        return lambda leaves: self.grad_and_value(scalar_fn, leaves, devices)
 
 
 # The active backend the tracer reads, per execution context. ``None`` means "use the

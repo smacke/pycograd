@@ -61,6 +61,12 @@ class Param:
     # by the optimizer, but writable via ``ParamDict.update_buffers``.
     mutable: bool = False
     tie: Hashable | None = None
+    # A *home device* for this leaf on a delegate backend (``"cpu"`` / ``"mps"``): where it
+    # is lifted and keeps its gradient, overriding the backend's single compute device so
+    # part of a net can run on CPU and part on GPU. ``None`` means "the compute device".
+    # Purely a compile-backend lifting hint -- the stored ``value`` stays numpy and the
+    # numpy tape ignores it; set it with ``on_cpu(...)`` / ``on_device(...)``.
+    device: str | None = None
     # Stamped by the ``params{...}`` DSL with the block that declared this param,
     # so ``value_and_grad`` can reject a weight also passed in by hand.
     origin: object = None
@@ -125,6 +131,55 @@ class _Tied:
 
 
 tied = _Tied()
+
+
+class _OnDevice:
+    """Pin a leaf's *home device* on a delegate backend, as a call or a subscript:
+    ``on_device("cpu", v)`` / ``on_device("cpu")[v]`` (and the ``on_cpu`` shorthand).
+
+    ``v`` may be a raw array -- making a trainable :class:`Param` on that device -- or an
+    existing ``Param`` (``frozen``/``buffer``/``tied`` result), in which case only the
+    device is overridden so ``on_cpu(frozen(table))`` keeps the leaf frozen. Lets one net
+    run partly on CPU (e.g. a big embedding table) and partly on the GPU; see
+    :attr:`Param.device`."""
+
+    __slots__ = ("_device",)
+
+    def __init__(self, device: str | None) -> None:
+        self._device = device
+
+    def __call__(self, value: ArrayLike | Param) -> Param:
+        if isinstance(value, _TieRef):
+            raise ValueError(
+                "on_device/on_cpu cannot wrap tied[...]; set the device on the "
+                "target parameter instead (tied leaves share one tensor and device)"
+            )
+        if isinstance(value, Param):
+            import dataclasses
+
+            return dataclasses.replace(value, device=self._device)
+        return Param(np.asarray(value, dtype=current_dtype()), device=self._device)
+
+    def __getitem__(self, value: ArrayLike | Param) -> Param:
+        return self(value)
+
+
+_UNSET = object()
+
+
+def on_device(
+    device: str, value: ArrayLike | Param | object = _UNSET
+) -> Param | _OnDevice:
+    """Pin ``value`` to a home ``device`` (``"cpu"``/``"mps"``) on a delegate backend.
+
+    Two spellings: ``on_device("cpu", v)`` (direct) or ``on_device("cpu")[v]`` (subscript,
+    which reads naturally inside a ``params{...}`` block). See :class:`_OnDevice`;
+    ``on_cpu`` is the ``on_device("cpu", ...)`` shorthand."""
+    pin = _OnDevice(device)
+    return pin if value is _UNSET else pin(cast("ArrayLike | Param", value))
+
+
+on_cpu = _OnDevice("cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -248,43 +303,68 @@ class Weight:
             return cast(Array, be.coerce_operand(live))
         return cast(Array, live)
 
-    # -- operators: forward to the live value, unwrapping proxy operands ----------
+    def _co(self, a: object, b: object) -> tuple[Any, Any]:
+        """Co-locate two operands' devices under a delegate backend (the ambient auto-unify),
+        so a CPU-resident slice can meet a GPU weight in one op. A no-op on the numpy/Var
+        tape (no backend active) and when both operands are already on one device."""
+        be = active_backend_or_none()
+        if be is not None and be.is_delegate:
+            return be.colocate(a, b)
+        return a, b
+
+    # -- operators: forward to the live value, unwrapping (and co-locating) operands --
     def __matmul__(self, o: Operand) -> Operand:
-        return self._arr() @ _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a @ b
 
     def __rmatmul__(self, o: Operand) -> Operand:
-        return _as_arr(o) @ self._arr()
+        a, b = self._co(_as_arr(o), self._arr())
+        return a @ b
 
     def __add__(self, o: Operand) -> Operand:
-        return self._arr() + _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a + b
 
     __radd__ = __add__
 
     def __sub__(self, o: Operand) -> Operand:
-        return self._arr() - _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a - b
 
     def __rsub__(self, o: Operand) -> Operand:
-        return _as_arr(o) - self._arr()
+        a, b = self._co(_as_arr(o), self._arr())
+        return a - b
 
     def __mul__(self, o: Operand) -> Operand:
-        return self._arr() * _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a * b
 
     __rmul__ = __mul__
 
     def __truediv__(self, o: Operand) -> Operand:
-        return self._arr() / _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a / b
 
     def __rtruediv__(self, o: Operand) -> Operand:
-        return _as_arr(o) / self._arr()
+        a, b = self._co(_as_arr(o), self._arr())
+        return a / b
 
     def __pow__(self, o: Operand) -> Operand:
-        return self._arr() ** _as_arr(o)
+        a, b = self._co(self._arr(), _as_arr(o))
+        return a**b
 
     def __neg__(self) -> Operand:
         return -self._arr()
 
     def __getitem__(self, key: Index) -> Operand:
-        return cast(Operand, self._arr()[key])
+        arr = self._arr()
+        # Gather a CPU-resident table with a GPU index (or vice versa): move the index onto
+        # the table's device so the gather runs there and yields a same-device slice (which
+        # a later binop auto-unifies). A host/int index needs no move.
+        be = active_backend_or_none()
+        if be is not None and be.is_delegate:
+            key = cast(Index, be.align_key(arr, key))
+        return cast(Operand, arr[key])
 
     @property
     def T(self) -> Operand:
@@ -527,7 +607,10 @@ class ParamDict(dict):
         with _maybe_dtype(dtype):
             trainable: list[Array] = []
             tie_slot: dict[object, int] = {}
-            slots = {key: _plan_leaf(self[key], trainable, tie_slot) for key in self}
+            devices: list[str | None] = []  # home device per trainable leaf (parallel)
+            slots = {
+                key: _plan_leaf(self[key], trainable, tie_slot, devices) for key in self
+            }
 
             runner = _INSTRUMENTED.get(objective)
             if runner is None:
@@ -559,14 +642,19 @@ class ParamDict(dict):
                     (id(objective), be.name)
                     + tuple((key, slots[key][0]) for key in self)
                     + tuple((np.shape(t), str(np.asarray(t).dtype)) for t in trainable)
+                    + tuple(
+                        devices
+                    )  # a leaf's home device is part of the compiled graph
                 )
                 compiled = cache.get(sig)
                 if compiled is None:
-                    compiled = be.compile_grad(make_scalar_fn(slots))
+                    compiled = be.compile_grad(make_scalar_fn(slots), devices)
                     cache[sig] = compiled
                 value, grad_leaves = compiled(trainable)
             else:
-                value, grad_leaves = be.grad_and_value(make_scalar_fn(slots), trainable)
+                value, grad_leaves = be.grad_and_value(
+                    make_scalar_fn(slots), trainable, devices
+                )
             grads = ParamDict(
                 {key: _grad_for(slots[key], grad_leaves, be) for key in self}
             )

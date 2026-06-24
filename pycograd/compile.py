@@ -67,16 +67,21 @@ def compile_to(
 
 # A leaf "slot" records how to fill one argument-leaf position during the forward, and
 # how to report its gradient afterwards. One of:
-#   ("train", idx, orig)  -- differentiated; tensor/grad live at index ``idx``
-#   ("const", value)      -- frozen Param; a non-grad constant; gradient is None
-#   ("none", leaf)        -- non-numeric; passed through; gradient is None
+#   ("train", idx, orig)     -- differentiated; tensor/grad live at index ``idx``; the
+#                               leaf's home device travels in the parallel ``devices`` list
+#   ("const", value, device) -- frozen Param; a non-grad constant on ``device`` (or None)
+#   ("none", leaf)           -- non-numeric; passed through; gradient is None
 _Slot = tuple
 
 
 def _plan_leaf(
-    leaf: Leaf, trainable: list[Array], tie_slot: dict[object, int]
+    leaf: Leaf,
+    trainable: list[Array],
+    tie_slot: dict[object, int],
+    devices: list[str | None],
 ) -> _Slot:
-    """Classify one leaf and, if trainable, record its raw value in ``trainable``."""
+    """Classify one leaf; for a trainable leaf record its raw value in ``trainable`` and its
+    home device (``Param.device``, else ``None``) in the parallel ``devices`` list."""
     if isinstance(leaf, _TieRef):
         raise ValueError(
             "compile: tied[...] is only meaningful inside params(...), where it "
@@ -84,20 +89,28 @@ def _plan_leaf(
         )
     if isinstance(leaf, Param):
         if not leaf.trainable:
-            return ("const", leaf.value)
+            return ("const", leaf.value, leaf.device)
         if leaf.tie is not None:
             idx = tie_slot.get(leaf.tie)
             if idx is None:
                 idx = len(trainable)
                 trainable.append(np.asarray(leaf.value, dtype=current_dtype()))
+                devices.append(leaf.device)
                 tie_slot[leaf.tie] = idx
+            elif devices[idx] != leaf.device:
+                raise ValueError(
+                    "tied params share one tensor and so must share a device; got "
+                    f"{devices[idx]!r} and {leaf.device!r}"
+                )
             return ("train", idx, leaf)
         idx = len(trainable)
         trainable.append(np.asarray(leaf.value, dtype=float))
+        devices.append(leaf.device)
         return ("train", idx, leaf)
     if _is_numeric(leaf):
         idx = len(trainable)
         trainable.append(np.asarray(leaf, dtype=current_dtype()))
+        devices.append(None)
         return ("train", idx, leaf)
     return ("none", leaf)
 
@@ -106,7 +119,7 @@ def _fill(slot: _Slot, tensors: list[BackendArray], be: Backend) -> BackendArray
     if slot[0] == "train":
         return tensors[slot[1]]
     if slot[0] == "const":
-        return be.const(slot[1])
+        return be.const(slot[1], device=slot[2])
     return slot[1]
 
 
@@ -141,10 +154,13 @@ def value_and_grad(
             _check_param_ownership(args)
             trainable: list[Array] = []
             tie_slot: dict[object, int] = {}
+            devices: list[str | None] = []  # home device per trainable leaf (parallel)
             per_arg: list[tuple[TreeDef, list[_Slot]]] = []  # (treedef, [slot])
             for a in args:
                 leaves, treedef = tree_flatten(a)
-                slots = [_plan_leaf(leaf, trainable, tie_slot) for leaf in leaves]
+                slots = [
+                    _plan_leaf(leaf, trainable, tie_slot, devices) for leaf in leaves
+                ]
                 per_arg.append((treedef, slots))
 
             def scalar_fn(tensors: list[BackendArray]) -> BackendArray:
@@ -158,7 +174,7 @@ def value_and_grad(
                     ]
                     return runner(*call_args)
 
-            value, grad_leaves = be.grad_and_value(scalar_fn, trainable)
+            value, grad_leaves = be.grad_and_value(scalar_fn, trainable, devices)
 
             grads = tuple(
                 tree_unflatten(
