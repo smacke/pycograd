@@ -510,7 +510,10 @@ def d_cumsum(x: Operand, axis: int | None = None) -> Var:
 # ---------------------------------------------------------------------------
 def d_sum(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
     x, xp = _lift(x), _xp()
-    out = Var(x.value.sum(axis=axis, keepdims=keepdims), _parents=(x,))
+    # numpy's ndarray.sum overloads split on keepdims being a Literal once axis is
+    # a union, so a plain bool fails to match any variant (newer stubs only).
+    summed = x.value.sum(axis=axis, keepdims=keepdims)  # type: ignore[call-overload]
+    out = Var(summed, _parents=(x,))
 
     def _backward() -> None:
         g = out.grad
