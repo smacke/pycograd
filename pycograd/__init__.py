@@ -162,6 +162,7 @@ from pycograd.shapes import (
 )
 from pycograd.tensor import Var, detach
 from pycograd.tracer import AutodiffTracer, resolve_call
+from pycograd.training import accuracy, train
 from pycograd.transforms import (
     grad,
     gradient_descent,
@@ -219,6 +220,8 @@ __all__ = [
     "jacrev",
     "gradient_descent",
     "sgd_update",
+    "train",
+    "accuracy",
     # shape inference
     "eval_shape",
     "infer_shapes",

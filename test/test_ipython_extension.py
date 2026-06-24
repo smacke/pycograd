@@ -49,18 +49,21 @@ def test_extension_wiring_with_fake_shell():
     from pipescript.tracers.pipeline_tracer import PipelineTracer
 
     import pycograd
-    from pycograd import frozen, tied
+    from pycograd import frozen, params, tied
     from pycograd.extension import _autodiff_hook
 
     shell = _FakeShell()
     pycograd.load_ipython_extension(shell)
     try:
         # 1. pipescript was requested; 2. the autodiff pipe hook is registered once;
-        # 3. the params{} macro is wired; 4. frozen/tied are in the user namespace.
+        # 3. the params{} macro is wired; 4. params/frozen/tied are in the user
+        #    namespace (params is also a builtin, but the user_ns binding is what lets
+        #    Jedi -- the default completer -- autocomplete it).
         assert "pipescript" in shell.extension_manager.requests
         assert _autodiff_hook in PipelineTracer.application_hooks
         assert PipelineTracer.application_hooks.count(_autodiff_hook) == 1
         assert "params" in MacroTracer.namespace_block_macros
+        assert shell.user_ns.get("params") is params
         assert shell.user_ns.get("frozen") is frozen
         assert shell.user_ns.get("tied") is tied
 
@@ -73,7 +76,30 @@ def test_extension_wiring_with_fake_shell():
     # Unload reverses everything we wired up.
     assert _autodiff_hook not in PipelineTracer.application_hooks
     assert "params" not in MacroTracer.namespace_block_macros
-    assert "frozen" not in shell.user_ns and "tied" not in shell.user_ns
+    assert not ({"params", "frozen", "tied"} & set(shell.user_ns))
+
+
+def test_params_autocompletes_under_jedi():
+    # ``params`` is bound as a builtin by the macro, but Jedi -- IPython/Jupyter's
+    # default, static-analysis completer -- never sees a runtime-``setattr``'d builtin.
+    # load_ext therefore also injects ``params`` into ``user_ns``; this is what makes
+    # ``param``<Tab> complete. Drive the completer directly to lock that in.
+    pytest.importorskip("pipescript")
+    pytest.importorskip("jedi")
+    from IPython.core.completer import IPCompleter, provisionalcompleter
+
+    import pycograd
+
+    shell = _FakeShell()
+    pycograd.load_ipython_extension(shell)
+    try:
+        comp = IPCompleter(namespace=shell.user_ns, global_namespace={})
+        comp.use_jedi = True
+        with provisionalcompleter():
+            completions = {c.text for c in comp.completions("param", len("param"))}
+        assert "params" in completions
+    finally:
+        pycograd.unload_ipython_extension(shell)
 
 
 def test_is_user_function_accepts_ipython_cells():

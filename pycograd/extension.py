@@ -10,10 +10,11 @@ Loading the extension turns a notebook into a pycograd DSL session. It:
    primitive, and ``x |> my_helper`` instruments the helper on demand;
 3. wires the ``params{ w = ...; b = frozen[...] }`` brace surface via
    :func:`pycograd.params.register_pipescript_params_macro`;
-4. injects the two names a ``params{...}`` block needs to resolve (``frozen`` /
-   ``tied``) into the user namespace. ``params`` itself is exposed as a builtin by
-   the macro; import the rest of the API (``Var``, ``value_and_grad``, ...) as
-   usual.
+4. injects the ``params`` / ``frozen`` / ``tied`` names into the user namespace --
+   ``frozen`` / ``tied`` so a ``params{...}`` block resolves them, and ``params`` so
+   it autocompletes (the macro also binds ``params`` as a builtin, but a runtime-set
+   builtin is invisible to Jedi, the default completer). Import the rest of the API
+   (``Var``, ``value_and_grad``, ...) as usual.
 
 This is the DSL surface only: ordinary ``np.exp(x)`` outside a pipe is *not*
 auto-differentiated (use ``value_and_grad``/``grad`` or a pipe). pyccolo's
@@ -30,14 +31,18 @@ from typing import Any
 from pycograd._typing import Boxed, Prim
 from pycograd.backends import active_backend_or_none
 from pycograd.params import frozen as _frozen
+from pycograd.params import params as _params
 from pycograd.params import tied as _tied
 from pycograd.tensor import Var
 from pycograd.trace import Tracer
 from pycograd.tracer import resolve_call
 
-# The DSL essentials a ``params{...}`` block references by name. ``params`` is
-# bound as a builtin by the macro registration, so it is not listed here.
-_DSL_NAMES = {"frozen": _frozen, "tied": _tied}
+# The DSL essentials made resolvable by name in the user namespace. ``params`` is
+# also bound as a builtin by the macro registration (so the bare call/brace form
+# works), but a runtime-``setattr``'d builtin is invisible to Jedi -- IPython/Jupyter's
+# default, static-analysis completer -- so we inject it into ``user_ns`` here as well to
+# make ``params``/``frozen``/``tied`` autocomplete after ``%load_ext pycograd``.
+_DSL_NAMES = {"params": _params, "frozen": _frozen, "tied": _tied}
 
 _PIPESCRIPT_MISSING_MSG = (
     "pycograd's IPython extension needs pipescript; install it with "

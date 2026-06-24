@@ -5,7 +5,7 @@ These models are the package's first integration tests and the "don't regress"
 bar (see the test suite, which imports them). Run the training demos with::
 
     python -m pycograd.examples
-"""
-from pycograd.examples.training import accuracy, train
 
-__all__ = ["accuracy", "train"]
+The training-loop helpers (``train`` / ``accuracy``) the demos use are top-level
+exports: ``from pycograd import train, accuracy``.
+"""

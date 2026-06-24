@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Shared training boilerplate for the notebook demos.
+"""Training-loop helpers for the ambient-weights DSL.
 
-The demos all drive the ambient-weights DSL the same way: build a ``params{...}``
-block, write a ``$ |> ...`` forward, then repeatedly ``weights.grad(objective)`` and
-step. :func:`train` packages that loop once (in-place SGD for a float ``lr``, or a
-stateful :class:`~pycograd.optimizers.Optimizer` such as ``Adam``), and forwards
-``backend`` / ``jit`` so the very same loop trains on torch/jax/tf/mps. :func:`accuracy`
-is the matching argmax-vs-labels score. Importing these keeps the notebooks focused on
-the model, not the plumbing.
+The ambient-weights workflow is always the same: build a ``params{...}`` block, write a
+``$ |> ...`` forward, then repeatedly ``weights.grad(objective)`` and step. :func:`train`
+packages that loop once (in-place SGD for a float ``lr``, or a stateful
+:class:`~pycograd.optimizers.Optimizer` such as ``Adam``), and forwards ``backend`` /
+``jit`` so the very same loop trains on torch/jax/tf/mps. :func:`accuracy` is the matching
+argmax-vs-labels score. Both are top-level exports (``from pycograd import train,
+accuracy``) so a model can stay focused on the forward, not the plumbing.
 """
 from __future__ import annotations
 
