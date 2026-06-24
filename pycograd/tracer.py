@@ -107,9 +107,10 @@ def _unmapped_mathy(func: Prim, fallback: Prim) -> Prim:
 
 
 def _is_deferred_operand(z: object) -> bool:
-    """True for a *bare callable* used point-free in a binop -- e.g. ``np.tanh`` in a
-    pipeline stage ``np.tanh ** 2`` (meaning ``x -> np.tanh(x) ** 2``, with ``x`` supplied
-    later by the pipe). A ``Var``/``Tracer`` (or a plain number/array) is a *value*, not a
+    """True for a *bare callable* used point-free in a binop or comparison -- e.g.
+    ``np.tanh`` in a pipeline stage ``np.tanh ** 2`` (meaning ``x -> np.tanh(x) ** 2``) or
+    ``np.tanh > np.exp`` (meaning ``x -> np.tanh(x) > np.exp(x)``), with ``x`` supplied
+    later by the pipe. A ``Var``/``Tracer`` (or a plain number/array) is a *value*, not a
     deferred stage, so it takes the ordinary binop path."""
     return callable(z) and not isinstance(z, (Var, Tracer))
 
@@ -330,13 +331,12 @@ class AutodiffTracer(pyc.BaseTracer):
         )
 
         def op(x: Boxed | Prim, y: Boxed | Prim) -> Boxed | Prim:
-            xd, yd = _is_deferred_operand(x), _is_deferred_operand(y)
-            if compose and xd:
+            if compose and _is_deferred_operand(x):
                 # ``f .** g``: function composition (each call routed through
                 # ``resolve_call`` so it differentiates). ``g`` a function -> ``f ∘ g``;
                 # ``g`` an int -> the composition *power* ``f ∘ f ∘ … (g times)``.
                 rf = self.resolve_call(cast(Prim, x))
-                if yd:
+                if _is_deferred_operand(y):
                     rg = self.resolve_call(cast(Prim, y))
                     return lambda v: rf(rg(v))
                 n = y if isinstance(y, int) else int(cast(int, y))
@@ -347,27 +347,47 @@ class AutodiffTracer(pyc.BaseTracer):
                     return v
 
                 return composed
-            if not (xd or yd):
-                # Ordinary value binop (a Var/array/number, no bare function): route
-                # through ``bind`` exactly as before -- base ``Var``/array runs the ``d_*``
-                # primitive, a ``BatchTracer``/``ShapedArray`` selects its transform level.
-                return bind(prim, x, y)
-            # Point-free: an operand is a bare function (``np.tanh ** 2``). Defer the op to a
-            # one-argument *stage* ``v -> prim(x(v), y(v))`` -- each function operand is run
-            # through ``resolve_call`` so its call differentiates (``np.tanh`` -> ``d_tanh``)
-            # and rides any live transform level, exactly like an intercepted call would; a
-            # non-function operand (the ``2``) is held constant.
-            fx = self.resolve_call(cast(Prim, x)) if xd else None
-            fy = self.resolve_call(cast(Prim, y)) if yd else None
-
-            def stage(v: Boxed) -> Boxed:
-                a = fx(v) if fx is not None else x
-                b = fy(v) if fy is not None else y
-                return bind(prim, a, b)
-
-            return stage
+            if isinstance(node.op, ast.MatMult) and _is_deferred_operand(y):
+                # Point-free matmul against a *function* right operand (``f @ g``,
+                # ``value @ g``) means ``v -> x(v) @ g(v)`` -- a matmul of two function
+                # outputs, which is a footgun, so reject it eagerly rather than build the
+                # stage. ``f @ w`` (a function's output matmul'd against a *value*) stays
+                # legal via the point-free path below, as does ordinary ``Var @ w``.
+                raise TypeError(
+                    "point-free '@' with a function right operand is unsupported "
+                    "(e.g. `f @ g`): matmul a function's output against a value "
+                    "(`f @ w`) or write the stage explicitly."
+                )
+            return self._pointfree_binop(prim, x, y)
 
         return op
+
+    def _pointfree_binop(
+        self, prim: Prim, x: Boxed | Prim, y: Boxed | Prim
+    ) -> Boxed | Prim:
+        """Route a binop/compare whose operand(s) may be a bare function.
+
+        No deferred operand -> an ordinary value op via ``bind`` (a base ``Var``/array
+        runs the ``d_*`` primitive, a ``BatchTracer``/``ShapedArray`` selects its
+        transform level). Otherwise an operand is a bare function (``np.tanh ** 2``,
+        ``np.tanh > np.exp``): defer the op to a one-argument *stage*
+        ``v -> prim(x(v), y(v))`` -- each function operand is run through ``resolve_call``
+        so its call differentiates (``np.tanh`` -> ``d_tanh``) and rides any live
+        transform level, exactly like an intercepted call would; a non-function operand
+        (the ``2``) is held constant.
+        """
+        xd, yd = _is_deferred_operand(x), _is_deferred_operand(y)
+        if not (xd or yd):
+            return bind(prim, x, y)
+        fx = self.resolve_call(cast(Prim, x)) if xd else None
+        fy = self.resolve_call(cast(Prim, y)) if yd else None
+
+        def stage(v: Boxed) -> Boxed:
+            a = fx(v) if fx is not None else x
+            b = fy(v) if fy is not None else y
+            return bind(prim, a, b)
+
+        return stage
 
     @pyc.register_handler(
         pyc.before_unaryop, when=lambda node: type(node.op) in _UNARYOP_PRIM
@@ -389,7 +409,12 @@ class AutodiffTracer(pyc.BaseTracer):
         self, ret: Prim, node: ast.Compare, *_: object, **__: object
     ) -> Prim:
         prim, _raw = _COMPARE_PRIM[type(node.ops[0])]
-        return lambda x, y: bind(prim, x, y)
+        # A bare-function operand (``np.tanh > np.exp``, ``np.tanh >= 0.5``) makes this a
+        # point-free *stage* ``v -> np.tanh(v) > np.exp(v)`` -- the same deferral the
+        # arithmetic binops take. With no deferred operand it is an ordinary value
+        # comparison routed through ``bind`` (returning a plain boolean mask, which
+        # detaches the tape), exactly as before.
+        return lambda x, y: self._pointfree_binop(prim, x, y)
 
     @pyc.register_handler(pyc.before_subscript_load)
     def handle_before_subscript_load(

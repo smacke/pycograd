@@ -81,3 +81,15 @@ a `params{ w = ...; b = frozen[...] } as weights:` block for parameters, and
   `grad_graph(...)`, `vjp_graph(forward, x)`, and `weights.grad(objective)` all
   work on a `|>` pipeline (validate new notebooks by executing them with
   `jupyter nbconvert --execute`). `%load_ext pycograd` enables the DSL.
+- **Point-free binops over a bare function.** Any arithmetic (`+ - * / **`) or
+  comparison (`< <= > >= == !=`) binop where an operand is a *bare function*
+  becomes a deferred one-arg stage: `np.tanh ** 2` is `v -> np.tanh(v) ** 2`,
+  `np.tanh > np.exp` is `v -> np.tanh(v) > np.exp(v)` (a mask), with the other
+  operand a function or a held-constant value, in either order. This only works
+  under instrumentation (inside `grad`/`vmap`/`capture`/compile), not at module
+  level. Two carve-outs: `.**` is the distinct *compose* operator (`f .** g` =>
+  `f ∘ g`, `f .** n` => n-fold), not a power; and point-free `@` with a *function*
+  right operand (`f @ g`) raises — matmul a function's output against a value
+  (`f @ w`) instead. (`handle_before_binop` / `handle_before_compare` in
+  `tracer.py`.) A comparison stage in a pipe needs parens — `|>` lowers to `|`,
+  which binds tighter than `>`: `$ |> (np.tanh > 0.0) |> $.astype(float)`.

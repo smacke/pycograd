@@ -263,6 +263,26 @@ def test_autodiff_compose_power_distinct_from_power():
     )
 
 
+def test_autodiff_pointfree_comparison_in_pipe():
+    # A point-free *comparison* stage in a ``|>`` pipe: ``(np.tanh > 0.0)`` is a bare-
+    # function comparison, so it lifts to the mask stage ``v -> np.tanh(v) > 0.0``. The
+    # comparison stage needs parentheses because ``|>`` lowers to ``|`` (bitwise-or), which
+    # binds *tighter* than ``>``. The mask detaches the tape, so we check the value.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import value_and_grad")
+        ip.run_cell("rng = np.random.default_rng(0); xs = rng.standard_normal((3, 4))")
+        ip.run_cell("mask = ($ |> (np.tanh > 0.0) |> $.astype(float) |> np.sum)")
+        r = ip.run_cell("v, _ = value_and_grad(mask)(xs)")
+        assert r.error_in_exec is None, r.error_in_exec
+        xs = ip.user_ns["xs"]
+        assert np.allclose(ip.user_ns["v"], np.sum((np.tanh(xs) > 0.0).astype(float)))
+        print("OK")
+        """
+    )
+
+
 def test_leading_value_pipe_stage_with_integer_index_under_backend():
     # ``|> idx |> forward`` must equal ``forward(idx)`` even when ``forward`` gathers a table
     # with the integer index ``idx`` and runs under a delegate backend. Regression for a bug

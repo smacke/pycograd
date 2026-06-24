@@ -232,6 +232,147 @@ def test_pointfree_product_stage_grad():
     assert np.allclose(g_pf, fd, atol=1e-4)
 
 
+# Point-free is not special to ``**``/``*``: every arithmetic binop with a bare-function
+# operand defers the same way -- function+function, function+const, and the reversed /
+# non-commutative forms (a value on the *left* of a function). One forward per case, each
+# paired with its explicit form. Kept as ``def``s (not many sibling one-arg lambdas) to
+# avoid the lambda-AST-resolver arity fallback that can mis-instrument sibling lambdas.
+def pointfree_sum(x):
+    stage = np.tanh + np.exp  # v -> tanh(v) + exp(v)
+    return np.sum(stage(x))
+
+
+def explicit_sum(x):
+    return np.sum(np.tanh(x) + np.exp(x))
+
+
+def pointfree_rsub(x):
+    stage = 1 - np.tanh  # value on the left: v -> 1 - tanh(v)
+    return np.sum(stage(x))
+
+
+def explicit_rsub(x):
+    return np.sum(1 - np.tanh(x))
+
+
+def pointfree_div(x):
+    stage = np.tanh / 2  # function / const: v -> tanh(v) / 2
+    return np.sum(stage(x))
+
+
+def explicit_div(x):
+    return np.sum(np.tanh(x) / 2)
+
+
+def pointfree_rpow(x):
+    stage = 2**np.tanh  # value base, function exponent: v -> 2 ** tanh(v)
+    return np.sum(stage(x))
+
+
+def explicit_rpow(x):
+    return np.sum(2 ** np.tanh(x))
+
+
+@pytest.mark.parametrize(
+    "pf, ex",
+    [
+        (pointfree_sum, explicit_sum),
+        (pointfree_rsub, explicit_rsub),
+        (pointfree_div, explicit_div),
+        (pointfree_rpow, explicit_rpow),
+    ],
+)
+def test_pointfree_arithmetic_stage_grad(pf, ex):
+    x = np.array([0.5, -1.0, 2.0, 0.3])
+    v_pf, (g_pf,) = value_and_grad(pf)(x)
+    v_ex, (g_ex,) = value_and_grad(ex)(x)
+    assert np.allclose(v_pf, v_ex) and np.allclose(g_pf, g_ex)
+    (fd,) = finite_diff(ex, (x,))
+    assert np.allclose(g_pf, fd, atol=1e-4)
+
+
+# A *comparison* with a bare-function operand defers the same way, yielding a boolean mask
+# stage (``v -> tanh(v) > exp(v)``). The mask is non-differentiable (it detaches the tape),
+# so we check the value matches the explicit form; ``.astype(float)`` makes ``np.sum``
+# numeric. A value may sit on either side (``0.0 <= np.tanh``).
+def pointfree_gt(x):
+    stage = np.tanh > np.exp
+    return np.sum(stage(x).astype(float))
+
+
+def explicit_gt(x):
+    return np.sum((np.tanh(x) > np.exp(x)).astype(float))
+
+
+def pointfree_ge_const(x):
+    stage = np.tanh >= 0.5
+    return np.sum(stage(x).astype(float))
+
+
+def explicit_ge_const(x):
+    return np.sum((np.tanh(x) >= 0.5).astype(float))
+
+
+def pointfree_le_rev(x):
+    stage = 0.0 <= np.tanh  # value on the left
+    return np.sum(stage(x).astype(float))
+
+
+def explicit_le_rev(x):
+    return np.sum((0.0 <= np.tanh(x)).astype(float))
+
+
+@pytest.mark.parametrize(
+    "pf, ex",
+    [
+        (pointfree_gt, explicit_gt),
+        (pointfree_ge_const, explicit_ge_const),
+        (pointfree_le_rev, explicit_le_rev),
+    ],
+)
+def test_pointfree_comparison_stage(pf, ex):
+    x = np.array([0.5, -1.0, 2.0, 0.3])
+    v_pf, _ = value_and_grad(pf)(x)
+    v_ex, _ = value_and_grad(ex)(x)
+    assert np.allclose(v_pf, v_ex)
+
+
+# Point-free ``@`` against a *function* right operand (``f @ g``, ``value @ g``) is a
+# matmul of two function outputs -- a footgun pycograd rejects eagerly. A function's output
+# matmul'd against a *value* (``f @ M``) stays a legal stage.
+_POINTFREE_MAT = np.array([[0.3, -0.7, 1.1], [0.2, 0.5, -0.4], [1.0, 0.1, 0.9]])
+
+
+def pointfree_matmul_func_rhs(x):
+    return np.sum((np.tanh @ np.sin)(x))
+
+
+def pointfree_matmul_val_lhs(x):
+    return np.sum((_POINTFREE_MAT @ np.tanh)(x))
+
+
+def pointfree_matmul_val_rhs(x):
+    return np.sum((np.tanh @ _POINTFREE_MAT)(x))
+
+
+def explicit_matmul_val_rhs(x):
+    return np.sum(np.tanh(x) @ _POINTFREE_MAT)
+
+
+@pytest.mark.parametrize("fn", [pointfree_matmul_func_rhs, pointfree_matmul_val_lhs])
+def test_pointfree_matmul_function_rhs_rejected(fn):
+    x = np.array([0.5, -1.0, 2.0])
+    with pytest.raises(TypeError, match="point-free '@'"):
+        value_and_grad(fn)(x)
+
+
+def test_pointfree_matmul_value_rhs_ok():
+    x = np.array([0.5, -1.0, 2.0])
+    v_pf, (g_pf,) = value_and_grad(pointfree_matmul_val_rhs)(x)
+    v_ex, (g_ex,) = value_and_grad(explicit_matmul_val_rhs)(x)
+    assert np.allclose(v_pf, v_ex) and np.allclose(g_pf, g_ex)
+
+
 # --- scalar ops -------------------------------------------------------------
 def test_polynomial():
     val, (g,) = value_and_grad(poly)(4.0)
