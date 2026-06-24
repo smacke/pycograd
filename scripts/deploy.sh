@@ -8,20 +8,30 @@ if ! git diff-index --quiet HEAD --; then
     exit 1
 fi
 
-if ! current="$(git describe --exact-match --tags HEAD 2> /dev/null)"; then
+if ! git describe --exact-match --tags HEAD > /dev/null; then
     echo "current revision not tagged; please deploy from a tagged revision"
     exit 1
 fi
 
-latest="$(git describe --tags "$(git rev-list --tags --max-count=1)")"
+current="$(python -c 'import versioneer; print(versioneer.get_version())')"
+[[ $? -eq 1 ]] && exit 1
+
+latest="$(git describe --tags $(git rev-list --tags --max-count=1))"
+[[ $? -eq 1 ]] && exit 1
 
 if [[ "$current" != "$latest" ]]; then
     echo "current revision is not the latest version; please deploy from latest version"
     exit 1
 fi
 
-# Authenticate via ~/.pypirc, a TWINE_USERNAME/TWINE_PASSWORD env pair, or the
-# interactive prompt (twine supports all three).
-twine upload dist/*
+expect <<EOF
+set timeout -1
+
+spawn twine upload dist/*
+
+expect "Enter your API token:"
+send -- "$(lpass show 937494930560669633 --password)\r"
+expect
+EOF
 
 git push --tags
