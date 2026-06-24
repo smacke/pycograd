@@ -154,7 +154,7 @@ hands the net to *another framework's* autodiff.)
 In a Jupyter or IPython session, `%load_ext pycograd` turns on the pycograd DSL —
 it loads [pipescript](https://github.com/smacke/pipescript) (if not already
 loaded) and enables the `params{ ... }` block surface and autodiff through `|>`
-pipes. Requires the `pipescript` extra (`pip install pycograd[notebook]`):
+pipes.
 
 ```python
 %load_ext pycograd
