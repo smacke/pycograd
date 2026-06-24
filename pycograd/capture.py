@@ -90,6 +90,13 @@ class Graph:
     def __str__(self) -> str:  # pragma: no cover - debug aid
         return pretty(self)
 
+    def __call__(self, *inputs: PyTree) -> PyTree:
+        """Run the captured computation on concrete ``inputs`` -- ``graph(x)`` is the
+        inference path. Delegates to :func:`eval_graph`, so the replay dispatches through
+        ``bind`` (computing on the active backend) and stays differentiable under
+        ``value_and_grad``/``vmap``/``jvp`` just like the original function."""
+        return eval_graph(self, *inputs)
+
     def pretty(self) -> str:
         """A jaxpr-style text listing of the graph (nodes in SSA order), e.g.::
 
