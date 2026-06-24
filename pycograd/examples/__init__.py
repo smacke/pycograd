@@ -6,3 +6,6 @@ bar (see the test suite, which imports them). Run the training demos with::
 
     python -m pycograd.examples
 """
+from pycograd.examples.training import accuracy, train
+
+__all__ = ["accuracy", "train"]
