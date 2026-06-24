@@ -189,6 +189,49 @@ def _assert_grads_match(f, args, atol=1e-5):
         assert np.allclose(g_ad, g_fd, atol=atol), (g_ad, g_fd)
 
 
+# --- point-free binops over a bare function ---------------------------------
+def pointfree_power(x):
+    # ``np.tanh ** 2`` is point-free: a bare function operand makes the binop a deferred
+    # stage ``v -> np.tanh(v) ** 2`` (x supplied later), and the deferred call still
+    # differentiates (``np.tanh`` -> ``d_tanh``).
+    stage = np.tanh**2
+    return np.sum(stage(x))
+
+
+def explicit_power(x):
+    return np.sum(np.tanh(x) ** 2)
+
+
+def pointfree_product(x):
+    stage = np.sin * np.cos  # v -> sin(v) * cos(v)
+    return np.sum(stage(x))
+
+
+def explicit_product(x):
+    return np.sum(np.sin(x) * np.cos(x))
+
+
+def test_pointfree_power_stage_grad():
+    # The point-free function only differentiates when instrumented (a raw call would hit
+    # ``ufunc ** int``), so compare value_and_grad of the point-free and explicit forms --
+    # and the explicit form against finite differences.
+    x = np.array([0.5, -1.0, 2.0, 0.3])
+    v_pf, (g_pf,) = value_and_grad(pointfree_power)(x)
+    v_ex, (g_ex,) = value_and_grad(explicit_power)(x)
+    assert np.allclose(v_pf, v_ex) and np.allclose(g_pf, g_ex)
+    (fd,) = finite_diff(explicit_power, (x,))
+    assert np.allclose(g_pf, fd, atol=1e-4)
+
+
+def test_pointfree_product_stage_grad():
+    x = np.array([0.2, 1.1, -0.7])
+    _, (g_pf,) = value_and_grad(pointfree_product)(x)
+    _, (g_ex,) = value_and_grad(explicit_product)(x)
+    assert np.allclose(g_pf, g_ex)
+    (fd,) = finite_diff(explicit_product, (x,))
+    assert np.allclose(g_pf, fd, atol=1e-4)
+
+
 # --- scalar ops -------------------------------------------------------------
 def test_polynomial():
     val, (g,) = value_and_grad(poly)(4.0)

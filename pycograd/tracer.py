@@ -16,6 +16,8 @@ import ast
 import functools
 import inspect
 import sysconfig
+from types import CodeType
+from typing import cast
 
 import numpy as np
 import pyccolo as pyc
@@ -104,6 +106,20 @@ def _unmapped_mathy(func: Prim, fallback: Prim) -> Prim:
     return _wrapped
 
 
+def _is_deferred_operand(z: object) -> bool:
+    """True for a *bare callable* used point-free in a binop -- e.g. ``np.tanh`` in a
+    pipeline stage ``np.tanh ** 2`` (meaning ``x -> np.tanh(x) ** 2``, with ``x`` supplied
+    later by the pipe). A ``Var``/``Tracer`` (or a plain number/array) is a *value*, not a
+    deferred stage, so it takes the ordinary binop path."""
+    return callable(z) and not isinstance(z, (Var, Tracer))
+
+
+# pipescript lowers its *compose* operator ``.**`` to a ``**`` (Pow) token tagged with this
+# augmentation. We duck-type on the token (rather than import pipescript) so a ``.**`` node
+# composes functions while a plain ``**`` raises to a power. See ``handle_before_binop``.
+_COMPOSE_TOKEN = ".**"
+
+
 class AutodiffTracer(pyc.BaseTracer):
     # Instrument whichever file the differentiated function lives in.
     instrument_all_files = True
@@ -138,6 +154,73 @@ class AutodiffTracer(pyc.BaseTracer):
         runner = _make_runner(func)
         self._helpers[func] = runner
         return runner
+
+    def _augmented_definition_for(self, f: Prim) -> ast.stmt | None:
+        """Like pyccolo's, but also recovers a *bare pipe lambda*'s augmented AST.
+
+        pyccolo's base bails on ``co_name == "<lambda>"`` and only scans named ``def``s, so
+        a top-level pipe lambda (``redundant = $ |> np.tanh ** 2 |> np.sum``) has no retained
+        definition and falls back to *run-directly* -- leaving its binops (our point-free
+        ``np.tanh ** 2`` stage) un-instrumented. But the lambda's augmented ``ast.Lambda``
+        node *is* retained in the shared ``ast_node_by_id`` (pipescript wove it). Find it and
+        lift it into a synthetic ``def`` -- named ``<lambda>`` so ``instrumented``'s by-name
+        code-object extraction still matches -- mirroring pyccolo's own source-path lambda
+        lifting, but from the *augmented* node so the pipe markings (and the ``**``) survive.
+        A named def is handled by the base path unchanged.
+        """
+        node = super()._augmented_definition_for(f)
+        if node is not None:
+            return node
+        code = getattr(f, "__code__", None)
+        if (
+            code is None
+            or code.co_name != "<lambda>"
+            or not any(name.endswith("_PYCCOLO_EVT_EMIT") for name in code.co_names)
+        ):
+            return None
+        lam = self._retained_augmented_lambda(code)
+        if lam is None:
+            return None
+        template = cast(ast.FunctionDef, ast.parse("def _l(): return None").body[0])
+        template.name = "<lambda>"  # match ``instrumented``'s ``target_name`` (co_name)
+        template.args = lam.args
+        template.body = [ast.Return(value=lam.body)]
+        ast.copy_location(template, lam)
+        ast.fix_missing_locations(template)
+        return template
+
+    def _retained_augmented_lambda(self, code: CodeType) -> ast.Lambda | None:
+        """The retained augmentation-annotated ``ast.Lambda`` for a woven lambda ``code``:
+        an ``ast.Lambda`` whose subtree carries augmentations and whose arity matches,
+        preferring an exact ``lineno`` match over a bare arity match.
+
+        Scope the search to ``code``'s *source file* first (``ast_bookkeeper_by_fname``):
+        each cell run gets a distinct ``co_filename``, so an edited-and-re-run pipeline (a
+        new file) must not resolve to a *stale* lambda left in the shared global table by a
+        prior run. Only if the per-file table has no match do we fall back to the shared
+        table, scanning newest-first so the freshest definition still wins."""
+        argcount, firstlineno = code.co_argcount, code.co_firstlineno
+
+        def match(table: dict[int, ast.AST], newest_first: bool) -> ast.Lambda | None:
+            nodes = reversed(list(table.values())) if newest_first else table.values()
+            fallback: ast.Lambda | None = None
+            for node in nodes:
+                if (
+                    isinstance(node, ast.Lambda)
+                    and len(node.args.args) == argcount
+                    and any(self.get_augmentations(id(n)) for n in ast.walk(node))
+                ):
+                    if getattr(node, "lineno", None) == firstlineno:
+                        return node
+                    fallback = fallback or node
+            return fallback
+
+        bk = self.ast_bookkeeper_by_fname.get(code.co_filename)
+        if bk is not None:
+            hit = match(bk.ast_node_by_id, newest_first=False)
+            if hit is not None:
+                return hit
+        return match(self.ast_node_by_id, newest_first=True)
 
     def resolve_call(self, func: Prim) -> Prim:
         """Map a callable to its autodiff-aware version.
@@ -212,7 +295,52 @@ class AutodiffTracer(pyc.BaseTracer):
         self, ret: Prim, node: ast.BinOp, *_: object, **__: object
     ) -> Prim:
         prim, _raw = _BINOP_PRIM[type(node.op)]
-        return lambda x, y: bind(prim, x, y)
+        # pipescript's compose op ``.**`` lowers to a Pow node carrying ``_COMPOSE_TOKEN``;
+        # such a node *composes* functions instead of raising to a power.
+        compose = isinstance(node.op, ast.Pow) and any(
+            getattr(spec, "token", None) == _COMPOSE_TOKEN
+            for spec in self.get_augmentations(id(node))
+        )
+
+        def op(x: Boxed | Prim, y: Boxed | Prim) -> Boxed | Prim:
+            xd, yd = _is_deferred_operand(x), _is_deferred_operand(y)
+            if compose and xd:
+                # ``f .** g``: function composition (each call routed through
+                # ``resolve_call`` so it differentiates). ``g`` a function -> ``f ∘ g``;
+                # ``g`` an int -> the composition *power* ``f ∘ f ∘ … (g times)``.
+                rf = self.resolve_call(cast(Prim, x))
+                if yd:
+                    rg = self.resolve_call(cast(Prim, y))
+                    return lambda v: rf(rg(v))
+                n = y if isinstance(y, int) else int(cast(int, y))
+
+                def composed(v: Boxed) -> Boxed:
+                    for _ in range(n):
+                        v = rf(v)
+                    return v
+
+                return composed
+            if not (xd or yd):
+                # Ordinary value binop (a Var/array/number, no bare function): route
+                # through ``bind`` exactly as before -- base ``Var``/array runs the ``d_*``
+                # primitive, a ``BatchTracer``/``ShapedArray`` selects its transform level.
+                return bind(prim, x, y)
+            # Point-free: an operand is a bare function (``np.tanh ** 2``). Defer the op to a
+            # one-argument *stage* ``v -> prim(x(v), y(v))`` -- each function operand is run
+            # through ``resolve_call`` so its call differentiates (``np.tanh`` -> ``d_tanh``)
+            # and rides any live transform level, exactly like an intercepted call would; a
+            # non-function operand (the ``2``) is held constant.
+            fx = self.resolve_call(cast(Prim, x)) if xd else None
+            fy = self.resolve_call(cast(Prim, y)) if yd else None
+
+            def stage(v: Boxed) -> Boxed:
+                a = fx(v) if fx is not None else x
+                b = fy(v) if fy is not None else y
+                return bind(prim, a, b)
+
+            return stage
+
+        return op
 
     @pyc.register_handler(
         pyc.before_unaryop, when=lambda node: type(node.op) in _UNARYOP_PRIM

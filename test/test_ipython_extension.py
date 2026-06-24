@@ -206,6 +206,85 @@ def test_autodiff_pipe_in_cell():
     )
 
 
+def test_autodiff_pointfree_power_in_bare_pipe_lambda():
+    # A *bare top-level pipe lambda* using a point-free binop: ``np.tanh ** 2`` means the
+    # stage ``x -> np.tanh(x) ** 2``. The lambda runs un-instrumented by default, so this
+    # exercises both halves of the fix: (1) ``AutodiffTracer._augmented_definition_for``
+    # recovers the lambda's retained augmented AST so ``value_and_grad``/``capture``
+    # re-instrument it (instead of run-directly), and (2) the ``before_binop`` handler then
+    # lifts ``np.tanh ** 2`` to a differentiable stage. Value and gradient must be exact.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import value_and_grad, capture")
+        ip.run_cell("rng = np.random.default_rng(0); xs = rng.standard_normal((3, 4))")
+        ip.run_cell("redundant = ($ |> np.tanh ** 2 |> np.sum)")
+        r = ip.run_cell("v, (g,) = value_and_grad(redundant)(xs)")
+        assert r.error_in_exec is None, r.error_in_exec
+        xs = ip.user_ns["xs"]
+        assert np.allclose(ip.user_ns["v"], np.sum(np.tanh(xs) ** 2))
+        expected = 2 * np.tanh(xs) * (1 - np.tanh(xs) ** 2)
+        assert np.allclose(ip.user_ns["g"], expected), ip.user_ns["g"]
+        # and it captures into a graph with an explicit pow node (not a degraded op)
+        gr = ip.run_cell("graph = capture(redundant, xs)")
+        assert gr.error_in_exec is None, gr.error_in_exec
+        assert "pow" in ip.user_ns["graph"].pretty()
+        print("OK")
+        """
+    )
+
+
+def test_autodiff_compose_power_distinct_from_power():
+    # pipescript's compose op ``.**`` must *compose* (``np.tanh .** 2`` -> tanh(tanh(x))),
+    # distinct from the point-free power ``**`` (``np.tanh ** 2`` -> tanh(x)**2). pycograd
+    # tells them apart by the ``.**`` augmentation on the (lowered) Pow node.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import capture, value_and_grad")
+        ip.run_cell("rng = np.random.default_rng(0); xs = rng.standard_normal((3, 4))")
+        xs = np.random.default_rng(0).standard_normal((3, 4))
+        ip.run_cell("comp = ($ |> np.tanh .** 2 |> np.sum)")
+        ip.run_cell("gc = capture(comp, xs)")
+        pretty = ip.user_ns["gc"].pretty()
+        assert pretty.count("tanh") == 2 and "pow" not in pretty, pretty  # composition
+        r = ip.run_cell("vc, (gxc,) = value_and_grad(comp)(xs)")
+        assert r.error_in_exec is None, r.error_in_exec
+        assert np.allclose(ip.user_ns["vc"], np.sum(np.tanh(np.tanh(xs))))
+        expected = (1 - np.tanh(np.tanh(xs)) ** 2) * (1 - np.tanh(xs) ** 2)
+        assert np.allclose(ip.user_ns["gxc"], expected), ip.user_ns["gxc"]
+        # the plain power form stays a single tanh -> pow
+        ip.run_cell("pf = ($ |> np.tanh ** 2 |> np.sum)")
+        ip.run_cell("gp = capture(pf, xs)")
+        pp = ip.user_ns["gp"].pretty()
+        assert pp.count("tanh") == 1 and "pow" in pp, pp
+        print("OK")
+        """
+    )
+
+
+def test_autodiff_edited_pipe_lambda_not_stale():
+    # Editing a pipe lambda and re-running must use the NEW pipeline, not a stale one.
+    # The lambda's augmented node is recovered from the shared registry to re-instrument it;
+    # since re-running a cell yields a *new* co_filename, the recovery is scoped per-file so
+    # it never resolves to the previous run's lambda. Each capture must reflect its own op.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np; from pycograd import capture")
+        ip.run_cell("rng = np.random.default_rng(0); xs = rng.standard_normal((3, 4))")
+        ip.run_cell("redundant = ($ |> np.tanh ** 2 |> np.sum)")
+        ip.run_cell("gA = capture(redundant, xs)")
+        assert "tanh" in ip.user_ns["gA"].pretty() and "sin" not in ip.user_ns["gA"].pretty()
+        ip.run_cell("redundant = ($ |> np.sin ** 3 |> np.sum)")  # edit + re-run
+        ip.run_cell("gB = capture(redundant, xs)")
+        pretty = ip.user_ns["gB"].pretty()
+        assert "sin" in pretty and "tanh" not in pretty, pretty  # NEW pipeline, not stale
+        print("OK")
+        """
+    )
+
+
 def test_autodiff_pipe_through_user_helper_in_cell():
     # `y |> relu` instruments the helper on demand (exercises instrumented()
     # self-activation), so the subgradient flows without an always-on tracer.
