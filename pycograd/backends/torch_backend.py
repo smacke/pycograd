@@ -36,15 +36,27 @@ def _torch_dtype(torch: ModuleType, np_dtype: np.dtype) -> "torch.dtype":
     return getattr(torch, np_dtype.name)
 
 
-def _as_torch(torch: ModuleType, x: BackendArray) -> BackendArray:
-    """Convert ``x`` to a torch tensor in the active working dtype (bf16 via float32)."""
+def _as_torch(
+    torch: ModuleType,
+    x: BackendArray,
+    device: Optional[str] = None,
+    np_dtype: Optional[np.dtype] = None,
+) -> BackendArray:
+    """Convert ``x`` to a torch tensor in the working dtype (bf16 via float32).
+
+    ``np_dtype`` overrides the active :func:`~pycograd.dtypes.current_dtype` (a device
+    backend like ``mps`` uses this to substitute float32 for the unsupported float64),
+    and ``device`` places the result on that torch device (``None`` keeps it on the CPU,
+    the historical behavior; a no-op move when ``x`` is already a tensor on it)."""
+    dt = current_dtype() if np_dtype is None else np_dtype
     if isinstance(x, torch.Tensor):
-        return x
-    dt = current_dtype()
+        return x if device is None else x.to(device)
     if dt.name == "bfloat16":
         # torch can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
-        return torch.as_tensor(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
-    return torch.as_tensor(np.asarray(x, dtype=dt))
+        t = torch.as_tensor(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
+    else:
+        t = torch.as_tensor(np.asarray(x, dtype=dt))
+    return t if device is None else t.to(device)
 
 
 def _torch_to_numpy(torch: ModuleType, t: BackendArray) -> Array:
@@ -59,11 +71,17 @@ def _torch_to_numpy(torch: ModuleType, t: BackendArray) -> Array:
     return np.asarray(t)
 
 
-def _make_adapters(torch: ModuleType) -> dict[str, Prim]:
-    """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set."""
+def _make_adapters(
+    torch: ModuleType,
+    as_t: Callable[[BackendArray], BackendArray],
+    device: Optional[str] = None,
+) -> dict[str, Prim]:
+    """Build ``{numpy/math fn name: torch replacement}`` for the whole intercept set.
 
-    def as_t(x: BackendArray) -> BackendArray:
-        return _as_torch(torch, x)
+    ``as_t`` is the backend's device/dtype-aware tensor converter (so every operand the
+    adapters touch lands on the right device); ``device`` is threaded into the one spot
+    that builds a tensor directly rather than through ``as_t`` (the ``where`` condition).
+    """
 
     def unary(name: str) -> Prim:
         fn = getattr(torch, name)
@@ -79,11 +97,12 @@ def _make_adapters(torch: ModuleType) -> dict[str, Prim]:
         return torch.minimum(as_t(a), as_t(b))
 
     def where(cond: BackendArray, a: BackendArray, b: BackendArray) -> BackendArray:
-        c = (
-            cond
-            if isinstance(cond, torch.Tensor)
-            else torch.as_tensor(np.asarray(cond))
-        )
+        if isinstance(cond, torch.Tensor):
+            c = cond
+        else:
+            c = torch.as_tensor(np.asarray(cond))
+            if device is not None:
+                c = c.to(device)
         return torch.where(c, as_t(a), as_t(b))
 
     def clip(
@@ -219,11 +238,14 @@ class TorchBackend(Backend):
     name = "torch"
     is_delegate = True
 
-    def __init__(self) -> None:
+    def __init__(self, device: Optional[str] = None) -> None:
         import torch
 
         self._torch = torch
-        adapters = _make_adapters(torch)
+        # The torch device every tensor is placed on. ``None`` keeps tensors on the CPU
+        # (the default torch backend); a subclass (e.g. ``mps``) names a device.
+        self._device = device
+        adapters = _make_adapters(torch, self._as_tensor, device)
         self._intercept = {
             fn: adapters[getattr(fn, "__name__")]
             for fn in _INTERCEPT
@@ -242,13 +264,13 @@ class TorchBackend(Backend):
         # axis ``dim`` and needs a concrete dim (no ``None``), so default softmax to -1
         # and reduce logsumexp over all axes when ``axis is None``.
         self._intercept[d_softmax] = lambda x, axis=-1: torch.softmax(
-            _as_torch(torch, x), dim=-1 if axis is None else axis
+            self._as_tensor(x), dim=-1 if axis is None else axis
         )
 
         def _torch_logsumexp(
             x: BackendArray, axis: object = None, keepdims: bool = False
         ) -> BackendArray:
-            t = _as_torch(torch, x)
+            t = self._as_tensor(x)
             dim = tuple(range(t.ndim)) if axis is None else axis
             return torch.logsumexp(t, dim=dim, keepdim=keepdims)
 
@@ -274,8 +296,17 @@ class TorchBackend(Backend):
 
         self._intercept[_conv2d] = _torch_conv2d
 
+    def _working_np_dtype(self) -> np.dtype:
+        """The numpy dtype tensors are created in -- the active working dtype by default.
+
+        A device backend that cannot run the float64 default (``mps``) overrides this to
+        substitute a supported dtype; everything else inherits :func:`current_dtype`."""
+        return current_dtype()
+
     def _as_tensor(self, x: BackendArray) -> BackendArray:
-        return _as_torch(self._torch, x)
+        return _as_torch(
+            self._torch, x, device=self._device, np_dtype=self._working_np_dtype()
+        )
 
     @property
     def intercept(self) -> Mapping[Prim, Prim]:
@@ -285,16 +316,16 @@ class TorchBackend(Backend):
         return _unmapped(func, lambda x: isinstance(x, self._torch.Tensor))
 
     def lift(self, array: BackendArray) -> BackendArray:
-        return _as_torch(self._torch, array)
+        return self._as_tensor(array)
 
     def const(self, array: BackendArray) -> BackendArray:
-        return _as_torch(self._torch, array)
+        return self._as_tensor(array)
 
     def coerce_operand(self, value: BackendArray) -> BackendArray:
         # Promote a numpy constant (e.g. a data global) so it can share an operator
         # with a torch tensor; leave python scalars and existing tensors untouched.
         if isinstance(value, (np.ndarray, np.generic)):
-            return _as_torch(self._torch, value)
+            return self._as_tensor(value)
         return value
 
     def to_numpy(self, tensor: BackendArray) -> Array:
@@ -306,7 +337,7 @@ class TorchBackend(Backend):
         leaves: list[BackendArray],
     ) -> tuple[BackendArray, list[BackendArray]]:
         torch = self._torch
-        ts = [_as_torch(torch, leaf).requires_grad_(True) for leaf in leaves]
+        ts = [self._as_tensor(leaf).requires_grad_(True) for leaf in leaves]
         out = self._as_tensor(scalar_fn(ts)).reshape(())
         if ts:
             grads = torch.autograd.grad(out, ts, allow_unused=True)
@@ -344,7 +375,7 @@ class TorchBackend(Backend):
         def run(
             leaves: list[BackendArray],
         ) -> tuple[BackendArray, list[BackendArray]]:
-            ts = [_as_torch(torch, x) for x in leaves]
+            ts = [self._as_tensor(x) for x in leaves]
             if not ts:
                 out = self._as_tensor(scalar_fn(ts)).reshape(())
                 return _torch_to_numpy(torch, out), []

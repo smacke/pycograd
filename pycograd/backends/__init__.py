@@ -219,6 +219,12 @@ def _make_tf() -> Backend:
     return TFBackend()
 
 
+def _make_mps() -> Backend:
+    from pycograd.backends.mps_backend import MpsBackend
+
+    return MpsBackend()
+
+
 def _make_abstract() -> Backend:
     from pycograd.backends.abstract_backend import AbstractBackend
 
@@ -237,6 +243,8 @@ register_backend("shape", _make_abstract)
 register_backend("jax", _make_jax)
 register_backend("torch", _make_torch)
 register_backend("pytorch", _make_torch)
+register_backend("mps", _make_mps)
+register_backend("metal", _make_mps)
 register_backend("tf", _make_tf)
 register_backend("tensorflow", _make_tf)
 register_backend("cupy", _make_cupy)
