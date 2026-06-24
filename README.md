@@ -11,26 +11,6 @@ and [pyccolo](https://github.com/smacke/pyccolo). Write *ordinary* numeric Pytho
 — including `numpy` calls like `np.exp`, `np.dot`, `np.sum` and operators like
 `@` — and get correct gradients, with no special "autodiff namespace."
 
-pycograd grew out of the autodiff example in pyccolo. It is meant to scale *down*
-to "explain backprop on one slide" and *up*, eventually, to training real models —
-see [`ROADMAP.md`](ROADMAP.md).
-
-## How it works
-
-* `Var` is a reverse-mode tape node wrapping a numpy array. Arithmetic operators
-  are overloaded so that running a program builds a computation graph;
-  `Var.backward()` then walks it in reverse to accumulate gradients.
-
-* Operator overloading alone is *not enough*. The moment user code calls a numpy
-  function — `np.exp(x)` — numpy's ufunc machinery takes over and the gradient
-  link is lost. (`Var` sets `__array_ufunc__ = None` so this fails loudly instead
-  of silently producing a wrong gradient.) pyccolo supplies the missing piece: its
-  `before_call` event lets a handler *replace the function being called*, swapping
-  `np.exp` for a differentiable `d_exp` transparently — so idiomatic numpy code
-  "just differentiates." The same trick routes scalar `math.*` through the
-  numpy-backed primitives, and differentiates through your own helper functions by
-  instrumenting them on demand.
-
 ## Install
 
 ```bash
@@ -175,6 +155,22 @@ x.grad                                   # == np.exp(x)
 ```
 
 `value_and_grad` / `grad` work the same in a notebook as anywhere else.
+
+## How it works
+
+* `Var` is a reverse-mode tape node wrapping a numpy array. Arithmetic operators
+  are overloaded so that running a program builds a computation graph;
+  `Var.backward()` then walks it in reverse to accumulate gradients.
+
+* Operator overloading alone is *not enough*. The moment user code calls a numpy
+  function — `np.exp(x)` — numpy's ufunc machinery takes over and the gradient
+  link is lost. (`Var` sets `__array_ufunc__ = None` so this fails loudly instead
+  of silently producing a wrong gradient.) pyccolo supplies the missing piece: its
+  `before_call` event lets a handler *replace the function being called*, swapping
+  `np.exp` for a differentiable `d_exp` transparently — so idiomatic numpy code
+  "just differentiates." The same trick routes scalar `math.*` through the
+  numpy-backed primitives, and differentiates through your own helper functions by
+  instrumenting them on demand.
 
 ## License
 
