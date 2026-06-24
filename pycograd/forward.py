@@ -289,6 +289,28 @@ def _gated_act_rule(trace: JVPTrace, f: Boxed, s: Boxed) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
+def _softmax_rule(trace: JVPTrace, x: Boxed, axis: Axis = -1) -> JVPTracer:
+    # y = softmax(x); dy = y * (dx - sum(y*dx, axis, keepdims)).
+    t = trace._raise(x)
+    y = bind(ops.d_softmax, t.primal, axis=axis)
+    ydx_sum = bind(ops.d_sum, bind(ops.d_mul, y, t.tangent), axis=axis, keepdims=True)
+    tangent_out = bind(ops.d_mul, y, bind(ops.d_sub, t.tangent, ydx_sum))
+    return _result(trace, y, tangent_out)
+
+
+def _logsumexp_rule(
+    trace: JVPTrace, x: Boxed, axis: Axis = None, keepdims: bool = False
+) -> JVPTracer:
+    # d(logsumexp(x)) = sum(softmax(x) * dx, axis) -- softmax is the gradient of logsumexp.
+    t = trace._raise(x)
+    primal_out = bind(ops.d_logsumexp, t.primal, axis=axis, keepdims=keepdims)
+    sm = bind(ops.d_softmax, t.primal, axis=axis)
+    tangent_out = bind(
+        ops.d_sum, bind(ops.d_mul, sm, t.tangent), axis=axis, keepdims=keepdims
+    )
+    return _result(trace, primal_out, tangent_out)
+
+
 def _div_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_div, ta.primal, tb.primal)
@@ -601,6 +623,8 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             # nonlinear binary.
             ops.d_mul: _mul_rule,
             ops.d_gated_act: _gated_act_rule,
+            ops.d_softmax: _softmax_rule,
+            ops.d_logsumexp: _logsumexp_rule,
             ops.d_div: _div_rule,
             ops.d_pow: _pow_rule,
             ops._matmul: _matmul_rule,

@@ -204,6 +204,14 @@ def _einsum_flops(node: Node, operands: "list[ShapeDtypeStruct]", symbolic: int)
     return 2 * prod
 
 
+def matmul_flops(out_size: int, k: int) -> int:
+    """FLOPs for a matmul producing ``out_size`` elements with contracted dim ``k``:
+    one multiply + one add per term, hence ``2 * out_size * k``. The single source for
+    the matmul cost model -- ``node_flops`` and the matmul-chain reordering pass
+    (:mod:`pycograd.passes`) both cost candidate products through it."""
+    return 2 * out_size * k
+
+
 def node_flops(node: Node, by_id: "dict[int, Node]", model: CostModel) -> int:
     """Estimated floating-point operations to evaluate ``node`` (0 for inputs/consts and
     pure data movement)."""
@@ -220,7 +228,7 @@ def node_flops(node: Node, by_id: "dict[int, Node]", model: CostModel) -> int:
         if operands and operands[0].shape:
             d = operands[0].shape[-1]
             k = d if isinstance(d, int) else sym
-        return 2 * out * k
+        return matmul_flops(out, k)
     if name == "d_einsum":
         return _einsum_flops(node, operands, sym)
     if name in _MOVEMENT:

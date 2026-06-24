@@ -604,6 +604,72 @@ def d_min(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
 
 
 # ---------------------------------------------------------------------------
+# Fused softmax / logsumexp.
+#
+# Both are *fused* primitives (the ``d_gated_act`` / ``d_sigmoid`` template): one tape
+# node + one closed-form VJP instead of the ~6-node max/sub/exp/sum/log chain the
+# composed ``functional.softmax`` / ``logsumexp`` would unroll to. Both compute the
+# numerically *stable* max-shifted form internally, so fusing a naive
+# ``log(sum(exp(x)))`` into ``d_logsumexp`` is also an overflow fix. Tape-only (no numpy
+# name, so no ``_RULES`` entry); user code calls them directly, so under an enclosing
+# transform an operand is a higher-level tracer -- dispatch through ``bind`` so the
+# registered jvp/vmap/abstract rule runs. The ``axis`` is a bind *param* (not baked) so
+# vmap can shift it past the inserted batch axis.
+# ---------------------------------------------------------------------------
+def d_softmax(x: Operand, axis: Axis = -1) -> Var:
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(x, Tracer):
+        return cast(Var, bind(d_softmax, x, axis=axis))
+    x, xp = _lift(x), _xp()
+    e = xp.exp(x.value - xp.max(x.value, axis=axis, keepdims=True))
+    y = e / xp.sum(e, axis=axis, keepdims=True)
+    out = Var(y, _parents=(x,))
+
+    def _backward() -> None:
+        # dx = y * (g - sum(y*g, axis, keepdims)) -- the standard stable softmax backward.
+        g = out.grad
+        dx = y * (g - xp.sum(y * g, axis=axis, keepdims=True))
+        x.grad = _accumulate(x.grad, dx)
+
+    out._backward = _backward
+    _record_vjp(out, d_softmax, (x,), {"axis": axis})
+    return out
+
+
+def d_logsumexp(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(x, Tracer):
+        return cast(Var, bind(d_logsumexp, x, axis=axis, keepdims=keepdims))
+    x, xp = _lift(x), _xp()
+    m = xp.max(x.value, axis=axis, keepdims=True)
+    e = xp.exp(x.value - m)
+    s = xp.sum(e, axis=axis, keepdims=True)
+    lse_kd = m + xp.log(s)  # keepdims-shaped result
+    if keepdims:
+        out_val = lse_kd
+    elif axis is None:
+        out_val = lse_kd.reshape(())
+    else:
+        axes = axis if isinstance(axis, tuple) else (axis,)
+        out_val = xp.squeeze(lse_kd, axis=axes)
+    out = Var(out_val, _parents=(x,))
+    sm = e / s  # softmax = d(lse)/dx
+
+    def _backward() -> None:
+        # dx = softmax(x) * g, broadcasting g back over the reduced axis.
+        g = out.grad
+        if axis is not None and not keepdims:
+            g = xp.expand_dims(g, axis)
+        x.grad = _accumulate(x.grad, sm * g)
+
+    out._backward = _backward
+    _record_vjp(out, d_logsumexp, (x,), {"axis": axis, "keepdims": keepdims})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Shape / structure.
 # ---------------------------------------------------------------------------
 def d_concatenate(seq: Sequence[Operand], axis: int = 0) -> Var:
@@ -1264,6 +1330,36 @@ def _vjp_reduce_select(
     return [_b(d_mul, g, _const_like(mask))]
 
 
+def _vjp_softmax(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # y = softmax(x); dx = y * (g - sum(y*g, axis, keepdims)). ``d_softmax`` is recomputed
+    # bind-riding -- ``cse`` dedups it against the forward node (the cross-pass-CSE path).
+    (x,) = operands
+    axis = params.get("axis", -1)
+    y = _b(d_softmax, x, axis=axis)
+    yg_sum = _b(d_sum, _b(d_mul, y, g), axis=axis, keepdims=True)
+    return [_b(d_mul, y, _b(d_sub, g, yg_sum))]
+
+
+def _vjp_logsumexp(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # d(logsumexp(x))/dx = softmax(x); dx = softmax(x) * g (g broadcast over the reduced axis).
+    (x,) = operands
+    axis = params.get("axis")
+    keepdims = params.get("keepdims", False)
+    if axis is not None and not keepdims:
+        g = _expand_dims_multi(g, axis)
+    return [_b(d_mul, _b(d_softmax, x, axis=axis), g)]
+
+
 def _vjp_select(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -1387,6 +1483,8 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_concatenate: _vjp_concatenate,
             d_max: _vjp_reduce_select,
             d_min: _vjp_reduce_select,
+            d_softmax: _vjp_softmax,
+            d_logsumexp: _vjp_logsumexp,
             d_maximum: _vjp_select,
             d_minimum: _vjp_select,
             d_where: _vjp_where,

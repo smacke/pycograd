@@ -20,7 +20,7 @@ import numpy as np
 from pycograd._typing import Array, BackendArray, Prim
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT, d_gated_act, d_sigmoid
+from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 # math.* names that don't exist verbatim on jnp.
 _NAME_OVERRIDE = {"atan": "arctan"}
@@ -76,6 +76,15 @@ class JaxBackend(Backend):
         self._intercept[d_sigmoid] = jax.nn.sigmoid
         # ``d_gated_act`` (tanh(f)*sigmoid(s)) is likewise tape-only; lower it natively.
         self._intercept[d_gated_act] = lambda f, s: jnp.tanh(f) * jax.nn.sigmoid(s)
+        # Fused stable softmax / logsumexp (tape-only): lower to jax's native ops.
+        import jax.scipy.special as _jsp
+
+        self._intercept[d_softmax] = lambda x, axis=-1: jax.nn.softmax(x, axis=axis)
+        self._intercept[d_logsumexp] = (
+            lambda x, axis=None, keepdims=False: _jsp.logsumexp(
+                x, axis=axis, keepdims=keepdims
+            )
+        )
         # Lower the composed im2col ``conv2d`` to XLA's native conv via
         # ``lax.conv_general_dilated`` (NCHW input / OIHW kernel, matching pycograd's
         # layout; ``rhs_dilation`` = kernel dilation, ``feature_group_count`` = groups),

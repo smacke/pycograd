@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT, d_gated_act, d_sigmoid
+from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 
 def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
@@ -224,6 +224,15 @@ class TFBackend(Backend):
         self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
             "sigmoid"
         ](s)
+        # Fused stable softmax / logsumexp (tape-only): lower to tf's native ops.
+        self._intercept[d_softmax] = lambda x, axis=-1: tf.nn.softmax(
+            _as_tf(tf, x), axis=-1 if axis is None else axis
+        )
+        self._intercept[d_logsumexp] = (
+            lambda x, axis=None, keepdims=False: tf.reduce_logsumexp(
+                _as_tf(tf, x), axis=axis, keepdims=keepdims
+            )
+        )
 
     def _is_tensor(self, x: object) -> bool:
         tf = self._tf

@@ -269,6 +269,22 @@ def _reduce_for(prim: Prim) -> Rule:
     return rule
 
 
+def _axis_preserving_for(prim: Prim) -> Rule:
+    """Like :func:`_reduce_for` but for a shape-preserving ``axis``-bearing op (softmax):
+    the batch axis moves to the front and the logical ``axis`` shifts past it, but the
+    result keeps the batch axis (``bdim`` 0) rather than reducing it away."""
+
+    def rule(trace: BatchTrace, x: Boxed, axis: Axis = -1, **kw: Any) -> BatchTracer:
+        t = trace._raise(x)
+        if t.bdim is None:
+            return _result(trace, bind(prim, t.value, axis=axis, **kw), None)
+        v = _move_bdim_to_front(t)
+        ax = _shift_axis(axis, _logical_ndim(t))
+        return _result(trace, bind(prim, v, axis=ax, **kw), 0)
+
+    return rule
+
+
 # -- transpose --------------------------------------------------------------
 def _transpose_rule(
     trace: BatchTrace, x: Boxed, axes: tuple[int, ...] | None = None
@@ -593,6 +609,8 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_std: _reduce_for(ops.d_std),
             ops.d_max: _reduce_for(ops.d_max),
             ops.d_min: _reduce_for(ops.d_min),
+            ops.d_softmax: _axis_preserving_for(ops.d_softmax),
+            ops.d_logsumexp: _reduce_for(ops.d_logsumexp),
             ops._matmul: _matmul_rule,
             ops.d_einsum: _einsum_rule,
             ops.d_cumsum: _cumsum_rule,

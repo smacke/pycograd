@@ -10,7 +10,13 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd import d_sigmoid, ops, value_and_grad  # noqa: E402
+from pycograd import (  # noqa: E402
+    d_logsumexp,
+    d_sigmoid,
+    d_softmax,
+    ops,
+    value_and_grad,
+)
 from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import (  # noqa: E402
     _CONST,
@@ -28,7 +34,10 @@ from pycograd.passes import (  # noqa: E402
     constant_fold,
     cse,
     fuse_gated_act,
+    fuse_logsumexp,
+    fuse_softmax,
     optimize,
+    reorder_matmul_chain,
 )
 from pycograd.shapes import ShapeDtypeStruct  # noqa: E402
 from pycograd.tensor import _value  # noqa: E402
@@ -122,7 +131,8 @@ def test_graph_pretty_listing():
     assert "outputs:" in s
     assert "matmul" in s and "maximum" in s  # relu is np.maximum(x, 0)
     assert "-> f64[]" in s  # the scalar loss output
-    assert "{axis=1, keepdims=True}" in s  # params shown (the softmax reduction)
+    assert "softmax" in s  # the fused stable-softmax node (functional.softmax)
+    assert "{axis=1}" in s  # params shown on a node (softmax / the loss reduction)
     # every op node appears as "%id = ..."
     for nd in g.nodes:
         if nd.prim not in (_INPUT, _CONST):
@@ -313,3 +323,121 @@ def test_optimized_forward_gives_a_fused_backward():
     t = np.tanh(x)
     ref = s * (1 - t * t) + t * s * (1 - s)
     assert np.allclose(np.asarray(grad_fused), ref, atol=1e-9)
+
+
+# --- stable softmax / logsumexp fusion --------------------------------------
+def _grads_match_after(g, fn, args, atol=1e-9):
+    """Replay-vs-reference value and gradient check for an optimized/rewritten graph."""
+
+    def replay(*a):
+        return eval_graph(g, *a)
+
+    replay._pycograd_run_directly = True
+    assert np.allclose(
+        float(_value(eval_graph(g, *args))), float(_value(fn(*args))), atol=atol
+    )
+    _, gr = value_and_grad(replay)(*args)
+    _, gf = value_and_grad(fn)(*args)
+    lr = [np.asarray(x) for arg in gr for x in tree_leaves(arg)]
+    lf = [np.asarray(x) for arg in gf for x in tree_leaves(arg)]
+    assert lr and len(lr) == len(lf)
+    for a, b in zip(lr, lf):
+        assert np.allclose(a, b, atol=atol)
+
+
+def _naive_softmax_fn(x):
+    e = np.exp(x)
+    sm = e / np.sum(e, axis=-1, keepdims=True)  # naive softmax (inline)
+    return np.sum(sm * sm)
+
+
+def _naive_logsumexp_fn(x):
+    return np.sum(np.log(np.sum(np.exp(x), axis=-1)))  # naive log-sum-exp (inline)
+
+
+def _stable_softmax_fn(x):
+    m = np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x - m)  # stable, max-shifted softmax (inline)
+    sm = e / np.sum(e, axis=-1, keepdims=True)
+    return np.sum(sm * sm)
+
+
+def test_fuse_softmax_rewrites_exp_over_sum():
+    x = _rng(1).standard_normal((4, 5))
+    g2 = fuse_softmax(cse(capture(_naive_softmax_fn, x)))
+    prims = [nd.prim for nd in g2.nodes]
+    assert d_softmax in prims
+    assert ops.d_div not in prims  # the exp/sum/div cluster fused away
+    assert ops.d_exp not in prims
+    _grads_match_after(g2, _naive_softmax_fn, (x,))
+
+
+def test_fuse_softmax_handles_stable_max_shifted_form():
+    # Shift-invariance: exp(x-m)/sum(exp(x-m)) fuses to d_softmax(x-m) == softmax(x).
+    x = _rng(3).standard_normal((4, 5))
+    g2 = fuse_softmax(cse(capture(_stable_softmax_fn, x)))
+    assert d_softmax in [nd.prim for nd in g2.nodes]
+    _grads_match_after(g2, _stable_softmax_fn, (x,))
+
+
+def test_fuse_logsumexp_rewrites_log_sum_exp():
+    x = _rng(2).standard_normal((4, 5))
+    g2 = fuse_logsumexp(capture(_naive_logsumexp_fn, x))
+    prims = [nd.prim for nd in g2.nodes]
+    assert d_logsumexp in prims
+    assert ops.d_log not in prims  # log/sum/exp triple fused away
+    assert ops.d_exp not in prims
+    _grads_match_after(g2, _naive_logsumexp_fn, (x,))
+
+
+# --- matmul-chain reordering ------------------------------------------------
+def _n_matmul(graph):
+    return sum(1 for nd in graph.nodes if nd.prim is ops._matmul)
+
+
+def _chain2d_fn(x, w1, w2, w3):
+    return np.sum(((x @ w1) @ w2) @ w3)  # left-assoc; reorder cuts FLOPs
+
+
+def _chain_batched_fn(q, k, v):
+    return np.sum((q @ k) @ v)  # batched chain (leading batch dim)
+
+
+def test_reorder_matmul_chain_preserves_count_value_and_grad():
+    # Shapes chosen so right-leaning association is far cheaper than left-assoc.
+    args = (
+        _rng(0).standard_normal((100, 5)),
+        _rng(1).standard_normal((5, 80)),
+        _rng(2).standard_normal((80, 4)),
+        _rng(3).standard_normal((4, 60)),
+    )
+    g = capture(_chain2d_fn, *args)
+    gr = reorder_matmul_chain(g)
+    assert _n_matmul(gr) == _n_matmul(g) == 3  # reassociation keeps the matmul count
+    # the reordered chain materializes a smaller intermediate (w1@w2 is 5x4)
+    assert any(tuple(nd.aval.shape) == (5, 4) for nd in gr.nodes)
+    _grads_match_after(gr, _chain2d_fn, args, atol=1e-7)
+
+
+def test_reorder_matmul_chain_is_idempotent_at_optimum():
+    args = (
+        _rng(0).standard_normal((100, 5)),
+        _rng(1).standard_normal((5, 80)),
+        _rng(2).standard_normal((80, 4)),
+        _rng(3).standard_normal((4, 60)),
+    )
+    gr = reorder_matmul_chain(capture(_chain2d_fn, *args))
+    gr2 = reorder_matmul_chain(gr)
+    assert [nd.id for nd in gr2.nodes] == [nd.id for nd in gr.nodes]
+
+
+def test_reorder_matmul_chain_batched():
+    args = (
+        _rng(0).standard_normal((8, 3, 5)),
+        _rng(1).standard_normal((8, 5, 7)),
+        _rng(2).standard_normal((8, 7, 2)),
+    )
+    g = capture(_chain_batched_fn, *args)
+    gr = reorder_matmul_chain(g)
+    assert _n_matmul(gr) == _n_matmul(g) == 2
+    _grads_match_after(gr, _chain_batched_fn, args, atol=1e-7)

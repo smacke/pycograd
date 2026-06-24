@@ -25,7 +25,7 @@ import numpy as np
 from pycograd._typing import Array, Axis, BackendArray, DTypeLike, Prim, Shape
 from pycograd.backends import Backend
 from pycograd.dtypes import current_dtype
-from pycograd.ops import _INTERCEPT, d_gated_act, d_sigmoid
+from pycograd.ops import _INTERCEPT, d_gated_act, d_logsumexp, d_sigmoid, d_softmax
 
 if TYPE_CHECKING:
     import torch
@@ -238,6 +238,21 @@ class TorchBackend(Backend):
         self._intercept[d_gated_act] = lambda f, s: adapters["tanh"](f) * adapters[
             "sigmoid"
         ](s)
+        # Fused stable softmax / logsumexp (tape-only): lower natively. torch spells the
+        # axis ``dim`` and needs a concrete dim (no ``None``), so default softmax to -1
+        # and reduce logsumexp over all axes when ``axis is None``.
+        self._intercept[d_softmax] = lambda x, axis=-1: torch.softmax(
+            _as_torch(torch, x), dim=-1 if axis is None else axis
+        )
+
+        def _torch_logsumexp(
+            x: BackendArray, axis: object = None, keepdims: bool = False
+        ) -> BackendArray:
+            t = _as_torch(torch, x)
+            dim = tuple(range(t.ndim)) if axis is None else axis
+            return torch.logsumexp(t, dim=dim, keepdim=keepdims)
+
+        self._intercept[d_logsumexp] = _torch_logsumexp
         # Lower the composed im2col ``conv2d`` to torch's *native* conv (a direct
         # NCHW / OIHW map), so the compiled net runs cuDNN/MKLDNN convolutions and
         # torch autograd supplies the backward -- instead of tracing the gather +

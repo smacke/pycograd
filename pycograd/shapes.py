@@ -432,6 +432,15 @@ def abstract_unary(x: AbstractVal) -> ShapedArray:
     return ShapedArray(a.shape, a.dtype)
 
 
+def abstract_axis_preserving(
+    x: AbstractVal, axis: Axis = None, **_: Any
+) -> ShapedArray:
+    # Shape-preserving but ``axis``-bearing (e.g. ``softmax``): same shape/dtype as the
+    # input, but it accepts the ``axis`` bind-param ``abstract_unary`` would reject.
+    a = _aval(x)
+    return ShapedArray(a.shape, a.dtype)
+
+
 def _ew_binary(a: AbstractVal, b: AbstractVal) -> ShapedArray:
     return ShapedArray(_broadcast_shape("elementwise", a, b), _result_dtype(a, b))
 
@@ -863,6 +872,8 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_std: abstract_reduce,
             ops.d_max: abstract_reduce,
             ops.d_min: abstract_reduce,
+            ops.d_softmax: abstract_axis_preserving,
+            ops.d_logsumexp: abstract_reduce,
             ops._matmul: abstract_matmul,
             ops.d_einsum: abstract_einsum,
             ops.d_cumsum: abstract_cumsum,

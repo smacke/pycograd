@@ -21,37 +21,43 @@ from typing import Optional, cast
 
 import numpy as np
 
-from pycograd import random
-
 # NOTE: like ``examples/models.py``, these helpers are recompiled by pyccolo when
 # instrumented on demand, which re-evaluates their annotations -- so the ``Axis``
 # alias (a value lookup) is fine, but avoid PEP 604 ``X | None`` spellings here.
+from pycograd import ops, random
 from pycograd._typing import Axis, Operand, Tensor
-from pycograd.tensor import _value
+from pycograd.tensor import Var, _value
+
+
+def _array_out(x: Tensor, y: Tensor) -> Tensor:
+    """Preserve the array-in/array-out contract when wrapping a fused primitive: a
+    plain (untraced) input yields a plain array (the fused ``Var`` would otherwise break
+    eager numpy composition, e.g. ``np.matmul(softmax(...), v)``); a ``Var``/``Tracer``
+    input keeps the tape so the enclosing transform differentiates through it."""
+    from pycograd.trace import Tracer
+
+    return y if isinstance(x, (Var, Tracer)) else cast(Tensor, _value(y))
 
 
 def logsumexp(x: Tensor, axis: Axis = None, keepdims: bool = False) -> Tensor:
     """``log(sum(exp(x), axis))`` computed stably via the max-shift identity
-    ``m + log(sum(exp(x - m)))`` with ``m = max(x, axis)``."""
-    m = np.max(x, axis=axis, keepdims=True)
-    lse = m + np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True))
-    if keepdims:
-        return lse
-    # Drop the reduced (size-1) axes without ``np.squeeze`` (not intercepted):
-    # summing over a size-1 axis is value-preserving and differentiable.
-    return np.sum(lse, axis=axis)
+    ``m + log(sum(exp(x - m)))`` with ``m = max(x, axis)``. A thin wrapper over the
+    fused :func:`pycograd.ops.d_logsumexp` primitive (one tape node + closed-form VJP).
+    """
+    return _array_out(x, ops.d_logsumexp(x, axis=axis, keepdims=keepdims))
 
 
 def log_softmax(x: Tensor, axis: Axis = -1) -> Tensor:
-    """``log(softmax(x))`` -- stable (no ``exp`` overflow, no ``log(0)``)."""
-    m = np.max(x, axis=axis, keepdims=True)
-    shifted = x - m
-    return shifted - np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))
+    """``log(softmax(x)) = x - logsumexp(x)`` -- stable (no ``exp`` overflow, no
+    ``log(0)``), built on the fused :func:`pycograd.ops.d_logsumexp`."""
+    return _array_out(x, x - ops.d_logsumexp(x, axis=axis, keepdims=True))
 
 
 def softmax(x: Tensor, axis: Axis = -1) -> Tensor:
-    """Stable softmax, ``exp(log_softmax(x))`` -- output sums to 1 along ``axis``."""
-    return np.exp(log_softmax(x, axis=axis))
+    """Stable softmax (output sums to 1 along ``axis``), the fused
+    :func:`pycograd.ops.d_softmax` primitive -- one tape node instead of the
+    max/sub/exp/sum/div chain."""
+    return _array_out(x, ops.d_softmax(x, axis=axis))
 
 
 def cross_entropy(logits: Tensor, targets: Tensor, axis: Axis = -1) -> Operand:

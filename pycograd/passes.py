@@ -16,6 +16,8 @@ import numpy as np
 
 from pycograd._typing import Operand
 from pycograd.capture import _CONST, _INPUT, Const, Graph, Node, Ref
+from pycograd.cost import DEFAULT_COST_MODEL, matmul_flops, node_flops
+from pycograd.shapes import ShapeDtypeStruct
 from pycograd.tensor import Var, _value
 from pycograd.trace import bind
 
@@ -317,10 +319,244 @@ def _gate_pair(
     return None
 
 
+def _producer(spec: Any, by_id: dict[int, Node]) -> "Node | None":
+    """The node ``spec`` refers to, if it is a ``Ref`` to one; else ``None``."""
+    return by_id.get(spec.id) if isinstance(spec, Ref) else None
+
+
+def fuse_logsumexp(graph: Graph) -> Graph:
+    """Fuse ``log(sum(exp(Z), axis, keepdims))`` into a single ``d_logsumexp(Z)`` node when
+    the ``exp`` and ``sum`` feed only this chain (use-count 1), then DCE the dead pair.
+    Always semantics-preserving: ``logsumexp(Z) == log(sum(exp(Z)))`` exactly (the fused
+    primitive just computes it stably) -- so a naive inline ``log(sum(exp(x)))`` becomes
+    both fused *and* overflow-safe, and a stable ``m + log(sum(exp(x-m)))`` fuses its
+    expensive ``exp``/``sum``/``log`` cluster (the cheap ``m``/subtract residual is
+    value-equivalent: ``logsumexp(x-m)`` differs from the whole only by the explicit ``+m``).
+    """
+    from pycograd import ops
+
+    by_id = {nd.id: nd for nd in graph.nodes}
+    uses = _use_counts(graph)
+    nodes: list[Node] = []
+    for nd in graph.nodes:
+        fused = None
+        if nd.prim is ops.d_log:
+            sn = _producer(nd.args[0], by_id)
+            if sn is not None and sn.prim is ops.d_sum and uses.get(sn.id) == 1:
+                en = _producer(sn.args[0], by_id)
+                if en is not None and en.prim is ops.d_exp and uses.get(en.id) == 1:
+                    params = {
+                        "axis": sn.params.get("axis"),
+                        "keepdims": sn.params.get("keepdims", False),
+                    }
+                    fused = Node(nd.id, ops.d_logsumexp, (en.args[0],), params, nd.aval)
+        nodes.append(fused if fused is not None else nd)
+    return dce(replace(graph, nodes=nodes))
+
+
+def fuse_softmax(graph: Graph) -> Graph:
+    """Fuse ``exp(Z) / sum(exp(Z), axis, keepdims=True)`` into a single ``d_softmax(Z)``
+    node, then DCE the dead ``exp``/``sum``. Always semantics-preserving: softmax is
+    shift-invariant, so ``d_softmax(Z) == exp(Z)/sum(exp(Z))`` exactly (computed stably) --
+    a naive inline softmax becomes fused *and* overflow-safe, and a stable
+    ``exp(x-m)/sum(exp(x-m))`` fuses to the value-equivalent ``d_softmax(x-m) == softmax(x)``.
+    Handles the numerator and the in-sum ``exp`` being either one shared node (post-``cse``,
+    use-count 2) or two structurally-equal nodes (pre-``cse``)."""
+    from pycograd import ops
+
+    by_id = {nd.id: nd for nd in graph.nodes}
+    uses = _use_counts(graph)
+    nodes: list[Node] = []
+    for nd in graph.nodes:
+        fused = None
+        if nd.prim is ops.d_div and len(nd.args) == 2:
+            num, den = _producer(nd.args[0], by_id), _producer(nd.args[1], by_id)
+            if (
+                num is not None
+                and num.prim is ops.d_exp
+                and den is not None
+                and den.prim is ops.d_sum
+                and den.params.get("keepdims") is True
+                and uses.get(den.id) == 1
+            ):
+                inner = _producer(den.args[0], by_id)
+                if inner is not None and inner.prim is ops.d_exp:
+                    same = inner.id == num.id
+                    # The two exps must be exp of the same value, and become dead: either
+                    # one shared node used exactly by (div, sum), or two single-use nodes.
+                    dead = (same and uses.get(num.id) == 2) or (
+                        not same
+                        and uses.get(num.id) == 1
+                        and uses.get(inner.id) == 1
+                        and num.args[0] == inner.args[0]
+                    )
+                    if dead:
+                        params = {"axis": den.params.get("axis")}
+                        fused = Node(
+                            nd.id, ops.d_softmax, (num.args[0],), params, nd.aval
+                        )
+        nodes.append(fused if fused is not None else nd)
+    return dce(replace(graph, nodes=nodes))
+
+
+# ---------------------------------------------------------------------------
+# Matmul-chain reordering (classic matrix-chain DP over the captured avals).
+#
+# A chain ``A1 @ A2 @ ... @ Ak`` is captured as some binary tree of ``_matmul`` nodes;
+# matmul is associative, so reassociating to minimise FLOPs is value- and gradient-
+# preserving (``eval_graph`` replays through ``bind``, so the reverse pass differentiates
+# the reordered chain identically -- the only change is ~ULP float reordering). The pass
+# keeps the same ``k-1`` matmul *count* (so ``optimize``'s monotonic node/op-count
+# invariant holds) and reuses the chain's node ids; it is idempotent at the DP optimum, so
+# it cannot oscillate.
+# ---------------------------------------------------------------------------
+def _matmul_chain_factors(
+    node: Node, by_id: dict[int, Node], uses: dict[int, int], matmul: Any
+) -> "tuple[list[Any], list[Node]]":
+    """Flatten the linear matmul chain rooted at ``node`` into ``(factor_specs, internal)``:
+    its ordered operand factors and the absorbed (single-use) ``_matmul`` nodes feeding it.
+    A multi-use or non-matmul operand stays an opaque leaf factor."""
+    factors: list[Any] = []
+    internal: list[Node] = []
+    for op in node.args:
+        p = by_id.get(op.id) if isinstance(op, Ref) else None
+        if p is not None and p.prim is matmul and uses.get(p.id) == 1:
+            sub_f, sub_i = _matmul_chain_factors(p, by_id, uses, matmul)
+            factors.extend(sub_f)
+            internal.append(p)
+            internal.extend(sub_i)
+        else:
+            factors.append(op)
+    return factors, internal
+
+
+def reorder_matmul_chain(graph: Graph) -> Graph:
+    """Reassociate each maximal linear ``_matmul`` chain to its minimum-FLOP parenthesization
+    (matrix-chain DP). Handles 2-D and batched (equal leading batch dims) chains; skips a
+    chain with unknown/symbolic dims, mismatched batch dims, or non-chaining shapes."""
+    from pycograd import ops
+
+    matmul = ops._matmul
+    by_id = {nd.id: nd for nd in graph.nodes}
+    uses = _use_counts(graph)
+    shape_by_id = {nd.id: nd.aval.shape for nd in graph.nodes}
+    const_of: dict[int, object] = {
+        nd.id: nd.params["value"] for nd in graph.nodes if nd.prim is _CONST
+    }
+    matmuls = [nd for nd in graph.nodes if nd.prim is matmul]
+    mm_operand_ids = {r for m in matmuls for op in m.args for r in _spec_refs(op)}
+
+    block_at: dict[int, list[Node]] = (
+        {}
+    )  # tail id -> reordered chain nodes (topo order)
+    removed: set[int] = (
+        set()
+    )  # all chain matmul ids (tail + internal) of reordered chains
+    for tail in matmuls:
+        # process each chain once, from its tail (a matmul not absorbed into a parent matmul)
+        if uses.get(tail.id) == 1 and tail.id in mm_operand_ids:
+            continue
+        factors, internal = _matmul_chain_factors(tail, by_id, uses, matmul)
+        k = len(factors)
+        if k < 3:
+            continue  # a single matmul: nothing to reassociate
+        shapes = [_shape_of(f, shape_by_id, const_of) for f in factors]
+        if any(s is None or len(s) < 2 for s in shapes):
+            continue
+        rank = len(shapes[0])
+        if any(len(s) != rank for s in shapes):
+            continue  # mixed rank: skip conservatively
+        batch = shapes[0][:-2]
+        if any(s[:-2] != batch for s in shapes):
+            continue  # require identical batch dims (no broadcasting batch)
+        rows = [s[-2] for s in shapes]
+        cols = [s[-1] for s in shapes]
+        if any(cols[i] != rows[i + 1] for i in range(k - 1)):
+            continue  # not a valid contraction chain
+        dims = rows + [cols[-1]]  # p[0..k]: factor i is (dims[i], dims[i+1])
+        if any(not isinstance(d, int) for d in dims) or any(
+            not isinstance(b, int) for b in batch
+        ):
+            continue  # symbolic dims: the FLOP model needs concrete sizes
+        batch_size = 1
+        for b in batch:
+            batch_size *= b
+
+        # matrix-chain DP: m[i][j] = min FLOPs for factors i..j (inclusive). Candidate
+        # products are costed through the shared ``cost.matmul_flops`` (a product i..j has
+        # ``batch_size * dims[i] * dims[j+1]`` outputs and contracted dim ``dims[s+1]``).
+        inf = float("inf")
+        m: list[list[float]] = [[0.0] * k for _ in range(k)]
+        split = [[0] * k for _ in range(k)]
+        for length in range(2, k + 1):
+            for i in range(k - length + 1):
+                j = i + length - 1
+                m[i][j] = inf
+                for s in range(i, j):
+                    c = (
+                        m[i][s]
+                        + m[s + 1][j]
+                        + matmul_flops(batch_size * dims[i] * dims[j + 1], dims[s + 1])
+                    )
+                    if c < m[i][j]:
+                        m[i][j], split[i][j] = c, s
+        opt_cost = m[0][k - 1]
+
+        # current cost: the existing chain matmuls' FLOPs via the same cost model.
+        cur_cost = sum(
+            node_flops(mm, by_id, DEFAULT_COST_MODEL) for mm in [tail, *internal]
+        )
+        if opt_cost >= cur_cost:
+            continue  # strictly cheaper only -> idempotent at the optimum
+
+        # Rebuild: reuse the chain's node ids (root keeps the tail id so external refs hold).
+        pool = [n.id for n in internal]  # exactly k-2 ids for the k-2 non-root products
+        new_nodes: list[Node] = []
+        dtype = tail.aval.dtype
+
+        def build(i: int, j: int) -> Any:
+            if i == j:
+                return factors[i]
+            s = split[i][j]
+            left, right = build(i, s), build(s + 1, j)
+            nid = tail.id if (i == 0 and j == k - 1) else pool.pop()
+            shape = batch + (dims[i], dims[j + 1])
+            new_nodes.append(
+                Node(nid, matmul, (left, right), {}, ShapeDtypeStruct(shape, dtype))
+            )
+            return Ref(nid)
+
+        build(0, k - 1)
+        block_at[tail.id] = new_nodes
+        removed.add(tail.id)
+        removed.update(n.id for n in internal)
+
+    if not block_at:
+        return graph
+    nodes: list[Node] = []
+    for nd in graph.nodes:
+        if nd.id in removed:
+            if nd.id in block_at:  # the tail: splice the reordered block in its place
+                nodes.extend(block_at[nd.id])
+            # internal chain matmuls: dropped (their ids are reused inside the block)
+        else:
+            nodes.append(nd)
+    return replace(graph, nodes=nodes)
+
+
 # ---------------------------------------------------------------------------
 # Driver.
 # ---------------------------------------------------------------------------
-DEFAULT_PASSES: list[Pass] = [algebraic, constant_fold, cse, fuse_gated_act, dce]
+DEFAULT_PASSES: list[Pass] = [
+    algebraic,
+    constant_fold,
+    cse,
+    reorder_matmul_chain,
+    fuse_gated_act,
+    fuse_logsumexp,
+    fuse_softmax,
+    dce,
+]
 
 
 def _measure(graph: Graph) -> tuple[int, int]:
