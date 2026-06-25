@@ -171,6 +171,8 @@ declares the weights, a `|>` pipeline is the forward written once, and
 import numpy as np
 from pycograd import relu, softmax, cross_entropy
 
+rng = np.random.default_rng(42)
+
 with params{
     w1 = 0.3 * rng.standard_normal((2, 16)); b1 = np.zeros(16)
     w2 = 0.3 * rng.standard_normal((16, 3)); b2 = np.zeros(3)
