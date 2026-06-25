@@ -16,6 +16,7 @@ pyccolo; the pyccolo seam lives in :mod:`pycograd.tracer`.
 from __future__ import annotations
 
 import math
+import operator
 import warnings
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence, cast
@@ -341,6 +342,10 @@ def d_pow(a: Operand, b: Operand) -> Var:
     return _lift(a) ** b
 
 
+def d_mod(a: Operand, b: Operand) -> Var:
+    return _lift(a) % b
+
+
 def d_lt(a: Operand, b: Operand) -> Array:
     return _lift(a) < b
 
@@ -600,6 +605,28 @@ def d_sum(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
 
     out._backward = _backward
     _record_vjp(out, d_sum, (x,), {"axis": axis, "keepdims": keepdims})
+    return out
+
+
+def d_prod(x: Operand, axis: Axis = None, keepdims: bool = False) -> Var:
+    # Reduction by multiplication. d/dx_i prod(x) = prod(x) / x_i (the product of the other
+    # elements); the backward broadcasts the keepdims product over the reduced axis and
+    # divides by x. (Like autograd, this assumes the reduced slice has no exact zero.)
+    x, xp = _lift(x), _xp()
+    pk = xp.prod(x.value, axis=axis, keepdims=True)  # for broadcasting in backward
+    out = Var(
+        x.value.prod(axis=axis, keepdims=keepdims),  # type: ignore[call-overload]
+        _parents=(x,),
+    )
+
+    def _backward() -> None:
+        g = out.grad
+        if axis is not None and not keepdims:
+            g = xp.expand_dims(g, axis)
+        x.grad = _accumulate(x.grad, xp.broadcast_to(g, x.value.shape) * pk / x.value)
+
+    out._backward = _backward
+    _record_vjp(out, d_prod, (x,), {"axis": axis, "keepdims": keepdims})
     return out
 
 
@@ -914,16 +941,22 @@ def d_dstack(seq: Sequence[Operand]) -> Var:
 # callable that should route to it (e.g. np.exp and math.exp share d_exp); the
 # flat lookup the tracer uses is denormalized from this below.
 _RULES: dict[Prim, tuple[Prim, ...]] = {
-    # operator primitives -- no numpy callable swaps to these (operators are not
-    # numpy functions), so their tuples are empty: they contribute no ``_INTERCEPT``
-    # key (coverage parity with the numpy-keyed tables is preserved) but are still
-    # listed as primitives so ``_BATCH`` / ``_ABSTRACT`` can register rules for them.
-    d_add: (),
-    d_sub: (),
-    d_mul: (),
-    d_div: (),
-    d_neg: (),
-    d_pow: (),
+    # operator primitives -- the *operators* (``+ - * / **``) reach these through ``Var``'s
+    # dunders directly, but the numpy *function* forms (``np.add`` etc.) are intercepted, so
+    # those callables are mapped here too (the rule tables are keyed by the primitive, so the
+    # function and operator share one set of rules). Comparison operators stay empty (no
+    # numpy callable / their gradient is zero).
+    # numpy *and* ``operator`` function forms map to the operator primitives. The
+    # ``operator.*`` callables matter when the differentiated function is e.g. ``op.mul``
+    # itself (intercepted as a call), since the bare ``*`` on two same-level tracers is not
+    # otherwise routed.
+    d_add: (np.add, operator.add),
+    d_sub: (np.subtract, operator.sub),
+    d_mul: (np.multiply, operator.mul),
+    d_div: (np.divide, np.true_divide, operator.truediv),
+    d_neg: (np.negative, operator.neg),
+    d_pow: (np.power, operator.pow),
+    d_mod: (np.mod, np.remainder, operator.mod),
     d_lt: (),
     d_le: (),
     d_gt: (),
@@ -976,6 +1009,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_clip: (np.clip,),
     # reductions
     d_sum: (np.sum,),
+    d_prod: (np.prod,),
     d_mean: (np.mean,),
     d_var: (np.var,),
     d_std: (np.std,),
@@ -1208,6 +1242,19 @@ def _vjp_div(
     return [_b(d_div, g, b), _b(d_neg, _b(d_div, _b(d_mul, g, a), _b(d_mul, b, b)))]
 
 
+def _vjp_mod(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # a % b = a - b*floor(a/b): d/da = 1, d/db = -floor(a/b). ``floor`` is piecewise
+    # constant (``d_floor`` has zero derivative), so the second-order term through it is
+    # correctly zero.
+    a, b = operands
+    return [g, _b(d_mul, _b(d_neg, _b(d_floor, _b(d_div, a, b))), g)]
+
+
 def _vjp_pow(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -1381,6 +1428,25 @@ def _vjp_sum(
     if axis is not None and not keepdims:
         g = _expand_dims_multi(g, axis)
     return [_b(d_broadcast_to, g, _pshape(p))]
+
+
+def _vjp_prod(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # cotangent_i = g * prod(x) / x_i, with the keepdims product broadcast over the reduced
+    # axis. ``d_prod`` is re-bound (differentiable) so the rule composes to second order.
+    (p,) = primals
+    (x,) = operands
+    axis = params.get("axis")
+    keepdims = params.get("keepdims", False)
+    if axis is not None and not keepdims:
+        g = _expand_dims_multi(g, axis)
+    gx = _b(d_broadcast_to, g, _pshape(p))
+    pk = _b(d_prod, x, axis=axis, keepdims=True)
+    return [_b(d_div, _b(d_mul, gx, pk), x)]
 
 
 def _vjp_reshape(
@@ -1593,6 +1659,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_mul: _vjp_mul,
             d_gated_act: _vjp_gated_act,
             d_div: _vjp_div,
+            d_mod: _vjp_mod,
             d_pow: _vjp_pow,
             _matmul: _vjp_matmul,
             d_einsum: _vjp_einsum,
@@ -1600,6 +1667,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_getitem: _vjp_getitem,
             _scatter: _vjp_scatter,
             d_sum: _vjp_sum,
+            d_prod: _vjp_prod,
             d_reshape: _vjp_reshape,
             d_broadcast_to: _vjp_broadcast_to,
             d_expand_dims: _vjp_reshape,  # expand_dims is a reshape; the VJP reshapes back

@@ -376,6 +376,27 @@ class Var:
             ops.d_div,
         )
 
+    def __mod__(self, o: Operand) -> Var:
+        # a % b == a - b*floor(a/b); d/da = 1, d/db = -floor(a/b) (floor is stop-gradient).
+        from pycograd import ops
+
+        return self._binary(
+            o,
+            lambda a, b: a % b,
+            lambda a, b, g: (g, -_xp().floor(a / b) * g),
+            ops.d_mod,
+        )
+
+    def __rmod__(self, o: Operand) -> Var:
+        from pycograd import ops
+
+        return _lift(o)._binary(
+            self,
+            lambda a, b: a % b,
+            lambda a, b, g: (g, -_xp().floor(a / b) * g),
+            ops.d_mod,
+        )
+
     def __neg__(self) -> Var:
         from pycograd import ops
 

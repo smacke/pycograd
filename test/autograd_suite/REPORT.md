@@ -60,6 +60,14 @@ this work** — see below).
   `_UNARY_DERIV` and shared by the reverse and forward rules. This flipped ~29 previously
   skipped tests green (14 in `test_scalar_ops`, ~15 across `test_systematic`/`test_numpy`).
   Native regression coverage: `test/test_unary_ops.py`.
+* **numpy function-form arithmetic + mod + prod** (second bridging PR): mapped the numpy
+  *and* `operator` function forms (`np.add`/`operator.add`, `multiply`, `subtract`,
+  `divide`/`true_divide`, `negative`, `power`) onto the existing operator primitives; added a
+  new binary primitive **`d_mod`** (`np.mod`/`np.remainder`/`operator.mod` and the `%` operator
+  via `ast.Mod` in `_BINOP_PRIM` + `Var.__mod__`) and a new reduction primitive **`d_prod`**
+  (`np.prod`), each with reverse, forward (jvp), batching (vmap) and **shape-inference
+  (eval_shape)** rules. Flipped ~44 more skipped tests green (the suite is now 224 passed /
+  169 skipped). Native regression: `test/test_arith_reduce_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new
@@ -79,7 +87,7 @@ a `d_*` rule + registering it for the op would flip the corresponding tests gree
 |---|---:|---|
 | **array-manipulation**: `repeat`, `tile`, `diff`, `gradient`, `roll`, `moveaxis`, `swapaxes`, `rollaxis`, `pad`, `select`, `sort`, `partition`, `atleast_{1,2,3}d`, `squeeze`, `ravel`, `append` | ~30 | mostly index/gather-shaped backward |
 | **tensor contraction**: `np.dot` (general/≥2-D), `inner`, `outer`, `tensordot`, `kron`, `cross`, `trace`, `matmul` (general/broadcast) | ~21 | `einsum` already covers the math; these are the high-value linear-algebra entry points |
-| **numpy *function* forms of arithmetic**: `np.add`/`subtract`/`multiply`/`divide`/`true_divide`/`power`/`mod`/`remainder` and `op.*` | ~15 | the *operators* (`+ - * / **`) work in reverse; the function aliases don't dispatch to a rule. Also forward-mode of a **two-tracer bilinear op** (`x*y` differentiating both args) is unsupported. |
+| **numpy *function* forms of arithmetic** — ✅ *landed* (`np.add`/`subtract`/`multiply`/`divide`/`true_divide`/`power`/`negative`, `op.*`, `mod`/`remainder`, `%`) | 2 left | only the `x**0`/`0**y` power-at-zero edge (autograd #116) remains |
 | **triangular / diagonal**: `tril`, `triu`, `diag` | ~11 | |
 | **split family**: `split`, `vsplit`, `hsplit`, `dsplit`, `array_split` | ~11 | inverse of concatenate |
 | **unary ufuncs** — ✅ *landed* (`tan`, inverse-trig, `exp2`/`log2`/`log10`, deg/rad, `sign`/`ceil`/`floor`, `fabs`); only **`sinc`** remains (fiddly derivative, deferred) | 1 left | done in the first bridging PR |
@@ -141,8 +149,7 @@ Documented so they aren't mistaken for regressions:
 ## Suggested first PRs (best parity-per-line)
 
 1. ~~**Unary ufunc rules**~~ — ✅ **done** (see "What was landed"); only `sinc` left.
-2. **numpy *function* forms** of the arithmetic operators + `np.prod` — wire `np.add`/`multiply`/
-   `divide`/`power`/`mod`/`negative`/`true_divide` to the existing operator rules.
+2. ~~**numpy *function* forms** + `np.prod` + `mod`~~ — ✅ **done** (see "What was landed").
 3. **Tensor contraction** (`np.dot` general, `tensordot`, `inner`, `outer`) — reuse the existing
    `einsum` backward; unblocks ~21 tests and most of `test_wrappers`' jacobian-product family.
 4. **Array-manipulation gather/scatter rules** (`repeat`, `tile`, `split` family, `tril`/`triu`/

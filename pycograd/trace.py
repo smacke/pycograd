@@ -304,6 +304,7 @@ _BINOP_PRIM: dict[type, tuple[Prim, Prim]] = {
     ast.Sub: (ops.d_sub, operator.sub),
     ast.Mult: (ops.d_mul, operator.mul),
     ast.Div: (ops.d_div, operator.truediv),
+    ast.Mod: (ops.d_mod, operator.mod),
     ast.Pow: (ops.d_pow, operator.pow),
     ast.MatMult: (ops._matmul, operator.matmul),
 }

@@ -136,7 +136,9 @@ def test_sqrt():
 
 
 @pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.power function form (the operator works, but the numpy function alias does not dispatch to a rule)"
+    reason="pycograd-gap: d_pow does not special-case the x**0 / 0**y zero edge "
+    "(autograd issue #116); g*b*a**(b-1) is nan at a=0, b=0. The non-edge power "
+    "gradient works -- see test_power_arg1."
 )
 def test_power_arg0():
     make_fun = lambda y: lambda x: np.power(x, y)
@@ -147,9 +149,6 @@ def test_power_arg0():
     assert grad(fun)(0.0) == 0.0
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.power function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_power_arg1():
     x = npr.randn() ** 2
     fun = lambda y: np.power(x, y)
@@ -157,72 +156,48 @@ def test_power_arg1():
 
 
 @pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.power function form (the operator works, but the numpy function alias does not dispatch to a rule)"
+    reason="pycograd-gap: d/dy of 0**y is nan (no zero-base special case; autograd #116)"
 )
 def test_power_arg1_zero():
     fun = lambda y: np.power(0.0, y)
     check_grads(fun)(npr.rand() ** 2)
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.mod function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_mod_arg0():
     fun = lambda x, y: np.mod(x, y)
     check_grads(fun)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.mod function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_mod_arg1():
     fun = lambda x, y: np.mod(x, y)
     check_grads(fun, argnum=1)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.divide function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_divide_arg0():
     fun = lambda x, y: np.divide(x, y)
     check_grads(fun)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.divide function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_divide_arg1():
     fun = lambda x, y: np.divide(x, y)
     check_grads(fun, argnum=1)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.multiply function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_multiply_arg0():
     fun = lambda x, y: np.multiply(x, y)
     check_grads(fun)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.multiply function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_multiply_arg1():
     fun = lambda x, y: np.multiply(x, y)
     check_grads(fun, argnum=1)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.true_divide function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_true_divide_arg0():
     fun = lambda x, y: np.true_divide(x, y)
     check_grads(fun)(npr.rand(), npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.true_divide function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_true_divide_arg1():
     fun = lambda x, y: np.true_divide(x, y)
     check_grads(fun, argnum=1)(npr.rand(), npr.rand())
@@ -233,9 +208,6 @@ def test_reciprocal():
     check_grads(fun)(npr.rand())
 
 
-@pytest.mark.skip(
-    reason="pycograd-gap: no rule for the np.negative function form (the operator works, but the numpy function alias does not dispatch to a rule)"
-)
 def test_negative():
     fun = lambda x: np.negative(x)
     check_grads(fun)(npr.rand())

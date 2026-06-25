@@ -604,6 +604,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_mul: _elementwise_for(ops.d_mul),
             ops.d_gated_act: _elementwise_for(ops.d_gated_act),
             ops.d_div: _elementwise_for(ops.d_div),
+            ops.d_mod: _elementwise_for(ops.d_mod),
             ops.d_neg: _elementwise_for(ops.d_neg),
             ops.d_pow: _pow_rule,  # exponent stays constant; see _pow_rule
             ops.d_lt: _elementwise_for(ops.d_lt),
@@ -618,6 +619,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_where: _elementwise_for(ops.d_where),
             ops.d_clip: _elementwise_for(ops.d_clip),
             ops.d_sum: _reduce_for(ops.d_sum),
+            ops.d_prod: _reduce_for(ops.d_prod),
             ops.d_mean: _reduce_for(ops.d_mean),
             ops.d_var: _reduce_for(ops.d_var),
             ops.d_std: _reduce_for(ops.d_std),

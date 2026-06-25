@@ -50,7 +50,6 @@ def test_div():
         check_grads(fun)(arg1, arg2)
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for the modulo operator")
 def test_mod():
     fun = lambda x, y: x % y
     make_gap_from_zero = lambda x: np.sqrt(x**2 + 0.5)

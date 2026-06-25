@@ -324,6 +324,15 @@ def _div_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
+def _mod_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
+    ta, tb = trace._raise(a), trace._raise(b)
+    primal_out = bind(ops.d_mod, ta.primal, tb.primal)
+    # d(a % b) = da - floor(a/b)*db (floor is piecewise constant: stop-gradient).
+    q = bind(ops.d_floor, bind(ops.d_div, ta.primal, tb.primal))
+    tangent_out = bind(ops.d_sub, ta.tangent, bind(ops.d_mul, q, tb.tangent))
+    return _result(trace, primal_out, tangent_out)
+
+
 def _pow_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     ta, tb = trace._raise(a), trace._raise(b)
     primal_out = bind(ops.d_pow, ta.primal, tb.primal)
@@ -461,6 +470,22 @@ def _reduce_for(prim: Prim) -> Rule:
         return _result(trace, primal_out, tangent_out)
 
     return rule
+
+
+def _prod_rule(
+    trace: JVPTrace,
+    x: Boxed,
+    axis: Axis = None,
+    keepdims: bool = False,
+    **kw: Any,
+) -> JVPTracer:
+    """``prod`` is non-linear: d prod(x) = sum_axis( (prod(x)/x_i) * dx_i )."""
+    t = trace._raise(x)
+    primal_out = bind(ops.d_prod, t.primal, axis=axis, keepdims=keepdims)
+    pk = bind(ops.d_prod, t.primal, axis=axis, keepdims=True)
+    contrib = bind(ops.d_div, bind(ops.d_mul, pk, t.tangent), t.primal)
+    tangent_out = bind(ops.d_sum, contrib, axis=axis, keepdims=keepdims)
+    return _result(trace, primal_out, tangent_out)
 
 
 def _reduced_count(x: Boxed, axis: Axis) -> int:
@@ -626,6 +651,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_softmax: _softmax_rule,
             ops.d_logsumexp: _logsumexp_rule,
             ops.d_div: _div_rule,
+            ops.d_mod: _mod_rule,
             ops.d_pow: _pow_rule,
             ops._matmul: _matmul_rule,
             ops.d_einsum: _einsum_rule,
@@ -648,6 +674,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             # reductions: sum/mean/var/std are (composed-)linear; max/min route the
             # tangent through the selected element.
             ops.d_sum: _reduce_for(ops.d_sum),
+            ops.d_prod: _prod_rule,
             ops.d_mean: _reduce_for(ops.d_mean),
             ops.d_var: _var_rule,
             ops.d_std: _std_rule,

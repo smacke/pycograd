@@ -48,7 +48,6 @@ def test_pow():
     check_binary_func(lambda x, y: x**y)
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for the modulo operator (Var % y)")
 def test_mod():
     check_binary_func(lambda x, y: x % y)
 
