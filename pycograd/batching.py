@@ -428,6 +428,26 @@ def _cumsum_rule(trace: BatchTrace, x: Boxed, axis: int = -1) -> BatchTracer:
     return _result(trace, bind(ops.d_cumsum, _move_bdim_to_front(t), axis=ax + 1), 0)
 
 
+def _sort_rule(trace: BatchTrace, x: Boxed, axis: int = -1) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_sort, t.value, axis=axis), None)
+    ax = axis % _logical_ndim(t)
+    return _result(trace, bind(ops.d_sort, _move_bdim_to_front(t), axis=ax + 1), 0)
+
+
+def _partition_rule(
+    trace: BatchTrace, x: Boxed, kth: Any, axis: int = -1
+) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_partition, t.value, kth, axis=axis), None)
+    ax = axis % _logical_ndim(t)
+    return _result(
+        trace, bind(ops.d_partition, _move_bdim_to_front(t), kth, axis=ax + 1), 0
+    )
+
+
 def _roll_rule(
     trace: BatchTrace, x: Boxed, shift: Any, axis: Any = None
 ) -> BatchTracer:
@@ -708,6 +728,10 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_diff: ops.diff_transform_rule,
             ops.d_diag: ops.diag_transform_rule,
             ops.d_diagonal: ops.diagonal_transform_rule,
+            ops.d_sort: _sort_rule,
+            ops.d_partition: _partition_rule,
+            ops.d_select: ops.select_transform_rule,
+            ops.d_gradient: ops.gradient_transform_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),

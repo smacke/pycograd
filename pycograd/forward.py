@@ -384,6 +384,27 @@ def _einsum_rule(trace: JVPTrace, subscripts: str, *operands: Boxed) -> JVPTrace
     return _result(trace, primal_out, tangent_out)
 
 
+def _sort_rule(trace: JVPTrace, x: Boxed, axis: int = -1) -> JVPTracer:
+    """sort permutes by argsort (a stop-gradient index): gather the tangent the same way."""
+    t = trace._raise(x)
+    perm = np.argsort(np.asarray(_value(cast(Any, t.primal))), axis=axis)
+    return _result(
+        trace,
+        ops._take_along_var(cast(Any, t.primal), perm, axis),
+        ops._take_along_var(cast(Any, t.tangent), perm, axis),
+    )
+
+
+def _partition_rule(trace: JVPTrace, x: Boxed, kth: Any, axis: int = -1) -> JVPTracer:
+    t = trace._raise(x)
+    perm = np.argpartition(np.asarray(_value(cast(Any, t.primal))), kth, axis=axis)
+    return _result(
+        trace,
+        ops._take_along_var(cast(Any, t.primal), perm, axis),
+        ops._take_along_var(cast(Any, t.tangent), perm, axis),
+    )
+
+
 def _roll_rule(trace: JVPTrace, x: Boxed, shift: Any, axis: Any = None) -> JVPTracer:
     """``roll`` is a linear permutation: roll the tangent the same way."""
     t = trace._raise(x)
@@ -728,6 +749,10 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_diff: ops.diff_transform_rule,
             ops.d_diag: ops.diag_transform_rule,
             ops.d_diagonal: ops.diagonal_transform_rule,
+            ops.d_sort: _sort_rule,
+            ops.d_partition: _partition_rule,
+            ops.d_select: ops.select_transform_rule,
+            ops.d_gradient: ops.gradient_transform_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),

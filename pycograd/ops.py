@@ -1392,6 +1392,137 @@ def diagonal_abstract_rule(
     return cast(Boxed, ShapedArray(out_shape, a.dtype))
 
 
+# ---------------------------------------------------------------------------
+# np.sort / np.partition -- a value-dependent *permutation* along an axis. The permutation
+# (``argsort`` / ``argpartition``) is a stop-gradient index array, so both are a gather along
+# that axis (``take_along_axis``) whose adjoint scatters the cotangent back (``put_along_axis``;
+# a bijection, so no collisions). Shape-preserving.
+# ---------------------------------------------------------------------------
+def _take_along_var(x: Operand, perm: Array, axis: int) -> Var:
+    """Gather ``x`` by the (constant) per-axis index array ``perm``; the VJP scatters the
+    cotangent back to the gathered positions."""
+    x, xp = _lift(x), _xp()
+    out = Var(xp.take_along_axis(x.value, perm, axis), _parents=(x,))
+
+    def _backward() -> None:
+        gx = xp.zeros_like(x.value)
+        xp.put_along_axis(gx, perm, out.grad, axis)
+        x.grad = _accumulate(x.grad, gx)
+
+    out._backward = _backward
+    return out
+
+
+def d_sort(x: Operand, axis: int = -1) -> Var:
+    x = _lift(x)
+    perm = _xp().argsort(x.value, axis=axis)
+    return _take_along_var(x, perm, axis)
+
+
+def d_partition(x: Operand, kth: Any, axis: int = -1) -> Var:
+    x = _lift(x)
+    perm = _xp().argpartition(x.value, kth, axis=axis)
+    return _take_along_var(x, perm, axis)
+
+
+def _sort_like_abstract(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
+    from pycograd.shapes import abstract_unary  # sort/partition preserve shape
+
+    return cast(Boxed, abstract_unary(cast(Any, x)))
+
+
+# ---------------------------------------------------------------------------
+# np.select(condlist, choicelist, default) -- pick from ``choicelist`` by the first true
+# condition: a right-fold of ``where`` (``where(c0, ch0, where(c1, ch1, ..., default))``).
+# The conditions are boolean (stop-gradient); a composition of ``d_where`` (no own VJP).
+# ---------------------------------------------------------------------------
+def d_select(condlist: Any, choicelist: Any, default: Any = 0) -> Var:
+    acc: Operand = default
+    for cond, choice in zip(reversed(list(condlist)), reversed(list(choicelist))):
+        acc = d_where(np.asarray(cond), choice, acc)
+    return _lift(cast(Operand, acc))
+
+
+def select_transform_rule(
+    _trace: Boxed, condlist: Any, choicelist: Any, default: Any = 0
+) -> Boxed:
+    from pycograd.trace import bind
+
+    acc: Boxed = default
+    for cond, choice in zip(reversed(list(condlist)), reversed(list(choicelist))):
+        acc = bind(d_where, np.asarray(cond), choice, acc)
+    return acc
+
+
+def select_abstract_rule(condlist: Any, choicelist: Any, default: Any = 0) -> Boxed:
+    from pycograd.shapes import abstract_where
+
+    acc: Any = default
+    for cond, choice in zip(reversed(list(condlist)), reversed(list(choicelist))):
+        acc = abstract_where(cast(Any, cond), cast(Any, choice), cast(Any, acc))
+    return cast(Boxed, acc)
+
+
+# ---------------------------------------------------------------------------
+# np.gradient -- central-difference numerical gradient (unit spacing, edge_order=1, the numpy
+# default). Along one axis: interior ``(f[2:] - f[:-2]) / 2`` with one-sided first-order
+# boundaries, assembled by ``concatenate`` of getitem slices (all with full rules). Returns a
+# list (one array per axis) for ``axis=None`` / a tuple of axes, else a single array.
+# Non-default spacing (``varargs``) is unsupported.
+# ---------------------------------------------------------------------------
+def _gradient_axes(ndim: int, axis: Any) -> tuple[list[int], bool]:
+    if axis is None:
+        return list(range(ndim)), True
+    if isinstance(axis, (tuple, list)):
+        return [a % ndim for a in axis], True
+    return [axis % ndim], False
+
+
+def _gradient_along(f: Boxed, ax: int, ndim: int) -> Boxed:
+    from pycograd.trace import bind
+
+    def sl(s: slice) -> tuple:
+        return tuple(s if i == ax else slice(None) for i in range(ndim))
+
+    def g(s: slice) -> Boxed:
+        return bind(d_getitem, f, sl(s))
+
+    first = bind(d_sub, g(slice(1, 2)), g(slice(0, 1)))
+    interior = bind(d_mul, bind(d_sub, g(slice(2, None)), g(slice(0, -2))), 0.5)
+    last = bind(d_sub, g(slice(-1, None)), g(slice(-2, -1)))
+    return bind(d_concatenate, [first, interior, last], axis=ax)
+
+
+def _gradient_impl(f: Boxed, ndim: int, axis: Any) -> Boxed:
+    axes, as_list = _gradient_axes(ndim, axis)
+    results = [_gradient_along(f, ax, ndim) for ax in axes]
+    return cast(Boxed, results) if as_list else results[0]
+
+
+def d_gradient(f: Operand, *varargs: Any, axis: Any = None, edge_order: int = 1) -> Var:
+    if varargs:
+        raise NotImplementedError("gradient: non-default spacing is not supported")
+    return cast(Var, _gradient_impl(cast(Boxed, f), _logical_ndim(f), axis))
+
+
+def gradient_transform_rule(
+    _trace: Boxed, f: Boxed, *varargs: Any, axis: Any = None, edge_order: int = 1
+) -> Boxed:
+    return _gradient_impl(f, len(cast(Any, f).shape), axis)
+
+
+def gradient_abstract_rule(
+    f: Boxed, *varargs: Any, axis: Any = None, edge_order: int = 1
+) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, f))
+    axes, as_list = _gradient_axes(len(a.shape), axis)
+    if as_list:
+        return cast(Boxed, [ShapedArray(a.shape, a.dtype) for _ in axes])
+    return cast(Boxed, ShapedArray(a.shape, a.dtype))
+
+
 def split_abstract_rule(which: str) -> Callable[..., Boxed]:
     def rule(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
         from pycograd.shapes import ShapedArray, _aval
@@ -1908,6 +2039,10 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_diff: (np.diff,),
     d_diag: (np.diag,),
     d_diagonal: (np.diagonal,),
+    d_sort: (np.sort,),
+    d_partition: (np.partition,),
+    d_select: (np.select,),
+    d_gradient: (np.gradient,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),

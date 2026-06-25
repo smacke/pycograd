@@ -64,17 +64,13 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_diagonal",
-    ): "pycograd-gap: np.diagonal with non-default axes (axis1=-1, axis2=-2) and autograd's make_diagonal helper",
+    ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
     (
         "test_numpy.py",
         "test_flatten_method",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
+    ): "pycograd-gap: Var has no .flatten()/.ravel() method (the np.* function forms work)",
     ("test_numpy.py", "test_fliplr"): "pycograd-gap: unsupported op (no autodiff rule)",
     ("test_numpy.py", "test_flipud"): "pycograd-gap: unsupported op (no autodiff rule)",
-    (
-        "test_numpy.py",
-        "test_gradient",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_numpy.py",
         "test_len",
@@ -144,15 +140,15 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_simple_append_arr",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
+    ): "pycograd-gap: no VJP rule for np.append",
     (
         "test_numpy.py",
         "test_simple_append_list",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
+    ): "pycograd-gap: no VJP rule for np.append",
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
+    ): "pycograd-gap: no VJP rule for np.append",
     (
         "test_numpy.py",
         "test_std_list_of_boxes",
@@ -219,10 +215,6 @@ SKIPS = {
     ): "pycograd-gap: np.einsum with >=3 operands has no VJP rule",
     (
         "test_systematic.py",
-        "test_gradient",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
-    (
-        "test_systematic.py",
         "test_hstack_1d",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
@@ -240,10 +232,6 @@ SKIPS = {
     ): "pycograd-gap: np.outer (deferred; needs flatten+einsum with an abstract-reshape path)",
     (
         "test_systematic.py",
-        "test_partition",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
-    (
-        "test_systematic.py",
         "test_real",
     ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
     (
@@ -258,14 +246,6 @@ SKIPS = {
         "test_systematic.py",
         "test_row_stack_2d",
     ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
-    (
-        "test_systematic.py",
-        "test_select",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
-    (
-        "test_systematic.py",
-        "test_sort",
-    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_systematic.py",
         "test_std",

@@ -110,6 +110,13 @@ this work** — see below).
   passed / 112 skipped). (`np.make_diagonal` is autograd-specific, not numpy; `vmap` of
   diag-*construct* is unsupported -- `_scatter` has no batch rule.) Native regression:
   `test/test_more_ops.py`.
+* **Gather/selection ops** (sixth PR): `np.sort`/`np.partition` (permute by the stop-gradient
+  `argsort`/`argpartition` -- a take-along-axis gather whose adjoint scatters back via
+  `put_along_axis`), `np.select` (a right-fold of `where`), and `np.gradient` (central
+  difference, unit spacing, `edge_order=1` -- a `getitem`/`concatenate` composition; returns a
+  list for `axis=None`/a tuple of axes). Full reverse/forward/vmap/eval_shape rules. Flipped ~5
+  more tests green (suite now 286 passed / 107 skipped). Native regression:
+  `test/test_gather_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new
