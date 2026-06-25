@@ -80,8 +80,13 @@ this work** — see below).
   the operand rank), and `np.tril`/`np.triu` lower to `d_mul` against a constant triangular
   mask -- same einsum-style delegation (eager + forward/vmap/eval_shape rules, no separate
   `_VJP_FOR`). Flipped ~10 more tests green (suite now 245 passed / 148 skipped). Remaining in
-  this bucket: `repeat`/`tile`/`split` family/`diag`/`roll`/`pad`/`diff`/`sort`/etc. Native
+  this bucket: `repeat`/`tile`/`split` family/`diag`/`pad`/`diff`/`sort`/etc. Native
   regression: `test/test_manip_ops.py`.
+* **Array-manipulation (roll + reshape-lowered)** (fourth PR, second batch): `np.roll` (a
+  genuine linear primitive -- the VJP rolls the cotangent back by the negated shift; full
+  reverse/forward/vmap/eval_shape rules), and `np.ravel`/`np.squeeze`/`np.atleast_{1,2,3}d`
+  lowering to `d_reshape` (target shape computed from the operand shape). Flipped ~9 more
+  tests green (suite now 254 passed / 139 skipped).
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

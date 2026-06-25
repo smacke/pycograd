@@ -78,3 +78,56 @@ def test_vmap_is_per_example():
     sw = np.asarray(vmap(lambda x: np.swapaxes(x, 0, 1))(np.stack([_X, _X])))
     assert sw.shape == (2, 3, 2, 4)
     assert np.allclose(sw[0], np.swapaxes(_X, 0, 1))
+
+
+# --- roll + reshape-lowered ops --------------------------------------------
+def f_roll(x):
+    return np.sum(np.roll(x, 2, axis=1) ** 2)
+
+
+def f_roll_flat(x):
+    return np.sum(np.roll(x, 1) * 3.0)
+
+
+def f_ravel(x):
+    return np.sum(np.ravel(x) * np.arange(x.size))
+
+
+def f_squeeze(x):
+    return np.sum(np.squeeze(x) ** 2)
+
+
+def f_atleast_2d(x):
+    return np.sum(np.atleast_2d(x) * 2.0)
+
+
+def f_atleast_3d(x):
+    return np.sum(np.atleast_3d(x) * 2.0)
+
+
+_A = _rng.standard_normal((3, 4))
+_S = _rng.standard_normal((1, 3, 1))
+_V = _rng.standard_normal(4)
+
+
+@pytest.mark.parametrize(
+    "fn, a",
+    [
+        (f_roll, _A),
+        (f_roll_flat, _A),
+        (f_ravel, _A),
+        (f_squeeze, _S),
+        (f_atleast_2d, _V),
+        (f_atleast_3d, _V),
+    ],
+)
+def test_roll_reshape_grad_vs_fd(fn, a):
+    assert np.allclose(np.asarray(grad(fn)(a)[0]), _fd(fn, a), atol=1e-5)
+
+
+def test_roll_jvp_and_vmap():
+    _, t = jvp(f_roll, (_A,), (np.ones_like(_A),))
+    assert np.isfinite(float(np.asarray(t)))
+    v = np.asarray(vmap(lambda m: np.roll(m, 1, axis=1))(np.stack([_A, _A + 0.1])))
+    assert v.shape == (2, 3, 4)
+    assert np.allclose(v[0], np.roll(_A, 1, axis=1))

@@ -384,6 +384,14 @@ def _einsum_rule(trace: JVPTrace, subscripts: str, *operands: Boxed) -> JVPTrace
     return _result(trace, primal_out, tangent_out)
 
 
+def _roll_rule(trace: JVPTrace, x: Boxed, shift: Any, axis: Any = None) -> JVPTracer:
+    """``roll`` is a linear permutation: roll the tangent the same way."""
+    t = trace._raise(x)
+    primal_out = bind(ops.d_roll, t.primal, shift, axis=axis)
+    tangent_out = bind(ops.d_roll, t.tangent, shift, axis=axis)
+    return _result(trace, primal_out, tangent_out)
+
+
 def _select_for(prim: Prim) -> Rule:
     """max / min of two operands: route each operand's tangent through wherever that
     operand was selected (``mask = primal_out == operand``)."""
@@ -662,6 +670,12 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_rollaxis: ops._transpose_lowering_transform(ops.rollaxis_perm),
             ops.d_tril: ops._tri_lowering_transform(np.tril),
             ops.d_triu: ops._tri_lowering_transform(np.triu),
+            ops.d_roll: _roll_rule,
+            ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
+            ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
+            ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),
+            ops.d_atleast_2d: ops._reshape_lowering_transform(ops.atleast_2d_shape),
+            ops.d_atleast_3d: ops._reshape_lowering_transform(ops.atleast_3d_shape),
             ops.d_einsum: _einsum_rule,
             # cumsum is linear: the tangent is the cumsum of the tangent.
             ops.d_cumsum: _linear_for(ops.d_cumsum),

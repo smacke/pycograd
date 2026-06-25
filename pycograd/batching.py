@@ -428,6 +428,23 @@ def _cumsum_rule(trace: BatchTrace, x: Boxed, axis: int = -1) -> BatchTracer:
     return _result(trace, bind(ops.d_cumsum, _move_bdim_to_front(t), axis=ax + 1), 0)
 
 
+def _roll_rule(
+    trace: BatchTrace, x: Boxed, shift: Any, axis: Any = None
+) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_roll, t.value, shift, axis=axis), None)
+    if axis is None:
+        raise NotImplementedError(
+            "vmap(np.roll) with axis=None is not supported (it would roll across the "
+            "batch); pass an explicit axis"
+        )
+    ax = axis % _logical_ndim(t)
+    return _result(
+        trace, bind(ops.d_roll, _move_bdim_to_front(t), shift, axis=ax + 1), 0
+    )
+
+
 # -- getitem (incl. batched gather) -----------------------------------------
 def _getitem_rule(trace: BatchTrace, x: Boxed, key: Index) -> BatchTracer:
     tx = trace._raise(x)
@@ -636,6 +653,12 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_rollaxis: ops._transpose_lowering_transform(ops.rollaxis_perm),
             ops.d_tril: ops._tri_lowering_transform(np.tril),
             ops.d_triu: ops._tri_lowering_transform(np.triu),
+            ops.d_roll: _roll_rule,
+            ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
+            ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
+            ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),
+            ops.d_atleast_2d: ops._reshape_lowering_transform(ops.atleast_2d_shape),
+            ops.d_atleast_3d: ops._reshape_lowering_transform(ops.atleast_3d_shape),
             ops.d_einsum: _einsum_rule,
             ops.d_cumsum: _cumsum_rule,
             ops.d_transpose: _transpose_rule,

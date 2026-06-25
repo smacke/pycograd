@@ -72,13 +72,13 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_flatten_method",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     ("test_numpy.py", "test_fliplr"): "pycograd-gap: unsupported op (no autodiff rule)",
     ("test_numpy.py", "test_flipud"): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
         "test_gradient",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_numpy.py",
         "test_len",
@@ -142,40 +142,24 @@ SKIPS = {
     ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
     (
         "test_numpy.py",
-        "test_ravel_call",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
-        "test_ravel_method",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
         "test_repeat",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     (
         "test_numpy.py",
         "test_repeat_1d_axis0",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     (
         "test_numpy.py",
         "test_repeat_axis0",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     (
         "test_numpy.py",
         "test_repeat_axis0_rep1",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     (
         "test_numpy.py",
         "test_repeat_axis1_rep1",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
-        "test_roll",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
-        "test_roll_no_axis",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     ("test_numpy.py", "test_rot90"): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
@@ -184,23 +168,15 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_simple_append_arr",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_numpy.py",
         "test_simple_append_list",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
-        "test_squeeze_func",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_numpy.py",
-        "test_squeeze_method",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_numpy.py",
         "test_std_list_of_boxes",
@@ -239,18 +215,6 @@ SKIPS = {
     ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
     (
         "test_systematic.py",
-        "test_atleast_1d",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
-        "test_atleast_2d",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
-        "test_atleast_3d",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
         "test_column_stack_1d",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
@@ -276,7 +240,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_diff",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_dsplit_3d",
@@ -316,7 +280,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_gradient",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_hsplit_2d",
@@ -353,11 +317,11 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_pad",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_partition",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_real",
@@ -369,7 +333,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_repeat",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.repeat (segment-sum adjoint)",
     (
         "test_systematic.py",
         "test_row_stack_1d",
@@ -381,11 +345,11 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_select",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_sort",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/pad/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
         "test_split_1d",
@@ -405,7 +369,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_tile",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (repeat/tile/diff/gradient/roll/pad/select/sort/partition/atleast/squeeze/ravel/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for np.tile (tiled-sum adjoint)",
     (
         "test_systematic.py",
         "test_trace",

@@ -796,6 +796,136 @@ def _tri_lowering_abstract(x: Boxed, k: int = 0, **kw: Any) -> Boxed:
 
 
 # ---------------------------------------------------------------------------
+# Reshape-only ops (np.ravel / np.squeeze / np.atleast_{1,2,3}d) -- a pure reshape whose
+# target shape is a function of the input shape, so they lower to ``d_reshape``.
+# ---------------------------------------------------------------------------
+def _logical_shape(x: object) -> tuple[int, ...]:
+    shp = getattr(x, "shape", None)
+    if shp is not None:
+        return tuple(cast(Any, shp))
+    return tuple(np.shape(cast(Any, x)))
+
+
+def ravel_shape(shp: tuple[int, ...], *_a: Any, **_kw: Any) -> tuple[int, ...]:
+    return (int(np.prod(shp, dtype=np.int64)),)
+
+
+def squeeze_shape(
+    shp: tuple[int, ...], axis: Any = None, **_kw: Any
+) -> tuple[int, ...]:
+    if axis is None:
+        return tuple(d for d in shp if d != 1)
+    axes = {a % len(shp) for a in _as_axis_list(axis)}
+    return tuple(d for i, d in enumerate(shp) if i not in axes)
+
+
+def atleast_1d_shape(shp: tuple[int, ...], *_a: Any, **_kw: Any) -> tuple[int, ...]:
+    return shp if len(shp) >= 1 else (1,)
+
+
+def atleast_2d_shape(shp: tuple[int, ...], *_a: Any, **_kw: Any) -> tuple[int, ...]:
+    if len(shp) >= 2:
+        return shp
+    return (1,) * (2 - len(shp)) + shp
+
+
+def atleast_3d_shape(shp: tuple[int, ...], *_a: Any, **_kw: Any) -> tuple[int, ...]:
+    if len(shp) >= 3:
+        return shp
+    if len(shp) == 2:
+        return shp + (1,)
+    if len(shp) == 1:
+        return (1,) + shp + (1,)
+    return (1, 1, 1)
+
+
+def d_ravel(x: Operand) -> Var:
+    return d_reshape(x, ravel_shape(_logical_shape(x)))
+
+
+def d_squeeze(x: Operand, axis: Any = None) -> Var:
+    return d_reshape(x, squeeze_shape(_logical_shape(x), axis))
+
+
+def d_atleast_1d(x: Operand) -> Var:
+    return d_reshape(x, atleast_1d_shape(_logical_shape(x)))
+
+
+def d_atleast_2d(x: Operand) -> Var:
+    return d_reshape(x, atleast_2d_shape(_logical_shape(x)))
+
+
+def d_atleast_3d(x: Operand) -> Var:
+    return d_reshape(x, atleast_3d_shape(_logical_shape(x)))
+
+
+def _reshape_lowering_transform(
+    shape_builder: Callable[..., tuple[int, ...]],
+) -> Callable[..., Boxed]:
+    from pycograd.trace import bind
+
+    def rule(_trace: Boxed, x: Boxed, *args: Any, **kw: Any) -> Boxed:
+        target = shape_builder(_logical_shape(x), *args, **kw)
+        return bind(d_reshape, x, target)
+
+    return rule
+
+
+def _reshape_lowering_abstract(
+    shape_builder: Callable[..., tuple[int, ...]],
+) -> Callable[..., Boxed]:
+    def rule(x: Boxed, *args: Any, **kw: Any) -> Boxed:
+        from pycograd.shapes import abstract_reshape
+
+        target = shape_builder(_logical_shape(x), *args, **kw)
+        return cast(Boxed, abstract_reshape(cast(Any, x), target))
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
+# np.roll -- a circular shift: a linear, shape-preserving permutation. The VJP rolls the
+# cotangent back by the negated shift. A genuine primitive (no composition expresses it).
+# ---------------------------------------------------------------------------
+def _neg_shift(shift: Any) -> Any:
+    if isinstance(shift, (list, tuple)):
+        return tuple(-s for s in shift)
+    return -shift
+
+
+def d_roll(x: Operand, shift: Any, axis: Any = None) -> Var:
+    from pycograd.trace import Tracer, bind
+
+    if isinstance(x, Tracer):
+        return cast(Var, bind(d_roll, x, shift, axis=axis))
+    x, xp = _lift(x), _xp()
+    out = Var(xp.roll(x.value, shift, axis=axis), _parents=(x,))
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, xp.roll(out.grad, _neg_shift(shift), axis=axis))
+
+    out._backward = _backward
+    _record_vjp(out, d_roll, (x,), {"shift": shift, "axis": axis})
+    return out
+
+
+def _vjp_roll(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    (x,) = operands
+    return [_b(d_roll, g, _neg_shift(params["shift"]), axis=params["axis"])]
+
+
+def _roll_abstract(x: Boxed, shift: Any = None, axis: Any = None) -> Boxed:
+    from pycograd.shapes import abstract_unary  # roll preserves shape
+
+    return cast(Boxed, abstract_unary(cast(Any, x)))
+
+
+# ---------------------------------------------------------------------------
 # Cumulative sum -- a fused primitive (linear; no composition expresses the prefix
 # sum). The VJP is a reverse cumulative sum (flip -> cumsum -> flip).
 # ---------------------------------------------------------------------------
@@ -1264,6 +1394,12 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_rollaxis: (np.rollaxis,),
     d_tril: (np.tril,),
     d_triu: (np.triu,),
+    d_roll: (np.roll,),
+    d_ravel: (np.ravel,),
+    d_squeeze: (np.squeeze,),
+    d_atleast_1d: (np.atleast_1d,),
+    d_atleast_2d: (np.atleast_2d,),
+    d_atleast_3d: (np.atleast_3d,),
     d_reshape: (np.reshape,),
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),
@@ -1912,6 +2048,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             _scatter: _vjp_scatter,
             d_sum: _vjp_sum,
             d_prod: _vjp_prod,
+            d_roll: _vjp_roll,
             d_reshape: _vjp_reshape,
             d_broadcast_to: _vjp_broadcast_to,
             d_expand_dims: _vjp_reshape,  # expand_dims is a reshape; the VJP reshapes back
