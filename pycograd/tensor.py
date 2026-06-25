@@ -37,10 +37,11 @@ trade for a different job:
    cached primals. So the split is a deliberate speed-vs-composability trade, not an
    oversight (see the ``backward`` docstring for the exact trigger).
 
-3. **Graph mode** -- ``ad_graph.grad_graph`` / ``transpose.vjp_graph`` (opt-in via
-   ``capture`` / ``jit``). Reverse mode on the capture IR, so forward *and* backward live
-   in one graph the optimization passes can work across (e.g. CSE merging a recomputed
-   ``sigmoid``). ``grad_graph`` applies the VJP rules to a captured forward; ``vjp_graph``
+3. **Graph mode** -- ``grad`` / ``value_and_grad`` of a captured graph (the
+   ``ad_graph._grad_graph`` branch) / ``transpose.vjp_graph`` (opt-in via ``capture`` /
+   ``jit``). Reverse mode on the capture IR, so forward *and* backward live in one graph
+   the optimization passes can work across (e.g. CSE merging a recomputed ``sigmoid``).
+   ``_grad_graph`` applies the VJP rules to a captured forward; ``vjp_graph``
    instead *derives* reverse from forward as ``transpose ∘ linearize`` (linearize reuses
    the JVP rules; transpose flips only the linear ops). Neither is on the eager hot path.
    *Why a third strategy:* eager reverse (#1/#2) is a tape, not a graph, so it cannot be

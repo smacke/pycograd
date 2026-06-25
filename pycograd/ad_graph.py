@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Reverse-mode autodiff *on the capture IR*: ``grad_graph(forward) -> graph`` turns a
+"""Reverse-mode autodiff *on the capture IR*: ``_grad_graph(forward) -> graph`` turns a
 captured forward :class:`~pycograd.capture.Graph` into one graph that computes the
-output **and** its gradients w.r.t. the inputs -- forward and backward together.
+gradients w.r.t. the inputs (optionally alongside the output) -- forward and backward
+together. This is the graph branch of the public :func:`~pycograd.grad` /
+:func:`~pycograd.value_and_grad` (which type-dispatch on a captured ``Graph``).
 
 This is what lets optimization passes work *across* the forward/backward boundary
 (e.g. CSE merging a ``sigmoid`` the backward recomputes with the forward's value).
@@ -31,6 +33,7 @@ from pycograd._typing import Boxed
 from pycograd.capture import (
     _CONST,
     _INPUT,
+    _WEIGHT,
     Const,
     Graph,
     GraphTrace,
@@ -42,6 +45,7 @@ from pycograd.capture import (
     capture,
     eval_graph,
 )
+from pycograd.params import ParamDict
 from pycograd.shapes import ShapedArray
 from pycograd.tensor import _d_unbroadcast, _value
 from pycograd.trace import bind, new_main
@@ -176,7 +180,7 @@ def _g_pow(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]"
     # (a value, not a graph node), matching the eager rule (no grad to the exponent).
     a, b = operands
     if isinstance(b, GraphTracer):
-        raise NotImplementedError("grad_graph: pow with a non-constant exponent")
+        raise NotImplementedError("_grad_graph: pow with a non-constant exponent")
     ga = _b(ops.d_mul, g, _b(ops.d_mul, b, _b(ops.d_pow, a, b - 1)))
     return [ga, None]
 
@@ -203,7 +207,7 @@ def _vjp_on_graph(
     base = ops._VJP_FOR.get(prim)
     if base is None:
         raise NotImplementedError(
-            f"grad_graph: no graph VJP rule for {getattr(prim, '__name__', prim)!r}"
+            f"_grad_graph: no graph VJP rule for {getattr(prim, '__name__', prim)!r}"
         )
     return base(tuple(operands), tuple(operands), params, g)
 
@@ -223,13 +227,15 @@ def _operand_val(spec: Any, env: dict) -> Boxed:
     return env[spec.id] if isinstance(spec, Ref) else _const(spec)
 
 
-def grad_graph(forward: Graph) -> Graph:
+def _grad_graph(forward: Graph, *, include_value: bool = True) -> Graph:
     """Differentiate a captured forward graph. Returns a :class:`Graph` whose output is
-    ``(value, grads)`` -- ``value`` the original (scalar) output and ``grads`` a flat
-    tuple of cotangents, one per input leaf. Replays the forward (recording it), then a
-    reverse pass over its nodes builds the backward with the VJP rules."""
+    ``(value, grads)`` (``include_value=True``) or just ``grads`` (``include_value=False``)
+    -- ``value`` the original (scalar) output and ``grads`` a flat tuple of cotangents, one
+    per input leaf. Replays the forward (recording it), then a reverse pass over its nodes
+    builds the backward with the VJP rules. The ``value_and_grad`` / ``grad`` graph branch,
+    respectively."""
     if len(forward.outputs) != 1:
-        raise ValueError("grad_graph: expected a single (scalar) output")
+        raise ValueError("_grad_graph: expected a single (scalar) output")
 
     builder = _Builder()
     with new_main(GraphTrace, builder) as main:
@@ -240,6 +246,15 @@ def grad_graph(forward: Graph) -> Graph:
             if node.prim is _INPUT:
                 env[node.id] = trace.add_input(
                     ShapedArray(node.aval.shape, node.aval.dtype)
+                )
+            elif node.prim is _WEIGHT:
+                # A live ambient-weight leaf: recreate it in the new builder. The forward
+                # already collapsed tied/repeated keys to one node, so this 1:1 replay keeps
+                # that collapse -- one new leaf, one accumulated cotangent.
+                env[node.id] = trace.add_weight(
+                    node.params["key"],
+                    node.params["owner"],
+                    ShapedArray(node.aval.shape, node.aval.dtype),
                 )
             elif node.prim is _CONST:
                 env[node.id] = node.params["value"]
@@ -258,7 +273,7 @@ def grad_graph(forward: Graph) -> Graph:
 
         # Reverse pass: distribute each node's cotangent to its operands.
         for node in reversed(forward.nodes):
-            if node.prim is _INPUT or node.prim is _CONST:
+            if node.prim is _INPUT or node.prim is _CONST or node.prim is _WEIGHT:
                 continue
             g = ct.get(node.id)
             if g is None:
@@ -280,22 +295,72 @@ def grad_graph(forward: Graph) -> Graph:
                     else bind(ops.d_add, ct[spec.id], contrib)
                 )
 
-        # Outputs: (value, grads) with grads a flat tuple, one per input leaf.
-        grads: list[Boxed] = []
-        for inp in forward.inputs:
-            gco = ct.get(inp)
+        # Outputs. With ambient weights, ``grads`` is a ``ParamDict`` of weight cotangents
+        # (keyed by param name) -- so ``weights.step(grads, lr)`` consumes it directly,
+        # mirroring eager ``ParamDict.grad``. Otherwise ``grads`` is a tuple with one entry
+        # per positional argument, each matching that argument's pytree (a dict arg -> a dict
+        # gradient), regrouped from the flat per-input cotangents via the recorded
+        # ``in_treedef`` -- again mirroring eager ``value_and_grad``.
+        def _grad_for(old_nid: int) -> Boxed:
+            # ``ct`` is keyed by the forward graph's (old) node ids -- the reverse pass
+            # distributes via the forward ``node.args`` Refs.
+            gco = ct.get(old_nid)
             if gco is None:
-                aval = forward.nodes[inp].aval
+                aval = forward.nodes[old_nid].aval
                 gco = trace.pure(np.zeros(_ishape(aval.shape), dtype=aval.dtype))
-            grads.append(gco)
-        out_ids = [trace.output_id(env[out_id])] + [
-            trace.output_id(grad) for grad in grads
-        ]
+            return gco
 
-    _, out_treedef = tree_flatten((None, tuple(None for _ in grads)))
+        grads_tree: PyTree
+        if forward.weight_inputs:
+            # A ParamDict of weight cotangents. Flatten it to fix the leaf order (``tree_flatten``
+            # sorts dict keys), so ``grad_ids`` and ``out_treedef`` agree on which output is
+            # which key.
+            grads_tree = ParamDict(
+                {k: _grad_for(nid) for k, nid in forward.weight_inputs.items()}
+            )
+            grad_leaves: list[Boxed] = [
+                cast(Boxed, leaf) for leaf in tree_flatten(grads_tree)[0]
+            ]
+        elif forward.in_treedef is not None:
+            # Regroup the flat per-input cotangents into per-argument pytrees, with ``None`` at
+            # any non-numeric leaf that was baked in as a constant (no gradient).
+            in_grads = iter(_grad_for(inp) for inp in forward.inputs)
+            full_leaves = [
+                cast("Boxed | None", next(in_grads)) if is_input else None
+                for is_input in forward.in_leaf_is_input
+            ]
+            grads_tree = tree_unflatten(
+                forward.in_treedef, cast("list[Any]", full_leaves)
+            )
+            grad_leaves = [cast(Boxed, leaf) for leaf in tree_flatten(grads_tree)[0]]
+        else:  # a graph not built by ``capture`` (no recorded argument structure)
+            grad_leaves = [_grad_for(inp) for inp in forward.inputs]
+            grads_tree = cast(PyTree, tuple(grad_leaves))
+        grad_ids = [trace.output_id(g) for g in grad_leaves]
+        if include_value:
+            out_ids = [trace.output_id(env[out_id])] + grad_ids
+        else:
+            out_ids = grad_ids
+
+    if include_value:
+        _, out_treedef = tree_flatten((None, grads_tree))
+    else:
+        _, out_treedef = tree_flatten(grads_tree)
     inputs = [nd.id for nd in builder.nodes if nd.prim is _INPUT]
     in_avals = [builder.nodes[i].aval for i in inputs]
-    return Graph(builder.nodes, inputs, out_ids, out_treedef, in_avals)
+    new_weight_inputs = {
+        k: cast(GraphTracer, env[old_nid]).id
+        for k, old_nid in forward.weight_inputs.items()
+    }
+    return Graph(
+        builder.nodes,
+        inputs,
+        out_ids,
+        out_treedef,
+        in_avals,
+        weight_inputs=new_weight_inputs,
+        weight_owner=forward.weight_owner,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,19 +383,6 @@ def _cache_key(args: tuple) -> tuple:
     return tuple(key)
 
 
-def _regroup_grads(flat: list, args: tuple) -> tuple:
-    """Reshape ``grad_graph``'s flat per-leaf grads back into per-arg pytrees matching
-    the inputs (``None`` for any non-numeric, non-differentiated leaf), so the output
-    mirrors ``value_and_grad``."""
-    it = iter(flat)
-    out = []
-    for a in args:
-        leaves, treedef = tree_flatten(a)
-        rebuilt = [next(it) if _is_numeric(leaf) else None for leaf in leaves]
-        out.append(tree_unflatten(treedef, rebuilt))
-    return tuple(out)
-
-
 def jit(f: Callable[..., PyTree], grad: bool = False) -> Callable[..., PyTree]:
     """Graph-mode wrapper: capture ``f`` once per input shape/dtype, optimize the graph,
     cache it, and replay on later calls -- so the optimization passes (CSE/DCE/fusion)
@@ -339,7 +391,7 @@ def jit(f: Callable[..., PyTree], grad: bool = False) -> Callable[..., PyTree]:
 
     ``grad=False`` returns ``f``'s output. ``grad=True`` returns ``(value, grads)`` like
     :func:`value_and_grad`, but computed from a single *optimized forward+backward* graph
-    (via :func:`grad_graph`) -- the gradient comes from the graph's backward nodes, with
+    (via :func:`_grad_graph`) -- the gradient comes from the graph's backward nodes, with
     cross-pass CSE applied, and no eager ``.backward()`` pass.
     """
     cache: dict[tuple, Graph] = {}
@@ -359,14 +411,14 @@ def jit(f: Callable[..., PyTree], grad: bool = False) -> Callable[..., PyTree]:
                 from pycograd.passes import optimize
 
                 fwd = capture(f, *args)
-                graph = optimize(grad_graph(fwd) if grad else fwd)
+                graph = optimize(_grad_graph(fwd) if grad else fwd)
             except Exception:
                 return _eager(args)  # untraceable (dynamic control flow) -> eager
             cache[key] = graph
         out = tree_map(_value, eval_graph(graph, *args))
-        if grad:
-            value, flat = cast("tuple[Any, Any]", out)
-            return value, _regroup_grads(list(flat), args)
+        # ``_grad_graph`` already returns ``(value, grads)`` with ``grads`` regrouped into
+        # per-argument pytrees (via the graph's recorded ``in_treedef``), matching
+        # ``value_and_grad`` -- so there's nothing left to reshape here.
         return out
 
     return run

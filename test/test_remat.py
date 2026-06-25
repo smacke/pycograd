@@ -12,7 +12,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from pycograd.ad_graph import grad_graph  # noqa: E402
+from pycograd import value_and_grad  # noqa: E402
 from pycograd.capture import _INPUT, Graph, Node, Ref, capture, eval_graph  # noqa: E402
 from pycograd.cost import CostModel, cost_report  # noqa: E402
 from pycograd.examples import models as M  # noqa: E402
@@ -47,7 +47,7 @@ _IDS = [c[0] for c in _MODELS]
 
 
 def _grad_graph(loss, args):
-    return optimize(grad_graph(capture(loss, *args)))
+    return optimize(value_and_grad(capture(loss, *args)))
 
 
 # ---------------------------------------------------------------------------

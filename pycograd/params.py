@@ -538,14 +538,23 @@ class ParamDict(dict):
         semantics. ``dtype`` selects the working precision the leaves are lifted in.
         No framework is imported until a non-numpy ``backend`` is named.
 
-        ``jit=True`` (jax only; ignored elsewhere) compiles the gradient **once** and
-        reuses it across calls, so a training loop traces the net a single time instead of
-        every step. Cached per ``(objective, leaf structure)`` on this model; valid only
-        while the objective's non-weight inputs (e.g. data captured by closure) stay fixed
-        -- so it fits full-batch loops, not minibatching that swaps the data each step.
+        ``jit=True`` compiles the gradient **once** and reuses it across calls, so a
+        training loop traces the net a single time instead of every step. On the default
+        numpy backend it builds pycograd's own optimized forward+backward graph (``capture``
+        -> :func:`~pycograd.ad_graph._grad_graph` -> :func:`~pycograd.passes.optimize`); on a
+        delegate ``backend`` it uses that framework's compiled gradient. Cached per
+        ``(objective, leaf structure, input shapes)`` on this model. On the numpy path the
+        objective's **data must be passed positionally** (``weights.grad(loss, X, Y,
+        jit=True)``) so the trace flows through the weights and the data becomes a graph
+        input that can vary in value across calls at a fixed shape. If the objective can't be
+        compiled (data-dependent control flow, keyword args, a non-scalar output, or no
+        traced dependence on this model's trainable weights) ``jit=True`` raises -- rerun
+        with ``jit=False``.
         """
         if backend is not None and backend != "numpy":
             return self._grad_via_backend(objective, backend, dtype, jit, args, kwargs)
+        if jit:
+            return self._grad_via_graph_jit(objective, dtype, args, kwargs)
         from pycograd.tracer import _INSTRUMENTED, _make_runner
         from pycograd.transforms import _wrap_leaf
 
@@ -591,6 +600,81 @@ class ParamDict(dict):
             }
         )
         return value, grads
+
+    def _grad_via_graph_jit(
+        self,
+        objective: Callable[..., PyTree],
+        dtype: DTypeLike | None,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> tuple[Array, ParamDict]:
+        """``grad(..., jit=True)`` on the numpy backend: capture the ambient objective into a
+        forward graph (trainable weights become live ``_WEIGHT`` leaves), differentiate and
+        optimize it once via :func:`~pycograd.ad_graph._grad_graph` + :func:`~pycograd.passes.optimize`,
+        cache the graph on this model, and replay it each call. ``eval_graph`` re-reads each
+        weight's current ``.value``, so a stepped weight is picked up next call.
+
+        Fails fast (never silently runs the eager path): if the objective can't be compiled
+        -- keyword args, data-dependent control flow, a non-scalar output, or no dependence on
+        this model's trainable weights -- it raises, telling the caller to use ``jit=False``.
+        """
+        from pycograd.ad_graph import _cache_key, _grad_graph
+        from pycograd.capture import capture, eval_graph
+        from pycograd.dtypes import _maybe_dtype
+        from pycograd.passes import optimize
+        from pycograd.tree import tree_map
+
+        if kwargs:
+            raise TypeError(
+                "weights.grad(jit=True) does not support keyword arguments to the "
+                "objective; pass data positionally or use jit=False"
+            )
+
+        cache = getattr(self, "_compiled_grad", None)
+        if cache is None:
+            cache = {}
+            self._compiled_grad = cache
+        sig = (
+            ("numpy-graph", id(objective))
+            + _cache_key(args)
+            + tuple(
+                (
+                    key,
+                    isinstance(self[key], Param) and self[key].trainable,
+                    self[key].tie if isinstance(self[key], Param) else None,
+                )
+                for key in self
+            )
+        )
+        graph = cache.get(sig)
+        if graph is None:
+            with _maybe_dtype(dtype):
+                try:
+                    forward = capture(objective, *cast("tuple[PyTree, ...]", args))
+                    if not forward.weight_inputs or forward.weight_owner is not self:
+                        raise ValueError(
+                            "the captured graph has no gradient path to this model's "
+                            "trainable weights -- pass the objective's data positionally "
+                            "(weights.grad(loss, X, Y, jit=True)) so the trace flows through "
+                            "the weights, rather than closing the data over"
+                        )
+                    graph = optimize(_grad_graph(forward, include_value=True))
+                except (ValueError, TypeError, NotImplementedError) as e:
+                    raise ValueError(
+                        "weights.grad(jit=True) could not compile the objective into a graph "
+                        f"({e}); rerun with jit=False for the eager path"
+                    ) from e
+            cache[sig] = graph
+
+        with _maybe_dtype(dtype):
+            value, graph_grads = cast(
+                "tuple[Array, ParamDict]",
+                tree_map(_value, eval_graph(graph, *cast("tuple[PyTree, ...]", args))),
+            )
+        # Normalize to the eager shape: a ParamDict over *all* keys, with ``None`` at frozen /
+        # untouched leaves (the graph emits cotangents only for trainable weights it used).
+        grads = ParamDict({key: graph_grads.get(key) for key in self})
+        return np.asarray(value), grads
 
     def _grad_via_backend(
         self,

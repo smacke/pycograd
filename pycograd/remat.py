@@ -2,7 +2,8 @@
 """Rematerialization / spill planning over the capture IR.
 
 Given a captured forward+backward :class:`~pycograd.capture.Graph` (from
-:func:`~pycograd.ad_graph.grad_graph`) and a hard RAM budget, decide for each
+:func:`~pycograd.value_and_grad` on a captured graph) and a hard RAM budget, decide for
+each
 forward *activation* whether to **keep** it resident, **spill** it to SSD and reload
 it on its backward use, or **recompute** (rematerialize) it -- then act on the plan.
 
@@ -41,7 +42,7 @@ import numpy as np
 
 from pycograd import ops
 from pycograd._typing import Array
-from pycograd.capture import _CONST, _INPUT, Const, Graph, Node, Ref
+from pycograd.capture import _CONST, _INPUT, _WEIGHT, Const, Graph, Node, Ref
 from pycograd.cost import (
     DEFAULT_COST_MODEL,
     CostModel,
@@ -73,6 +74,12 @@ def _refs(args: tuple) -> "set[int]":
     return out
 
 
+def _weight_value(graph: Graph, nd: Node) -> "Array":
+    """The current array for a live ``_WEIGHT`` leaf -- read from the graph's source
+    ``ParamDict`` (so a stepped weight is picked up), mirroring ``eval_graph``."""
+    return np.asarray(_value(graph.weight_owner._resolve_weight(nd.params["key"])))
+
+
 def _consumers(graph: Graph) -> "dict[int, list[int]]":
     """Producer node id -> list of node ids that reference it as an operand."""
     cons: dict[int, list[int]] = defaultdict(list)
@@ -84,7 +91,7 @@ def _consumers(graph: Graph) -> "dict[int, list[int]]":
 
 def _forward_cone(graph: Graph) -> "set[int]":
     """Node ids reachable as ancestors of the primal value output ``outputs[0]`` -- i.e.
-    the forward pass. The rest of a ``grad_graph`` is the backward pass."""
+    the forward pass. The rest of a value-and-grad graph is the backward pass."""
     if not graph.outputs:
         return {nd.id for nd in graph.nodes}
     by_id = {nd.id: nd for nd in graph.nodes}
@@ -126,7 +133,7 @@ def _activations(
     outputs = set(graph.outputs)
     acts: dict[int, _Activation] = {}
     for nd in graph.nodes:
-        if nd.prim is _INPUT or nd.prim is _CONST or nd.id in outputs:
+        if nd.prim in (_INPUT, _CONST, _WEIGHT) or nd.id in outputs:
             continue
         if nd.id not in cone:
             continue
@@ -167,7 +174,7 @@ def _peak_under(
     for nid, (produce, last, nbytes) in intervals.items():
         if nid in evicted:
             continue
-        if by_id[nid].prim is _INPUT or by_id[nid].prim is _CONST:
+        if by_id[nid].prim in (_INPUT, _CONST, _WEIGHT):
             last = n - 1
         for s in range(produce, last + 1):
             timeline[s] += nbytes
@@ -206,7 +213,7 @@ def _segment_recompute_cost(
                 continue
             seen.add(i)
             nd = by_id.get(i)
-            if nd is None or nd.prim is _INPUT or nd.prim is _CONST:
+            if nd is None or nd.prim in (_INPUT, _CONST, _WEIGHT):
                 continue
             if i != aid and i in boundaries:
                 continue  # stop the cascade at another checkpoint boundary
@@ -396,7 +403,7 @@ def _stage2_spill_vs_recompute(
         if i in inN or i in resident:
             continue
         nd = by_id.get(i)
-        if nd is None or nd.prim is _INPUT or nd.prim is _CONST:
+        if nd is None or nd.prim in (_INPUT, _CONST, _WEIGHT):
             continue
         inN.add(i)
         stack.extend(_refs(nd.args))
@@ -532,7 +539,7 @@ def plan_remat(
         i: nc[i].out_bytes / model.ssd_read_bandwidth + model.ssd_latency for i in acts
     }
     inputs_consts = {
-        nd.id for nd in graph.nodes if nd.prim is _INPUT or nd.prim is _CONST
+        nd.id for nd in graph.nodes if nd.prim in (_INPUT, _CONST, _WEIGHT)
     }
     # Stage-1 eviction cost = the cheaper of recomputing the segment (cascade through the
     # layer's matmul) or spilling and reloading -- what Stage 2 will actually pay.
@@ -716,10 +723,14 @@ def eval_scheduled(
         if nid in memo:
             return memo[nid]  # within-demand cache: avoids exponential re-eval
         nd = by_id[nid]
-        if nd.prim is _INPUT:  # inputs/consts stay resident -> recompute base case
+        if (
+            nd.prim is _INPUT
+        ):  # inputs/consts/weights stay resident -> recompute base case
             return env[nid]
         if nd.prim is _CONST:
             return np.asarray(nd.params["value"])
+        if nd.prim is _WEIGHT:
+            return _weight_value(graph, nd)
         if nid in recompute_src:  # identity marker: value of its wrapped producer
             v = materialize(recompute_src[nid], memo)
         else:  # freed forward node: re-evaluate from its (materialized) operands
@@ -748,6 +759,9 @@ def eval_scheduled(
             elif nd.prim is _CONST:
                 env[nd.id] = np.asarray(nd.params["value"])
                 resident += _nbytes(env[nd.id])
+            elif nd.prim is _WEIGHT:
+                env[nd.id] = _weight_value(graph, nd)
+                resident += _nbytes(env[nd.id])
             elif nd.prim is ops._spill:
                 (src,) = _refs(nd.args)
                 disk[nd.id] = store.put(nd.id, materialize(src, {}))  # write to SSD
@@ -763,7 +777,7 @@ def eval_scheduled(
             for u, lu in list(last_use.items()):
                 if lu != i:
                     continue
-                if by_id[u].prim in (_INPUT, _CONST):
+                if by_id[u].prim in (_INPUT, _CONST, _WEIGHT):
                     continue
                 if u in env:
                     resident -= _nbytes(env.pop(u))

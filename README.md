@@ -69,12 +69,12 @@ plain numpy and the transforms see straight through them.
 ## Inspecting the graph
 
 A numpy function can be *captured* into a graph instead of run — the same idea as
-a JAX jaxpr. `capture` records the forward, `grad_graph` differentiates it into a
-combined forward+backward graph, and `optimize` cleans that up.
+a JAX jaxpr. `capture` records the forward, `value_and_grad` differentiates it into
+a combined forward+backward graph, and `optimize` cleans that up.
 
 ```python
 import numpy as np
-from pycograd import capture, grad_graph, optimize
+from pycograd import capture, value_and_grad, optimize
 
 def forward(x, w, b):
     h = np.tanh(x @ w + b)
@@ -94,13 +94,14 @@ graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
 }
 ```
 
-`grad_graph(g)` returns one graph holding the value **and** the gradient w.r.t.
-every input. Written naïvely, the backward pass is wasteful — it recomputes
+`value_and_grad(g)` returns one graph holding the value **and** the gradient w.r.t.
+every input (`grad(g)` keeps just the gradients). Written naïvely, the backward
+pass is wasteful — it recomputes
 `tanh` (`%13`, `%14`), doubles a multiply (`%10`, `%11`), and broadcasts a
 constant 1.0 (`%8`, `%9`):
 
 ```text
-# grad_graph(g) -- BEFORE
+# value_and_grad(g) -- BEFORE
 graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
   %3 = matmul %0 %1 -> f64[4,2]
   %4 = add %3 %2 -> f64[4,2]
@@ -131,11 +132,11 @@ folding, and dead-code elimination — the recomputed `tanh`/`mul` collapse back
 onto `%5`/`%6` and the broadcast folds away:
 
 ```python
-opt = optimize(grad_graph(g))
+opt = optimize(value_and_grad(g))
 ```
 
 ```text
-# optimize(grad_graph(g)) -- AFTER
+# optimize(value_and_grad(g)) -- AFTER
 graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
   %3 = matmul %0 %1 -> f64[4,2]
   %4 = add %3 %2 -> f64[4,2]

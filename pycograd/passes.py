@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterator, cast
 import numpy as np
 
 from pycograd._typing import Operand
-from pycograd.capture import _CONST, _INPUT, Const, Graph, Node, Ref
+from pycograd.capture import _CONST, _INPUT, _WEIGHT, Const, Graph, Node, Ref
 from pycograd.cost import DEFAULT_COST_MODEL, matmul_flops, node_flops
 from pycograd.shapes import ShapeDtypeStruct
 from pycograd.tensor import Var, _value
@@ -78,7 +78,8 @@ def dce(graph: Graph) -> Graph:
             for s in nd.args:
                 stack.extend(_spec_refs(s))
     nodes = [nd for nd in graph.nodes if nd.id in reachable]
-    return replace(graph, nodes=nodes)
+    weight_inputs = {k: v for k, v in graph.weight_inputs.items() if v in reachable}
+    return replace(graph, nodes=nodes, weight_inputs=weight_inputs)
 
 
 def cse(graph: Graph) -> Graph:
@@ -90,7 +91,7 @@ def cse(graph: Graph) -> Graph:
     nodes: list[Node] = []
     for nd in graph.nodes:
         args = tuple(_map_spec(s, remap) for s in nd.args)
-        if nd.prim is _INPUT or nd.prim is _CONST:
+        if nd.prim is _INPUT or nd.prim is _CONST or nd.prim is _WEIGHT:
             nodes.append(replace(nd, args=args))
             continue
         try:
@@ -125,7 +126,7 @@ def constant_fold(graph: Graph) -> Graph:
     }
     nodes: list[Node] = []
     for nd in graph.nodes:
-        if nd.prim is _INPUT or nd.prim is _CONST:
+        if nd.prim is _INPUT or nd.prim is _CONST or nd.prim is _WEIGHT:
             nodes.append(nd)
             continue
         refs = list(_spec_refs(tuple(nd.args)))
@@ -255,7 +256,7 @@ def algebraic(graph: Graph) -> Graph:
         nd = replace(nd, args=tuple(_map_spec(s, remap) for s in nd.args))
         res = (
             _simplify(nd, const_of, shape_by_id)
-            if nd.prim not in (_INPUT, _CONST)
+            if nd.prim not in (_INPUT, _CONST, _WEIGHT)
             else None
         )
         if res is None:
@@ -561,7 +562,9 @@ DEFAULT_PASSES: list[Pass] = [
 
 def _measure(graph: Graph) -> tuple[int, int]:
     ops = sum(
-        1 for nd in graph.nodes if nd.prim is not _INPUT and nd.prim is not _CONST
+        1
+        for nd in graph.nodes
+        if nd.prim is not _INPUT and nd.prim is not _CONST and nd.prim is not _WEIGHT
     )
     return (len(graph.nodes), ops)
 

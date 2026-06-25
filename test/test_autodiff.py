@@ -1594,6 +1594,85 @@ def test_with_weights_grad_backend_frozen_leaf_is_none(backend):
     assert grads["w"] is not None
 
 
+# --- numpy-backend jit: pycograd's own capture/optimize graph -----------------
+# The numpy graph path traces through the weights via the *data* arg, so the objective takes
+# its minibatch positionally (weights.grad(loss, X, Y, jit=True)).
+def test_with_weights_grad_jit_numpy_matches_and_reuses():
+    # jit=True with no backend builds pycograd's own optimized forward+backward graph; it
+    # must agree with the numpy tape and reuse the cached graph across calls.
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        ref_v, ref_g = weights.grad(proxy_loss_args, _PX, _PY)  # eager numpy tape
+        v1, g1 = weights.grad(proxy_loss_args, _PX, _PY, jit=True)
+        v2, g2 = weights.grad(
+            proxy_loss_args, _PX, _PY, jit=True
+        )  # reuses cached graph
+    assert getattr(weights, "_compiled_grad", None)  # a graph was cached on the model
+    assert isinstance(g1, ParamDict) and set(g1) == {"w", "b"}
+    assert np.allclose(float(ref_v), float(v1), atol=1e-9)
+    assert np.allclose(float(v1), float(v2))
+    for key in weights:
+        assert np.allclose(np.asarray(g1[key]), np.asarray(ref_g[key]), atol=1e-9)
+        assert np.allclose(np.asarray(g2[key]), np.asarray(ref_g[key]), atol=1e-9)
+
+
+def _counting_proxy_loss_args(Xb, Yb):
+    _jit_trace_calls["n"] += 1
+    return cross_entropy(proxy_forward(Xb), Yb)
+
+
+def test_with_weights_grad_jit_numpy_traces_once():
+    # capture instruments + runs the objective once (at capture); later jit calls replay the
+    # GRAPH, not the objective -- so the body does not re-execute per step.
+    _jit_trace_calls["n"] = 0
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        for _ in range(5):
+            weights.grad(_counting_proxy_loss_args, _PX, _PY, jit=True)
+    assert _jit_trace_calls["n"] <= 2, _jit_trace_calls["n"]
+
+
+def test_with_weights_grad_jit_numpy_frozen_is_none():
+    # frozen leaf -> None (not in the graph), matching the eager tape.
+    weights = params(w=_PW.copy(), b=frozen(_PB.copy()))
+    with weights:
+        _, g = weights.grad(proxy_loss_args, _PX, _PY, jit=True)
+    assert g["b"] is None and g["w"] is not None
+
+
+def test_with_weights_grad_jit_numpy_trains():
+    # a training loop on the cached graph decreases the loss (the graph re-reads stepped
+    # weights each call).
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        first = float(weights.grad(proxy_loss_args, _PX, _PY, jit=True)[0])
+        for _ in range(15):
+            _v, g = weights.grad(proxy_loss_args, _PX, _PY, jit=True)
+            weights.step(g, 0.5)
+        last = float(weights.grad(proxy_loss_args, _PX, _PY, jit=True)[0])
+    assert last < first - 1e-6
+
+
+def _dynamic_loss_args(Xb, Yb):
+    if float(np.sum(Xb @ w)) > 0.0:  # noqa: F821  data-dependent on a traced value
+        return cross_entropy(proxy_forward(Xb), Yb)
+    return cross_entropy(proxy_forward(Xb), Yb) * 2.0
+
+
+def test_with_weights_grad_jit_numpy_fails_fast():
+    weights = params(w=_PW.copy(), b=_PB.copy())
+    with weights:
+        # uncapturable objective -> raises (does NOT silently fall back), pointing at jit=False
+        with pytest.raises(ValueError, match="jit=False"):
+            weights.grad(_dynamic_loss_args, _PX, _PY, jit=True)
+        # keyword args are unsupported on the graph path
+        with pytest.raises(TypeError, match="jit=False"):
+            weights.grad(proxy_loss_args, _PX, Yb=_PY, jit=True)
+        # a closure-data thunk has no traced path to the weights -> clear error
+        with pytest.raises(ValueError, match="positionally|jit=False"):
+            weights.grad(proxy_loss, jit=True)
+
+
 def test_step_updates_in_place_and_skips_frozen():
     weights = params(w=np.array([1.0, 2.0]), b=frozen(np.array([5.0, 6.0])))
     grads = ParamDict({"w": np.array([1.0, 1.0]), "b": None})

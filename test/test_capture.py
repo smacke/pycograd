@@ -17,10 +17,10 @@ from pycograd import (  # noqa: E402
     ops,
     value_and_grad,
 )
-from pycograd.ad_graph import grad_graph  # noqa: E402
 from pycograd.capture import (  # noqa: E402
     _CONST,
     _INPUT,
+    _WEIGHT,
     Const,
     Graph,
     Node,
@@ -113,14 +113,53 @@ def test_capture_composes_with_ambient_weights():
 
     # The weights are sized by their real shapes, not () -- so x @ cew is (4, 3) @ (3, 2).
     assert any(nd.prim is ops._matmul and nd.aval.shape == (4, 2) for nd in g.nodes)
-    # ...and captured as concrete-array constants (a snapshot), not live Weight proxies.
+    # Trainable ambient weights are recorded as live, keyed ``_WEIGHT`` leaves (not frozen
+    # ``Const`` snapshots), so the graph differentiates w.r.t. them and reads their current
+    # values at eval time.
+    assert set(g.weight_inputs) == {"cew", "ceb"}
+    assert g.weight_owner is weights
+    weight_nodes = {nd.id: nd for nd in g.nodes if nd.prim is _WEIGHT}
+    assert {nd.params["key"] for nd in weight_nodes.values()} == {"cew", "ceb"}
+    # The weight arrays are NOT inlined as constants any more.
     const_vals = [a.value for nd in g.nodes for a in nd.args if isinstance(a, Const)]
-    assert any(
-        getattr(c, "shape", None) == (3, 2) for c in const_vals
-    )  # cew, snapshotted
+    assert not any(getattr(c, "shape", None) == (3, 2) for c in const_vals)
     assert not any(isinstance(c, Weight) for c in const_vals)
-    # Because it's a snapshot, the graph evaluates OUTSIDE the `with` block and matches eager.
+    # The graph still evaluates OUTSIDE the `with` block (``weight_owner`` keeps it valid) and
+    # matches eager.
     assert np.allclose(float(_value(eval_graph(g, X))), float(_value(ref)), atol=1e-9)
+    # And because weights are live, mutating one changes the next evaluation.
+    weights["cew"].value = weights["cew"].value + 1.0
+    assert not np.allclose(
+        float(_value(eval_graph(g, X))), float(_value(ref)), atol=1e-9
+    )
+
+
+def test_capture_frozen_weight_stays_const():
+    from pycograd.params import frozen, params  # noqa: F401
+
+    weights = params(cew=_rng(2).standard_normal((3, 2)), ceb=frozen(np.zeros(2)))
+    X = _rng(1).standard_normal((4, 3))
+    with weights:
+        g = capture(_dsl_weight_forward, X)
+    # Only the trainable weight is a live `_WEIGHT` leaf; the frozen one is snapshotted.
+    assert set(g.weight_inputs) == {"cew"}
+    const_vals = [a.value for nd in g.nodes for a in nd.args if isinstance(a, Const)]
+    assert any(getattr(c, "shape", None) == (2,) for c in const_vals)  # ceb snapshot
+
+
+def test_optimize_preserves_weight_inputs():
+    from pycograd.params import params
+    from pycograd.passes import optimize
+
+    weights = params(cew=_rng(2).standard_normal((3, 2)), ceb=np.zeros(2))
+    X = _rng(1).standard_normal((4, 3))
+    with weights:
+        g = optimize(capture(_dsl_weight_forward, X))
+        # optimize() keeps the live weights keyed and the graph still evaluates to a scalar.
+        assert set(g.weight_inputs) == {"cew", "ceb"}
+        assert g.weight_owner is weights
+        out = g(X)  # Graph.__call__ at base level -> concrete array
+    assert isinstance(out, np.ndarray) and np.isfinite(float(out))
 
 
 def test_graph_pretty_listing():
@@ -156,7 +195,7 @@ def test_graph_to_dot():
 
 
 def test_grad_graph_pretty_lists_value_and_grads():
-    gg = grad_graph(capture(M.mlp_tree_loss, *(M._init_mlp_tree(_rng(1)),)))
+    gg = value_and_grad(capture(M.mlp_tree_loss, *(M._init_mlp_tree(_rng(1)),)))
     s = gg.pretty()
     assert s.startswith("graph(") and "outputs:" in s
     out_line = next(ln for ln in s.splitlines() if ln.strip().startswith("outputs:"))

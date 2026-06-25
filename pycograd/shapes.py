@@ -603,7 +603,7 @@ def abstract_scatter(
     g: AbstractVal, key: object, shape: Shape, dtype: DTypeLike
 ) -> ShapedArray:
     # The internal scatter (a getitem VJP) produces a buffer of the given shape/dtype.
-    # Reached only when ``grad_graph`` records a backward pass; harmless elsewhere.
+    # Reached only when ``_grad_graph`` records a backward pass; harmless elsewhere.
     target = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
     return ShapedArray(tuple(int(d) for d in target), np.dtype(cast(Any, dtype)))
 

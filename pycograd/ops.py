@@ -946,7 +946,7 @@ def _const_like(arr: Array) -> Var:
 
 # A VJP rule reads its primals' shape/ndim/dtype to size the cotangent. Those primals are
 # recorded ``Var``s on the eager higher-order path (read ``.value.*``) but ``GraphTracer``s
-# when ``grad_graph`` differentiates a captured graph (read the aval via ``.shape``/
+# when ``_grad_graph`` differentiates a captured graph (read the aval via ``.shape``/
 # ``.dtype``). These accessors are byte-identical for a ``Var``, so the eager path is
 # unchanged; they just let the same rules also build a backward *graph*.
 def _pshape(p: Boxed) -> "tuple[int, ...]":

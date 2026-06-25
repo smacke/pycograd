@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from pycograd.capture import _CONST, _INPUT, Const, Graph, Node, Ref
+from pycograd.capture import _CONST, _INPUT, _WEIGHT, Const, Graph, Node, Ref
 from pycograd.shapes import ShapeDtypeStruct
 
 if TYPE_CHECKING:
@@ -215,7 +215,7 @@ def matmul_flops(out_size: int, k: int) -> int:
 def node_flops(node: Node, by_id: "dict[int, Node]", model: CostModel) -> int:
     """Estimated floating-point operations to evaluate ``node`` (0 for inputs/consts and
     pure data movement)."""
-    if node.prim is _INPUT or node.prim is _CONST:
+    if node.prim is _INPUT or node.prim is _CONST or node.prim is _WEIGHT:
         return 0
     name = getattr(node.prim, "__name__", str(node.prim))
     sym = model.symbolic_dim_size
@@ -421,6 +421,8 @@ def _prim_name(prim: "Prim") -> str:
         return "input"
     if prim is _CONST:
         return "const"
+    if prim is _WEIGHT:
+        return "weight"
     name = getattr(prim, "__name__", str(prim))
     return name[2:] if name.startswith("d_") else name.lstrip("_")
 
@@ -447,7 +449,7 @@ def pretty_cost(report: GraphCost) -> str:
     """A per-node cost listing plus the whole-graph totals (see :meth:`GraphCost`)."""
     lines = ["cost {"]
     for nc in report.nodes:
-        if nc.prim in ("input", "const"):
+        if nc.prim in ("input", "const", "weight"):
             continue
         lines.append(
             f"  %{nc.id} = {nc.prim} -> {nc.aval}  "

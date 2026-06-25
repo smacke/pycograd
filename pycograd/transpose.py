@@ -86,7 +86,7 @@ def vjp_graph(f: Callable[..., PyTree], *primals: PyTree) -> Graph:
     """Reverse mode as ``transpose ∘ linearize``: linearize ``f`` to a graph linear in
     the tangents, then flip that linear part. Returns a :class:`Graph` whose output is
     ``(value, grads)`` (grads a flat tuple, one per primal leaf) -- the same shape as
-    :func:`pycograd.ad_graph.grad_graph`, but reverse mode is derived from forward mode.
+    :func:`pycograd.ad_graph._grad_graph`, but reverse mode is derived from forward mode.
     Only the *linear* VJP rules are exercised; the nonlinear derivatives entered as
     residual constants during linearize."""
     lin, n_primal = linearize(f, *primals)

@@ -25,7 +25,7 @@ from pycograd._typing import BindArg, Boxed, Prim
 from pycograd.params import Param, Weight
 from pycograd.shapes import _ABS_FOR, ShapedArray, ShapeDtypeStruct, _aval
 from pycograd.tensor import Var, _value
-from pycograd.trace import Trace, Tracer, bind, new_main
+from pycograd.trace import Trace, Tracer, _get_stack, bind, new_main
 from pycograd.tree import Leaf, PyTree, tree_flatten, tree_unflatten
 
 if TYPE_CHECKING:
@@ -59,9 +59,14 @@ class Const:
 # Python so the interpreter can rebuild the exact call.
 ArgSpec = Any
 
-# Sentinel "primitives" marking the two non-op node kinds.
+# Sentinel "primitives" marking the non-op node kinds.
 _INPUT = cast(Prim, "input")
 _CONST = cast(Prim, "const")
+# A live, keyed ambient-parameter leaf: a trainable ``Weight`` captured under
+# ``with weights:`` becomes a ``_WEIGHT`` node (not a frozen ``_CONST``) so the graph
+# differentiates w.r.t. it and re-reads its current value at eval time. ``params`` holds
+# ``{"key": <param name>, "owner": <ParamDict>}``.
+_WEIGHT = cast(Prim, "weight")
 
 
 @dataclass
@@ -88,9 +93,25 @@ class Graph:
     outputs: list[int]
     out_treedef: Any
     in_avals: list[ShapeDtypeStruct] = field(default_factory=list)
+    # Ambient ``params{...}`` weights captured live: ``weight_inputs`` maps each trainable
+    # param key to its ``_WEIGHT`` node id (tied siblings share one node), and
+    # ``weight_owner`` is the source :class:`~pycograd.params.ParamDict` -- read at eval time
+    # for the current values and used to key the gradient ``ParamDict``. Empty for a graph
+    # captured outside a ``with weights:`` block (the ordinary inputs-only case).
+    weight_inputs: dict[str, int] = field(default_factory=dict)
+    weight_owner: Any = None
+    # The pytree structure of the *positional arguments* ``capture`` was called with:
+    # ``in_treedef`` is ``tree_flatten(tuple(args))``'s treedef and ``in_leaf_is_input`` marks
+    # which of those leaves became graph inputs (the numeric ones; the rest were baked as
+    # constants). Together they let ``value_and_grad``/``grad`` of the graph regroup the flat
+    # per-input cotangents back into per-argument pytrees -- so a dict argument yields a dict
+    # gradient, mirroring eager ``value_and_grad``. ``None`` for a graph not built by
+    # ``capture`` (e.g. ``transpose``), which keeps the flat-tuple gradient.
+    in_treedef: Any = None
+    in_leaf_is_input: list[bool] = field(default_factory=list)
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
-        n = sum(1 for nd in self.nodes if nd.prim not in (_INPUT, _CONST))
+        n = sum(1 for nd in self.nodes if nd.prim not in (_INPUT, _CONST, _WEIGHT))
         return f"Graph({len(self.inputs)} in, {n} ops, {len(self.outputs)} out)"
 
     def __str__(self) -> str:  # pragma: no cover - debug aid
@@ -100,8 +121,26 @@ class Graph:
         """Run the captured computation on concrete ``inputs`` -- ``graph(x)`` is the
         inference path. Delegates to :func:`eval_graph`, so the replay dispatches through
         ``bind`` (computing on the active backend) and stays differentiable under
-        ``value_and_grad``/``vmap``/``jvp`` just like the original function."""
-        return eval_graph(self, *inputs)
+        ``value_and_grad``/``vmap``/``jvp`` just like the original function.
+
+        At the true top level (no transform live) the replay's base-level ``bind`` builds
+        ``Var`` tape nodes; coerce those to concrete arrays so inference returns plain
+        ndarrays (``np.argmax(graph(x))`` works). When a transform *is* live
+        (``vmap``/``jvp``/``value_and_grad`` of the graph, or a graph called inside a
+        differentiated function) the outputs are kept boxed so the tape keeps flowing.
+        """
+        out = eval_graph(self, *inputs)
+        if len(_get_stack()) == 1:  # base level: materialize the inference result
+            leaves, td = tree_flatten(out)
+            leaves = cast(
+                "list[Leaf]",
+                [
+                    np.asarray(_value(lf)) if isinstance(lf, Var) else lf
+                    for lf in leaves
+                ],
+            )
+            out = tree_unflatten(td, leaves)
+        return out
 
     def pretty(self) -> str:
         """A jaxpr-style text listing of the graph (nodes in SSA order), e.g.::
@@ -257,7 +296,9 @@ def pretty(graph: "Graph") -> str:
     for nd in graph.nodes:
         if nd.prim is _INPUT:
             continue  # shown in the header
-        if nd.prim is _CONST:
+        if nd.prim is _WEIGHT:
+            rhs = f"weight {nd.params['key']!r}"
+        elif nd.prim is _CONST:
             rhs = f"const {_const_str(nd.params['value'])}"
         else:
             args = " ".join(_arg_str(s) for s in nd.args)
@@ -279,6 +320,8 @@ def to_dot(graph: "Graph") -> str:
     for nd in graph.nodes:
         if nd.prim is _INPUT:
             attrs = f'label="%{nd.id} in\\n{_aval_str(nd.aval)}", shape=ellipse, style=filled, fillcolor=lightblue'
+        elif nd.prim is _WEIGHT:
+            attrs = f'label="%{nd.id} weight {nd.params["key"]}\\n{_aval_str(nd.aval)}", shape=ellipse, style=filled, fillcolor=lightgreen'
         elif nd.prim is _CONST:
             attrs = f'label="%{nd.id} const\\n{_const_str(nd.params["value"])}", shape=ellipse, style=filled, fillcolor=lightyellow'
         else:
@@ -301,12 +344,39 @@ class _Builder:
 
     def __init__(self) -> None:
         self.nodes: list[Node] = []
+        # Ambient-weight recording: param key -> ``_WEIGHT`` node id, the owning ParamDict,
+        # and a memo so a weight referenced more than once (and tied siblings) collapse to a
+        # single leaf -- its cotangent then accumulates exactly once in the grad graph.
+        self.weight_inputs: dict[str, int] = {}
+        self.weight_owner: Any = None
+        self._weight_memo: dict[Any, int] = {}
 
     def add(self, prim: Prim, args: tuple, params: dict, aval: ShapedArray) -> int:
         nid = len(self.nodes)
         self.nodes.append(
             Node(nid, prim, args, params, ShapeDtypeStruct(aval.shape, aval.dtype))
         )
+        return nid
+
+    def weight_input(self, weight: Weight, leaf: Param, aval: ShapedArray) -> int:
+        """The ``_WEIGHT`` node id for a trainable ambient ``weight`` (created once, then
+        memoized). Tied siblings (same ``Param.tie``) and repeated references to one weight
+        share a single leaf, so the reverse pass accumulates their cotangent exactly once.
+        """
+        owner, key = weight._owner, weight._key
+        if self.weight_owner is None:
+            self.weight_owner = owner
+        elif self.weight_owner is not owner:
+            raise NotImplementedError(
+                "capture: a graph references ambient weights from more than one params{} "
+                "block; capture one block's weights per graph"
+            )
+        memo = leaf.tie if leaf.tie is not None else (id(owner), key)
+        nid = self._weight_memo.get(memo)
+        if nid is None:
+            nid = self.add(_WEIGHT, (), {"key": key, "owner": owner}, aval)
+            self._weight_memo[memo] = nid
+        self.weight_inputs[key] = nid
         return nid
 
 
@@ -402,6 +472,13 @@ class GraphTrace(Trace):
             return Ref(a.id)
         if isinstance(a, (list, tuple)):
             return type(a)(self._spec(e) for e in a)
+        if isinstance(a, Weight):
+            # A trainable ambient weight becomes a live, keyed ``_WEIGHT`` leaf (so the graph
+            # differentiates w.r.t. it and re-reads its value at eval time); a frozen/buffer
+            # weight stays a snapshot constant.
+            leaf = a._owner[a._key]
+            if isinstance(leaf, Param) and leaf.trainable:
+                return Ref(self._builder.weight_input(a, leaf, _aval(a)))
         return Const(_snapshot(a))
 
     def pure(self, val: Boxed) -> GraphTracer:
@@ -430,6 +507,12 @@ class GraphTrace(Trace):
 
     def add_input(self, aval: ShapedArray) -> GraphTracer:
         nid = self._builder.add(_INPUT, (), {}, aval)
+        return GraphTracer(self, nid, aval)
+
+    def add_weight(self, key: str, owner: Any, aval: ShapedArray) -> GraphTracer:
+        """Record a ``_WEIGHT`` leaf directly (used when ``_grad_graph`` replays a forward
+        graph's weight leaves into a fresh builder)."""
+        nid = self._builder.add(_WEIGHT, (), {"key": key, "owner": owner}, aval)
         return GraphTracer(self, nid, aval)
 
     def output_id(self, leaf: Boxed) -> int:
@@ -491,7 +574,23 @@ def capture(f: Callable[..., PyTree], *args: PyTree) -> Graph:
 
     inputs = [nd.id for nd in builder.nodes if nd.prim is _INPUT]
     in_avals = [builder.nodes[i].aval for i in inputs]
-    return Graph(builder.nodes, inputs, outputs, out_treedef, in_avals)
+    # Record the argument structure so the grad graph can return per-argument gradients.
+    # ``inputs`` is in the same order as the *numeric* leaves of ``tuple(args)``.
+    all_in_leaves, in_treedef = tree_flatten(tuple(args))
+    in_leaf_is_input = [
+        isinstance(leaf, Var) or _is_numeric(leaf) for leaf in all_in_leaves
+    ]
+    return Graph(
+        builder.nodes,
+        inputs,
+        outputs,
+        out_treedef,
+        in_avals,
+        weight_inputs=builder.weight_inputs,
+        weight_owner=builder.weight_owner,
+        in_treedef=in_treedef,
+        in_leaf_is_input=in_leaf_is_input,
+    )
 
 
 def _rebuild(spec: ArgSpec, env: dict[int, object]) -> object:
@@ -515,8 +614,13 @@ def eval_graph(graph: Graph, *inputs: PyTree) -> PyTree:
             f"eval_graph: expected {len(graph.inputs)} input leaves, got {len(in_leaves)}"
         )
     env: dict[int, object] = dict(zip(graph.inputs, in_leaves))
+    # Seed each live ambient-weight leaf from its current value (a ``Var`` on a grad pass, a
+    # plain array during inference) -- read fresh each call, so an ``weights.step`` update
+    # between calls is picked up.
+    for key, nid in graph.weight_inputs.items():
+        env[nid] = graph.weight_owner._resolve_weight(key)
     for node in graph.nodes:
-        if node.prim is _INPUT:
+        if node.prim is _INPUT or node.prim is _WEIGHT:
             continue
         if node.prim is _CONST:
             env[node.id] = node.params["value"]

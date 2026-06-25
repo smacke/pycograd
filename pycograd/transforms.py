@@ -9,13 +9,14 @@ the graph.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Hashable, cast
+from typing import Any, Callable, Hashable, cast, overload
 
 import numpy as np
 
 from pycograd import ops
 from pycograd._typing import Array, ArrayLike, Boxed, Operand
 from pycograd.batching import BatchTrace, BatchTracer
+from pycograd.capture import Graph
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import (
@@ -132,9 +133,18 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, L
     return None, leaf
 
 
+# A ``Graph`` is structurally callable (it has ``__call__``), so the two overloads
+# necessarily overlap; ``Graph`` first gives the correct runtime dispatch (a captured
+# graph -> a graph; any other callable -> a wrapper).
+@overload
+def value_and_grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
+@overload
 def value_and_grad(
     f: Callable[..., PyTree],
-) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]:
+) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]: ...
+def value_and_grad(
+    f: Callable[..., PyTree] | Graph,
+) -> Callable[..., tuple[Array, tuple[PyTree, ...]]] | Graph:
     """Wrap ``f`` so that calling it returns ``(value, grads)``.
 
     ``grads`` is a tuple with one entry per positional argument, holding the
@@ -145,7 +155,16 @@ def value_and_grad(
     Leaves may be ``Param``s to opt into freezing (``frozen``) or tying (``tied``).
     ``f`` may be an ordinary function or a pipescript ``|>`` pipe lambda (run it
     under ``PipelineTracer``).
+
+    ``f`` may instead be a *captured* :class:`~pycograd.capture.Graph`, in which case
+    a new :class:`~pycograd.capture.Graph` is returned whose output is ``(value, grads)``
+    -- ``grads`` a flat tuple, one cotangent per input leaf.
     """
+    if isinstance(f, Graph):
+        from pycograd.ad_graph import _grad_graph
+
+        return _grad_graph(f, include_value=True)
+
     runner = _INSTRUMENTED.get(f)
     if runner is None:
         runner = _make_runner(f)
@@ -240,9 +259,28 @@ def _match_arg(orig: Leaf, grad: Array) -> Operand:
     return grad if _is_array(value) else float(grad)
 
 
-def grad(f: Callable[..., PyTree]) -> Callable[..., tuple[PyTree, ...]]:
+# ``Graph`` first: it is structurally callable, so the overloads overlap; this order
+# routes a captured graph -> a graph and any other callable -> a wrapper (see
+# ``value_and_grad`` above).
+@overload
+def grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
+@overload
+def grad(f: Callable[..., PyTree]) -> Callable[..., tuple[PyTree, ...]]: ...
+def grad(
+    f: Callable[..., PyTree] | Graph,
+) -> Callable[..., tuple[PyTree, ...]] | Graph:
     """Return a function computing just the gradient tuple of ``f`` (one entry per
-    argument; each matches that argument's pytree structure)."""
+    argument; each matches that argument's pytree structure).
+
+    ``f`` may instead be a *captured* :class:`~pycograd.capture.Graph`, in which case a
+    new :class:`~pycograd.capture.Graph` is returned whose output is the grads alone (a
+    flat tuple, one cotangent per input leaf) -- the value-dropping mirror of the callable
+    case. Use :func:`value_and_grad` on the graph to keep the value too."""
+    if isinstance(f, Graph):
+        from pycograd.ad_graph import _grad_graph
+
+        return _grad_graph(f, include_value=False)
+
     vg = value_and_grad(f)
 
     def wrapped(*args: PyTree) -> tuple[PyTree, ...]:
