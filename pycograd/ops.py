@@ -1120,6 +1120,108 @@ def _tile_abstract(x: Boxed, reps: Any) -> Boxed:
 
 
 # ---------------------------------------------------------------------------
+# np.split / array_split / vsplit / hsplit / dsplit -- the inverse of concatenate: cut ``x``
+# into pieces along an axis. Each piece is a *slice* (``d_getitem``), so split is a
+# composition of getitems whose VJPs scatter-add back into ``x`` (the reverse of
+# concatenate); the op returns a *list* of values. ``hsplit`` uses axis 1 (axis 0 for 1-D),
+# ``vsplit`` axis 0, ``dsplit`` axis 2.
+# ---------------------------------------------------------------------------
+def split_slices(
+    shape: tuple[int, ...], indices_or_sections: Any, axis: int
+) -> list[tuple]:
+    n = shape[axis]
+    if isinstance(indices_or_sections, (int, np.integer)):
+        parts = int(indices_or_sections)
+        base, rem = divmod(n, parts)
+        sizes = [base + 1] * rem + [base] * (parts - rem)  # array_split semantics
+        bounds = list(np.cumsum([0] + sizes))
+    else:
+        idx = [min(max(int(i), 0), n) for i in indices_or_sections]
+        bounds = [0] + idx + [n]
+    out: list[tuple] = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        sl: list[Any] = [slice(None)] * len(shape)
+        sl[axis] = slice(int(a), int(b))
+        out.append(tuple(sl))
+    return out
+
+
+def split_axis(which: str, ndim: int) -> int:
+    """The axis each split variant cuts along: ``vsplit`` -> 0, ``dsplit`` -> 2,
+    ``hsplit`` -> 1 (0 for 1-D), ``split``/``array_split`` -> the caller's ``axis``."""
+    if which == "vsplit":
+        return 0
+    if which == "dsplit":
+        return 2
+    return 1 if ndim > 1 else 0  # hsplit
+
+
+def _resolve_split(which: str, ndim: int, args: tuple, kwargs: dict) -> tuple[Any, int]:
+    """``(indices_or_sections, axis)`` for a split-family call, by variant."""
+    ind = args[0]
+    if which in ("split", "array_split"):
+        axis = args[1] if len(args) > 1 else kwargs.get("axis", 0)
+        return ind, int(axis)
+    return ind, split_axis(which, ndim)
+
+
+def d_split(x: Operand, indices_or_sections: Any, axis: int = 0) -> list:
+    shape = _logical_shape(x)
+    return [d_getitem(x, sl) for sl in split_slices(shape, indices_or_sections, axis)]
+
+
+def d_array_split(x: Operand, indices_or_sections: Any, axis: int = 0) -> list:
+    return d_split(x, indices_or_sections, axis)
+
+
+def d_vsplit(x: Operand, indices_or_sections: Any) -> list:
+    return d_split(x, indices_or_sections, 0)
+
+
+def d_hsplit(x: Operand, indices_or_sections: Any) -> list:
+    return d_split(x, indices_or_sections, split_axis("hsplit", _logical_ndim(x)))
+
+
+def d_dsplit(x: Operand, indices_or_sections: Any) -> list:
+    return d_split(x, indices_or_sections, 2)
+
+
+def _sliced_shape(shape: tuple[int, ...], sl: tuple) -> tuple[int, ...]:
+    return tuple(len(range(*s.indices(int(d)))) for s, d in zip(sl, shape))
+
+
+def split_abstract_rule(which: str) -> Callable[..., Boxed]:
+    def rule(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
+        from pycograd.shapes import ShapedArray, _aval
+
+        a = _aval(cast(Any, x))
+        ind, axis = _resolve_split(which, len(a.shape), args, kwargs)
+        slices = split_slices(tuple(cast(Any, a.shape)), ind, axis)
+        return cast(
+            Boxed,
+            [
+                ShapedArray(_sliced_shape(tuple(cast(Any, a.shape)), sl), a.dtype)
+                for sl in slices
+            ],
+        )
+
+    return rule
+
+
+def split_transform_rule(which: str) -> Callable[..., Boxed]:
+    """Forward (jvp) *and* batching (vmap) rule for a split variant: cut ``x`` into slices via
+    ``d_getitem`` (which carries both rules), returning a *list* of pieces."""
+    from pycograd.trace import bind
+
+    def rule(_trace: Boxed, x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
+        ind, axis = _resolve_split(which, len(cast(Any, x).shape), args, kwargs)
+        slices = split_slices(tuple(cast(Any, x).shape), ind, axis)
+        return cast(Boxed, [bind(d_getitem, x, sl) for sl in slices])
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
 # Cumulative sum -- a fused primitive (linear; no composition expresses the prefix
 # sum). The VJP is a reverse cumulative sum (flip -> cumsum -> flip).
 # ---------------------------------------------------------------------------
@@ -1592,6 +1694,11 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_pad: (np.pad,),
     d_repeat: (np.repeat,),
     d_tile: (np.tile,),
+    d_split: (np.split,),
+    d_array_split: (np.array_split,),
+    d_vsplit: (np.vsplit,),
+    d_hsplit: (np.hsplit,),
+    d_dsplit: (np.dsplit,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),

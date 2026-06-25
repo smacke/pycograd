@@ -64,11 +64,11 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_diag",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint)",
+    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
     (
         "test_numpy.py",
         "test_diagonal",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint)",
+    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
     (
         "test_numpy.py",
         "test_flatten_method",
@@ -90,7 +90,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_make_diagonal",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint)",
+    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
     (
         "test_numpy.py",
         "test_max_equal_values",
@@ -183,18 +183,6 @@ SKIPS = {
     ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
     (
         "test_systematic.py",
-        "test_array_split_1d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_array_split_2d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_array_split_3d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
         "test_column_stack_1d",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
@@ -212,19 +200,15 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_diag",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint)",
+    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
     (
         "test_systematic.py",
         "test_diag_flat",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint)",
+    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
     (
         "test_systematic.py",
         "test_diff",
     ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
-        "test_dsplit_3d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
     (
         "test_systematic.py",
         "test_einsum2_covsum",
@@ -261,14 +245,6 @@ SKIPS = {
         "test_systematic.py",
         "test_gradient",
     ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
-        "test_hsplit_2d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_hsplit_3d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
     (
         "test_systematic.py",
         "test_hstack_1d",
@@ -324,30 +300,10 @@ SKIPS = {
     ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
     (
         "test_systematic.py",
-        "test_split_1d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_split_2d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_split_3d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
         "test_std",
     ): "pycograd-gap: np.std gradient mismatch under this check (reduction with ddof/sqrt)",
     (
         "test_systematic.py",
         "test_trace",
     ): "pycograd-gap: np.trace needs a diagonal einsum ('ii->'), which einsum rejects",
-    (
-        "test_systematic.py",
-        "test_vsplit_2d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
-    (
-        "test_systematic.py",
-        "test_vsplit_3d",
-    ): "pycograd-gap: no VJP rule for the np.split family (split/vsplit/hsplit/dsplit/array_split)",
 }

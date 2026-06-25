@@ -95,6 +95,13 @@ this work** — see below).
   (`np.repeat(np.arange(...))`) stay plain. Flipped ~8 more tests green (suite now 262 passed /
   131 skipped). The forward checker (`_jvp`) was also adjusted to hold *structural positional*
   args (e.g. `pad`'s `pad_width`) fixed rather than lifting them to tracers.
+* **The split family** (fourth PR, fourth batch): `np.split`/`np.array_split`/`np.vsplit`/
+  `np.hsplit`/`np.dsplit` -- the inverse of concatenate, lowered to `d_getitem` slices, so the
+  op returns a *list* of pieces whose getitem VJPs scatter-add back into `x`. A single rule
+  factory serves both forward and vmap (both delegate to `d_getitem`); the abstract
+  (`eval_shape`) path gained list-output support (`AbstractTrace.process_primitive` tags each
+  element). Flipped ~11 more tests green (suite now 273 passed / 120 skipped). Native
+  regression: `test/test_split_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

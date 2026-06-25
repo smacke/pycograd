@@ -903,6 +903,11 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_pad: ops._pad_abstract,
             ops.d_repeat: ops._repeat_abstract,
             ops.d_tile: ops._tile_abstract,
+            ops.d_split: ops.split_abstract_rule("split"),
+            ops.d_array_split: ops.split_abstract_rule("array_split"),
+            ops.d_vsplit: ops.split_abstract_rule("vsplit"),
+            ops.d_hsplit: ops.split_abstract_rule("hsplit"),
+            ops.d_dsplit: ops.split_abstract_rule("dsplit"),
             ops.d_ravel: ops._reshape_lowering_abstract(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_abstract(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_abstract(ops.atleast_1d_shape),
@@ -967,7 +972,11 @@ class AbstractTrace(Trace):
             raise NotImplementedError(
                 f"eval_shape: no shape rule for {getattr(prim, '__name__', prim)!r}"
             )
-        return self._tag(rule(*args, **params))
+        out = rule(*args, **params)
+        # A multi-output primitive (e.g. ``np.split``) returns a list of shapes; tag each.
+        if isinstance(out, list):
+            return cast(Boxed, [self._tag(o) for o in out])
+        return self._tag(out)
 
     def _tag(self, val: Boxed) -> ShapedArray:
         """Re-tag a rule's result (a sentinel-level ``ShapedArray``) with this level, so it
