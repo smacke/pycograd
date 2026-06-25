@@ -102,6 +102,14 @@ this work** — see below).
   (`eval_shape`) path gained list-output support (`AbstractTrace.process_primitive` tags each
   element). Flipped ~11 more tests green (suite now 273 passed / 120 skipped). Native
   regression: `test/test_split_ops.py`.
+* **Binary ufuncs + diff + diag** (fifth PR): `np.logaddexp`/`logaddexp2` (smooth -- the
+  softmax-weight VJP, computed stably) and `np.fmax`/`np.fmin` (reuse the maximum/minimum
+  selection machinery); `np.diff` (a `getitem`/`sub` composition); `np.diag`/`np.diagonal`
+  (extract = gather the diagonal indices via `d_getitem`, construct = scatter onto a zero
+  diagonal via `_scatter`). `eval_shape` for all. Flipped ~8 more tests green (suite now 281
+  passed / 112 skipped). (`np.make_diagonal` is autograd-specific, not numpy; `vmap` of
+  diag-*construct* is unsupported -- `_scatter` has no batch rule.) Native regression:
+  `test/test_more_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

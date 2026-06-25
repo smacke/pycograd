@@ -419,6 +419,25 @@ def _tile_rule(trace: JVPTrace, x: Boxed, reps: Any) -> JVPTracer:
     )
 
 
+def _logaddexp_for(prim: Prim, expp: Prim) -> Rule:
+    """jvp of logaddexp/logaddexp2: ``d out = wa*da + wb*db`` with softmax weights
+    ``wa = base^(a-out)``, ``wb = base^(b-out)``."""
+
+    def rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
+        ta, tb = trace._raise(a), trace._raise(b)
+        out = bind(prim, ta.primal, tb.primal)
+        wa = bind(expp, bind(ops.d_sub, ta.primal, out))
+        wb = bind(expp, bind(ops.d_sub, tb.primal, out))
+        tangent_out = bind(
+            ops.d_add,
+            bind(ops.d_mul, wa, ta.tangent),
+            bind(ops.d_mul, wb, tb.tangent),
+        )
+        return _result(trace, out, tangent_out)
+
+    return rule
+
+
 def _select_for(prim: Prim) -> Rule:
     """max / min of two operands: route each operand's tangent through wherever that
     operand was selected (``mask = primal_out == operand``)."""
@@ -706,6 +725,9 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_vsplit: ops.split_transform_rule("vsplit"),
             ops.d_hsplit: ops.split_transform_rule("hsplit"),
             ops.d_dsplit: ops.split_transform_rule("dsplit"),
+            ops.d_diff: ops.diff_transform_rule,
+            ops.d_diag: ops.diag_transform_rule,
+            ops.d_diagonal: ops.diagonal_transform_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),
@@ -726,6 +748,10 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             # selection.
             ops.d_maximum: _select_for(ops.d_maximum),
             ops.d_minimum: _select_for(ops.d_minimum),
+            ops.d_fmax: _select_for(ops.d_fmax),
+            ops.d_fmin: _select_for(ops.d_fmin),
+            ops.d_logaddexp: _logaddexp_for(ops.d_logaddexp, ops.d_exp),
+            ops.d_logaddexp2: _logaddexp_for(ops.d_logaddexp2, ops.d_exp2),
             ops.d_where: _where_rule,
             ops.d_clip: _clip_rule,
             # reductions: sum/mean/var/std are (composed-)linear; max/min route the

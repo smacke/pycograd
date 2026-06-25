@@ -249,6 +249,70 @@ def d_minimum(a: Operand, b: Operand) -> Var:
     return _elementwise_max(a, b, _xp().minimum, d_minimum)
 
 
+def d_fmax(a: Operand, b: Operand) -> Var:
+    # Like maximum (gradient flows to the larger operand); fmax ignores NaN, which the
+    # ``a == out`` selection mask handles for the real, non-NaN inputs we differentiate.
+    return _elementwise_max(a, b, _xp().fmax, d_fmax)
+
+
+def d_fmin(a: Operand, b: Operand) -> Var:
+    return _elementwise_max(a, b, _xp().fmin, d_fmin)
+
+
+# logaddexp(a, b) = log(exp a + exp b); logaddexp2(a, b) = log2(2^a + 2^b). Smooth: the
+# gradient w.r.t. each operand is its softmax weight ``exp(operand - out)`` (base-2 for
+# logaddexp2), computed stably (the exponent is <= 0).
+def _logaddexp_like(
+    a: Operand,
+    b: Operand,
+    fn: Callable[..., Array],
+    base_exp: Callable[..., Array],
+    prim: Prim,
+) -> Var:
+    a, b = _lift(a), _lift(b)
+    out_val = fn(a.value, b.value)
+    out = Var(out_val, _parents=(a, b))
+
+    def _backward() -> None:
+        wa = base_exp(a.value - out_val)
+        wb = base_exp(b.value - out_val)
+        a.grad = _accumulate(a.grad, _unbroadcast(out.grad * wa, a.value.shape))
+        b.grad = _accumulate(b.grad, _unbroadcast(out.grad * wb, b.value.shape))
+
+    out._backward = _backward
+    _record_vjp(out, prim, (a, b))
+    return out
+
+
+def d_logaddexp(a: Operand, b: Operand) -> Var:
+    xp = _xp()
+    return _logaddexp_like(a, b, xp.logaddexp, xp.exp, d_logaddexp)
+
+
+def d_logaddexp2(a: Operand, b: Operand) -> Var:
+    xp = _xp()
+    return _logaddexp_like(a, b, xp.logaddexp2, lambda z: xp.exp2(z), d_logaddexp2)
+
+
+def _vjp_logaddexp_for(prim: Prim, expp: Prim) -> Callable[..., list[Boxed]]:
+    """``ga = g * base^(a - out)``, ``gb = g * base^(b - out)`` -- the softmax weights,
+    re-bound (differentiable) via the op's own primitive ``prim`` and exp ``expp``."""
+
+    def rule(
+        primals: tuple[Var, ...],
+        operands: tuple[Boxed, ...],
+        params: dict[str, Any],
+        g: Boxed,
+    ) -> list[Boxed]:
+        a, b = operands
+        out = _b(prim, a, b)
+        wa = _b(expp, _b(d_sub, a, out))
+        wb = _b(expp, _b(d_sub, b, out))
+        return [_b(d_mul, g, wa), _b(d_mul, g, wb)]
+
+    return rule
+
+
 def d_clip(
     x: Operand, a_min: Operand | None = None, a_max: Operand | None = None
 ) -> Var:
@@ -1190,6 +1254,144 @@ def _sliced_shape(shape: tuple[int, ...], sl: tuple) -> tuple[int, ...]:
     return tuple(len(range(*s.indices(int(d)))) for s, d in zip(sl, shape))
 
 
+# ---------------------------------------------------------------------------
+# np.diff -- the n-th discrete difference along an axis. One difference is
+# ``x[1:] - x[:-1]``: a composition of two getitems and a subtract (all with full rules), so
+# like the split family it carries no ``_VJP_FOR`` of its own.
+# ---------------------------------------------------------------------------
+def _diff_slices(ndim: int, axis: int) -> tuple[tuple, tuple]:
+    ax = axis % ndim
+    upper = tuple(slice(1, None) if i == ax else slice(None) for i in range(ndim))
+    lower = tuple(slice(None, -1) if i == ax else slice(None) for i in range(ndim))
+    return upper, lower
+
+
+def d_diff(x: Operand, n: int = 1, axis: int = -1) -> Var:
+    ndim = _logical_ndim(x)
+    upper, lower = _diff_slices(ndim, axis)
+    cur: Operand = x
+    for _ in range(int(n)):
+        cur = cast(Var, d_getitem(cur, upper) - d_getitem(cur, lower))
+    return cast(Var, cur)
+
+
+def _resolve_diff(args: tuple, kwargs: dict) -> tuple[int, int]:
+    n = int(args[0]) if len(args) > 0 else int(kwargs.get("n", 1))
+    axis = int(args[1]) if len(args) > 1 else int(kwargs.get("axis", -1))
+    return n, axis
+
+
+def diff_transform_rule(_trace: Boxed, x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
+    from pycograd.trace import bind
+
+    n, axis = _resolve_diff(args, kwargs)
+    upper, lower = _diff_slices(len(cast(Any, x).shape), axis)
+    cur: Boxed = x
+    for _ in range(n):
+        cur = bind(d_sub, bind(d_getitem, cur, upper), bind(d_getitem, cur, lower))
+    return cur
+
+
+def diff_abstract_rule(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, x))
+    n, axis = _resolve_diff(args, kwargs)
+    ax = axis % len(a.shape)
+    sh = list(a.shape)
+    sh[ax] = sh[ax] - n
+    return cast(Boxed, ShapedArray(tuple(sh), a.dtype))
+
+
+# ---------------------------------------------------------------------------
+# np.diag / np.diagonal -- read/write a matrix diagonal. *Extracting* a diagonal is a gather
+# at the diagonal index arrays (``d_getitem``); *constructing* one from a 1-D vector is the
+# adjoint scatter (``_scatter``). Both carry full rules, so diag is a composition (no
+# ``_VJP_FOR`` of its own) that also vmaps / eval-shapes for free.
+# ---------------------------------------------------------------------------
+def _diag_key(shape: tuple[int, ...], k: int) -> tuple[tuple, tuple[int, ...]]:
+    """``(key, out_shape)`` for ``np.diag``: a 1-D ``shape`` *constructs* a square matrix with
+    the vector on the ``k``-diagonal; a 2-D ``shape`` *extracts* the ``k``-diagonal."""
+    if len(shape) == 1:
+        length = int(shape[0])
+        m = length + abs(k)
+        i = np.arange(length)
+        rows, cols = (i, i + k) if k >= 0 else (i - k, i)
+        return (rows, cols), (m, m)
+    rows_n, cols_n = int(shape[0]), int(shape[1])
+    if k >= 0:
+        length = max(min(rows_n, cols_n - k), 0)
+        i = np.arange(length)
+        rows, cols = i, i + k
+    else:
+        length = max(min(rows_n + k, cols_n), 0)
+        i = np.arange(length)
+        rows, cols = i - k, i
+    return (rows, cols), (length,)
+
+
+def _operand_dtype(x: object) -> Any:
+    if isinstance(x, Var):
+        return x.value.dtype
+    d = getattr(x, "dtype", None)
+    return d if d is not None else np.asarray(cast(Any, x)).dtype
+
+
+def d_diag(v: Operand, k: int = 0) -> Var:
+    shape = _logical_shape(v)
+    key, out_shape = _diag_key(shape, k)
+    if len(shape) == 1:  # construct a matrix with v on the k-diagonal
+        return _scatter(v, key, out_shape, _operand_dtype(v))
+    return d_getitem(v, key)  # extract the k-diagonal
+
+
+def diag_transform_rule(_trace: Boxed, v: Boxed, k: int = 0) -> Boxed:
+    from pycograd.trace import bind
+
+    shape = tuple(cast(Any, v).shape)
+    key, out_shape = _diag_key(shape, k)
+    if len(shape) == 1:
+        return bind(_scatter, v, key, out_shape, _operand_dtype(v))
+    return bind(d_getitem, v, key)
+
+
+def diag_abstract_rule(v: Boxed, k: int = 0) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, v))
+    _key, out_shape = _diag_key(tuple(cast(Any, a.shape)), k)
+    return cast(Boxed, ShapedArray(out_shape, a.dtype))
+
+
+def d_diagonal(v: Operand, offset: int = 0, axis1: int = 0, axis2: int = 1) -> Var:
+    shape = _logical_shape(v)
+    if len(shape) != 2 or {axis1 % 2, axis2 % 2} != {0, 1}:
+        raise NotImplementedError(
+            "diagonal: only the 2-D default (axis1=0, axis2=1) is supported"
+        )
+    key, _ = _diag_key(shape, offset)
+    return d_getitem(v, key)
+
+
+def diagonal_transform_rule(
+    _trace: Boxed, v: Boxed, offset: int = 0, axis1: int = 0, axis2: int = 1
+) -> Boxed:
+    from pycograd.trace import bind
+
+    key, _ = _diag_key(tuple(cast(Any, v).shape), offset)
+    return bind(d_getitem, v, key)
+
+
+def diagonal_abstract_rule(
+    v: Boxed, offset: int = 0, axis1: int = 0, axis2: int = 1
+) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, v))
+    _key, out_shape = _diag_key(tuple(cast(Any, a.shape)), offset)
+    return cast(Boxed, ShapedArray(out_shape, a.dtype))
+
+
 def split_abstract_rule(which: str) -> Callable[..., Boxed]:
     def rule(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
         from pycograd.shapes import ShapedArray, _aval
@@ -1666,6 +1868,10 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     # elementwise binary
     d_maximum: (np.maximum,),
     d_minimum: (np.minimum,),
+    d_fmax: (np.fmax,),
+    d_fmin: (np.fmin,),
+    d_logaddexp: (np.logaddexp,),
+    d_logaddexp2: (np.logaddexp2,),
     # selection
     d_where: (np.where,),
     d_clip: (np.clip,),
@@ -1699,6 +1905,9 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_vsplit: (np.vsplit,),
     d_hsplit: (np.hsplit,),
     d_dsplit: (np.dsplit,),
+    d_diff: (np.diff,),
+    d_diag: (np.diag,),
+    d_diagonal: (np.diagonal,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),
@@ -2367,6 +2576,10 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_logsumexp: _vjp_logsumexp,
             d_maximum: _vjp_select,
             d_minimum: _vjp_select,
+            d_fmax: _vjp_select,
+            d_fmin: _vjp_select,
+            d_logaddexp: _vjp_logaddexp_for(d_logaddexp, d_exp),
+            d_logaddexp2: _vjp_logaddexp_for(d_logaddexp2, d_exp2),
             d_where: _vjp_where,
             _remat: _vjp_remat,
             _spill: _vjp_identity,

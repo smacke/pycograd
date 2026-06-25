@@ -63,22 +63,18 @@ SKIPS = {
     ): "pycograd-gap: np.cumsum function form does not dispatch to the d_cumsum rule",
     (
         "test_numpy.py",
-        "test_diag",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
-    (
-        "test_numpy.py",
         "test_diagonal",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
+    ): "pycograd-gap: np.diagonal with non-default axes (axis1=-1, axis2=-2) and autograd's make_diagonal helper",
     (
         "test_numpy.py",
         "test_flatten_method",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     ("test_numpy.py", "test_fliplr"): "pycograd-gap: unsupported op (no autodiff rule)",
     ("test_numpy.py", "test_flipud"): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
         "test_gradient",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_numpy.py",
         "test_len",
@@ -90,7 +86,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_make_diagonal",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
+    ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
     (
         "test_numpy.py",
         "test_max_equal_values",
@@ -148,15 +144,15 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_simple_append_arr",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_numpy.py",
         "test_simple_append_list",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_numpy.py",
         "test_std_list_of_boxes",
@@ -199,18 +195,6 @@ SKIPS = {
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_systematic.py",
-        "test_diag",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
-    (
-        "test_systematic.py",
-        "test_diag_flat",
-    ): "pycograd-gap: no VJP rule for np.diag/np.diagonal (extract/construct adjoint + batched diag)",
-    (
-        "test_systematic.py",
-        "test_diff",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
-    (
-        "test_systematic.py",
         "test_einsum2_covsum",
     ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
     (
@@ -235,16 +219,8 @@ SKIPS = {
     ): "pycograd-gap: np.einsum with >=3 operands has no VJP rule",
     (
         "test_systematic.py",
-        "test_fmax",
-    ): "pycograd-gap: no rule for np.logaddexp/logaddexp2/fmax/fmin",
-    (
-        "test_systematic.py",
-        "test_fmin",
-    ): "pycograd-gap: no rule for np.logaddexp/logaddexp2/fmax/fmin",
-    (
-        "test_systematic.py",
         "test_gradient",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_systematic.py",
         "test_hstack_1d",
@@ -256,14 +232,6 @@ SKIPS = {
     ("test_systematic.py", "test_kron"): "pycograd-gap: no VJP rule for np.kron",
     (
         "test_systematic.py",
-        "test_logaddexp",
-    ): "pycograd-gap: no rule for np.logaddexp/logaddexp2/fmax/fmin",
-    (
-        "test_systematic.py",
-        "test_logaddexp2",
-    ): "pycograd-gap: no rule for np.logaddexp/logaddexp2/fmax/fmin",
-    (
-        "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
     (
@@ -273,7 +241,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_partition",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_systematic.py",
         "test_real",
@@ -293,11 +261,11 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_select",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_systematic.py",
         "test_sort",
-    ): "pycograd-gap: no VJP rule for this array-manipulation op (diff/gradient/select/sort/partition/flatten/append/diagonal)",
+    ): "pycograd-gap: no VJP rule for this op (gradient/select/sort/partition/flatten/append)",
     (
         "test_systematic.py",
         "test_std",
