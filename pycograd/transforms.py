@@ -1247,6 +1247,11 @@ def elementwise_grad(
     return eg
 
 
+# ``egrad`` is the popular autograd nickname for ``elementwise_grad`` (autograd users write
+# ``from autograd import elementwise_grad as egrad``); expose it as a first-class alias.
+egrad = elementwise_grad
+
+
 def make_jvp(
     f: Callable[..., PyTree], argnum: int = 0
 ) -> Callable[..., Callable[..., tuple[PyTree, PyTree]]]:
@@ -1280,8 +1285,12 @@ def make_vjp(
 ) -> Callable[..., tuple[Callable[..., PyTree], PyTree]]:
     """Builds a reverse-mode evaluator: ``make_vjp(f)(x)`` returns ``(vjp_fn, f(x))``,
     where ``vjp_fn(g)`` pulls the output cotangent ``g`` back to ``x`` -- a single forward
-    pass reused across cotangents (``Var.backward`` re-seeds and re-zeros each call). This
-    is the one low-level reverse primitive pycograd did not previously expose."""
+    pass reused across cotangents (``Var.backward`` re-seeds and re-zeros each call).
+
+    This is the eager, function-level (autograd/JAX-style) VJP maker. It builds on the
+    existing :meth:`Var.backward` (which already accepts an arbitrary cotangent); the
+    graph-level counterpart is :func:`pycograd.transpose.vjp_graph` (which returns a captured
+    ``Graph`` instead of an eager closure)."""
 
     def maker(*args: PyTree, **kwargs: PyTree) -> tuple[Callable[..., PyTree], PyTree]:
         out_var, x_var = _forward_for_vjp(f, args, kwargs, argnum)

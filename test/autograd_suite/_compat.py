@@ -44,6 +44,9 @@ elementwise_grad = pg.elementwise_grad
 make_jvp = pg.make_jvp
 
 
+egrad = pg.egrad  # autograd nickname for elementwise_grad
+
+
 def make_vjp(fun, argnum=0):
     """``make_vjp(fun)(x) -> (vjp_fn, ans)`` (autograd ordering), pytree-capable."""
 

@@ -52,9 +52,13 @@ this work** — see below).
   given order; default `None` keeps the existing tuple-over-all-args behavior) and **`**kwargs`**
   passthrough (held fixed), via selective lifting — only the differentiated argument is put on
   the tape, so an op applied to a *held* argument (e.g. `np.tan`) needs no rule.
-* New public operators **`jacobian`, `hessian`, `elementwise_grad`, `make_jvp`, `make_vjp`**.
-  `make_vjp` is the one genuinely new low-level primitive (pycograd previously had no reusable
-  reverse evaluator). Covered by `test/test_autograd_api.py`.
+* New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
+  **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
+  (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new
+  core capability — it builds on the pre-existing `Var.backward(cotangent=...)` (which already
+  accepted an arbitrary output cotangent) and overlaps with the existing graph-form
+  `transpose.vjp_graph(f, *primals)` (which returns a captured `Graph` rather than an eager
+  closure). Covered by `test/test_autograd_api.py`.
 
 ## Gaps, prioritized
 
@@ -95,6 +99,19 @@ forward gap currently skips the whole test even though reverse would pass — so
 | **`scipy`** (`special`/`stats`/`linalg`/`signal`/`integrate`) | large | no scipy backend |
 | **In-place / scatter** (`A[i] = b`) | medium | Phase 2 (WIP per ROADMAP) |
 | **dtype preservation** (grad keeps float32/float16; longdouble/clongdouble) | medium | pycograd defaults to a float64 working dtype |
+
+### Future cleanup: unify `grad` and `make_vjp`
+
+Unlike autograd (where `grad` literally *is* `make_vjp`-of-ones), pycograd's
+`grad`/`value_and_grad` and `make_vjp` are **separate reverse-mode paths** that both bottom
+out at `Var.backward` but neither builds on the other: `value_and_grad`'s `_run` is the
+pytree-aware path (dict/list/tuple args, `Param`/frozen/tied, the higher-order `differentiable`
+flag, ones-seeded scalar backward), while `make_vjp`'s `_forward_for_vjp` is a simpler
+single-array-arg lift with a caller-supplied cotangent. They were left separate to avoid
+disturbing the proven, hot `_run` path. **Future work:** generalize `make_vjp` to pytree
+inputs and express `grad`/`value_and_grad` as `make_vjp(...)[0](ones)` for scalar output, so
+there is a single reverse-mode core (benchmark first — the base `.grad` closure path was kept
+over the `bind`-riding one precisely because it was ~2x faster, see `ops.py` `_VJP_FOR`).
 
 ### 4. Semantic divergences (not bugs)
 
