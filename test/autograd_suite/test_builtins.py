@@ -1,0 +1,27 @@
+# -*- coding: utf-8 -*-
+"""Ported from autograd ``tests/test_builtins.py`` (MIT). ``isinstance`` under grad."""
+import numpy as np
+
+from ._compat import ag_isinstance as isinstance  # noqa: A001 (autograd shim)
+from ._compat import grad
+
+
+def test_isinstance():
+    def checker(ex, type_, truthval):
+        assert isinstance(ex, type_) == truthval
+        return 1.0
+
+    examples = [
+        [list, [[]], [()]],
+        [np.ndarray, [np.zeros(1)], [[]]],
+        [(tuple, list), [[], ()], [np.zeros(1)]],
+    ]
+
+    for type_, positive_examples, negative_examples in examples:
+        for ex in positive_examples:
+            checker(ex, type_, True)
+            grad(checker)(ex, type_, True)
+
+        for ex in negative_examples:
+            checker(ex, type_, False)
+            grad(checker)(ex, type_, False)

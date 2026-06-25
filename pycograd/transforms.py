@@ -9,7 +9,8 @@ the graph.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Hashable, cast, overload
+import inspect
+from typing import Any, Callable, Hashable, Sequence, cast, overload
 
 import numpy as np
 
@@ -83,6 +84,28 @@ def _check_param_ownership(args: tuple[PyTree, ...]) -> None:
             val_owner.setdefault(id(leaf.value), leaf)
 
 
+def _traceable(f: Callable[..., PyTree]) -> Callable[..., PyTree]:
+    """Return a form of ``f`` whose numeric ops can be intercepted.
+
+    A composite Python function carries source, so ``_make_runner`` instruments it
+    directly (weaving every ``np.*`` call in its body). A bare primitive -- a numpy
+    ufunc or other builtin with no retrievable source -- cannot be instrumented; wrap
+    it in a tiny closure so that the single ``f(...)`` call, once woven inside the
+    instrumented wrapper, routes through ``resolve_call`` to the primitive's rule.
+    """
+    try:
+        has_source = inspect.getsourcefile(f) is not None
+    except (TypeError, OSError):
+        has_source = False
+    if has_source:
+        return f
+
+    def call_primitive(*a: PyTree, **k: PyTree) -> PyTree:
+        return f(*a, **k)
+
+    return call_primitive
+
+
 def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, Leaf]:
     """Lift one argument leaf onto the tape.
 
@@ -140,21 +163,32 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, L
 def value_and_grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
 @overload
 def value_and_grad(
-    f: Callable[..., PyTree],
+    f: Callable[..., PyTree], argnum: int
+) -> Callable[..., tuple[Array, PyTree]]: ...
+@overload
+def value_and_grad(
+    f: Callable[..., PyTree], argnum: None | Sequence[int] = ...
 ) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]: ...
 def value_and_grad(
     f: Callable[..., PyTree] | Graph,
-) -> Callable[..., tuple[Array, tuple[PyTree, ...]]] | Graph:
+    argnum: int | Sequence[int] | None = None,
+) -> Callable[..., tuple[Array, PyTree]] | Graph:
     """Wrap ``f`` so that calling it returns ``(value, grads)``.
 
-    ``grads`` is a tuple with one entry per positional argument, holding the
-    gradient of the (scalar) output w.r.t. that argument. Each argument may be a
-    pytree (e.g. a dict of weights); its gradient comes back as a matching pytree,
-    with ``None`` at any non-numeric or frozen leaf. A bare array/scalar is just a
-    pytree with one leaf, so it yields a bare gradient (backward compatible).
-    Leaves may be ``Param``s to opt into freezing (``frozen``) or tying (``tied``).
-    ``f`` may be an ordinary function or a pipescript ``|>`` pipe lambda (run it
-    under ``PipelineTracer``).
+    With the default ``argnum=None``, ``grads`` is a tuple with one entry per
+    positional argument, holding the gradient of the (scalar) output w.r.t. that
+    argument. Each argument may be a pytree (e.g. a dict of weights); its gradient
+    comes back as a matching pytree, with ``None`` at any non-numeric or frozen
+    leaf. A bare array/scalar is just a pytree with one leaf, so it yields a bare
+    gradient (backward compatible). Leaves may be ``Param``s to opt into freezing
+    (``frozen``) or tying (``tied``). ``f`` may be an ordinary function or a
+    pipescript ``|>`` pipe lambda (run it under ``PipelineTracer``).
+
+    ``argnum`` selects which positional argument(s) to differentiate (JAX/autograd
+    convention): an ``int`` returns the *bare* gradient of that one argument; a
+    sequence of ints returns a tuple with one gradient per selected argument; the
+    other arguments and any keyword arguments are held fixed. Calling the wrapper
+    with ``**kwargs`` forwards them to ``f`` as non-differentiated constants.
 
     ``f`` may instead be a *captured* :class:`~pycograd.capture.Graph`, in which case
     a new :class:`~pycograd.capture.Graph` is returned whose output is ``(value, grads)``
@@ -167,15 +201,26 @@ def value_and_grad(
 
     runner = _INSTRUMENTED.get(f)
     if runner is None:
-        runner = _make_runner(f)
+        runner = _make_runner(_traceable(f))
         _INSTRUMENTED[f] = runner
 
-    def wrapped(*args: PyTree) -> tuple[Array, tuple[PyTree, ...]]:
+    def _run(
+        diff: tuple[int, ...], args: tuple[PyTree, ...], kwargs: dict[str, PyTree]
+    ) -> tuple[Array, dict[int, PyTree]]:
+        # Lift only the *selected* (``diff``) positional args onto the tape; every other
+        # positional arg and all keyword args pass through as plain constants. Holding the
+        # rest raw (rather than lifting every arg) keeps an op applied only to a held arg --
+        # e.g. ``np.tan`` on a non-differentiated argument, for which no rule may exist --
+        # off the tape entirely, matching autograd's per-``argnum`` semantics.
         call_args: list[PyTree] = []
-        per_arg: list[tuple[TreeDef, list[tuple[Leaf, Var | None]]]] = []
-        _check_param_ownership(args)
+        per_arg: list[tuple[TreeDef, list[tuple[Leaf, Var | None]]] | None] = []
+        _check_param_ownership(tuple(args[i] for i in diff))
         tie_vars: dict[Hashable, Var] = {}
-        for a in args:
+        for i, a in enumerate(args):
+            if i not in diff:
+                call_args.append(a)
+                per_arg.append(None)
+                continue
             leaves, treedef = tree_flatten(a)
             info: list[tuple[Leaf, Var | None]] = []
             wrapped_leaves: list[Leaf] = []
@@ -198,7 +243,7 @@ def value_and_grad(
         # enclosed; the marker carries no tracer, so dispatch is unchanged (see
         # ``trace.ReverseTrace``). Forward and backward both run inside it.
         with new_main(ReverseTrace):
-            out = runner(*call_args)
+            out = runner(*call_args, **kwargs)
             if isinstance(out, Var):
                 root: Var = out
             elif isinstance(out, Tracer) and isinstance(
@@ -233,14 +278,31 @@ def value_and_grad(
                 return None
             return v.grad if higher else _match_arg(orig, v.grad)
 
-        grads = tuple(
-            tree_unflatten(
-                treedef,
-                cast("list[Leaf]", [_grad_leaf(orig, v) for orig, v in info]),
+        grads: dict[int, PyTree] = {
+            i: tree_unflatten(
+                entry[0],
+                cast("list[Leaf]", [_grad_leaf(orig, v) for orig, v in entry[1]]),
             )
-            for treedef, info in per_arg
-        )
+            for i, entry in enumerate(per_arg)
+            if entry is not None
+        }
         return value, grads
+
+    def wrapped(*args: PyTree, **kwargs: PyTree) -> tuple[Array, PyTree]:
+        # ``diff`` is the positional indices to differentiate. Default (``argnum=None``)
+        # is every argument -- byte-for-byte the original behavior, returning
+        # ``(value, grads_tuple)``. An ``int`` returns the bare gradient; a sequence
+        # returns a tuple over the selected args in the *given* order.
+        if argnum is None:
+            diff = tuple(range(len(args)))
+        elif isinstance(argnum, int):
+            diff = (argnum,)
+        else:
+            diff = tuple(argnum)
+        value, grads = _run(diff, args, kwargs)
+        if isinstance(argnum, int):
+            return value, grads[argnum]
+        return value, tuple(grads[i] for i in diff)
 
     # ``_pycograd_vag_of`` lets ``vmap`` recognize ``vmap(value_and_grad(f))`` /
     # ``vmap(grad(f))`` and take the per-sample path (a single batched forward + one
@@ -265,12 +327,22 @@ def _match_arg(orig: Leaf, grad: Array) -> Operand:
 @overload
 def grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
 @overload
-def grad(f: Callable[..., PyTree]) -> Callable[..., tuple[PyTree, ...]]: ...
+def grad(f: Callable[..., PyTree], argnum: int) -> Callable[..., PyTree]: ...
+@overload
+def grad(
+    f: Callable[..., PyTree], argnum: None | Sequence[int] = ...
+) -> Callable[..., tuple[PyTree, ...]]: ...
 def grad(
     f: Callable[..., PyTree] | Graph,
-) -> Callable[..., tuple[PyTree, ...]] | Graph:
-    """Return a function computing just the gradient tuple of ``f`` (one entry per
-    argument; each matches that argument's pytree structure).
+    argnum: int | Sequence[int] | None = None,
+) -> Callable[..., PyTree] | Graph:
+    """Return a function computing just the gradient of ``f``.
+
+    With the default ``argnum=None`` this is the gradient *tuple* (one entry per
+    positional argument, each matching that argument's pytree structure). ``argnum``
+    selects which argument(s) to differentiate (JAX/autograd convention): an ``int``
+    returns the bare gradient of that argument, a sequence of ints a tuple over the
+    selected ones; ``**kwargs`` passed to the wrapper are forwarded to ``f`` fixed.
 
     ``f`` may instead be a *captured* :class:`~pycograd.capture.Graph`, in which case a
     new :class:`~pycograd.capture.Graph` is returned whose output is the grads alone (a
@@ -281,10 +353,10 @@ def grad(
 
         return _grad_graph(f, include_value=False)
 
-    vg = value_and_grad(f)
+    vg = value_and_grad(f, argnum)
 
-    def wrapped(*args: PyTree) -> tuple[PyTree, ...]:
-        return vg(*args)[1]
+    def wrapped(*args: PyTree, **kwargs: PyTree) -> PyTree:
+        return vg(*args, **kwargs)[1]
 
     # Carry the underlying ``f`` (not ``vg``) so ``vmap(grad(f))`` reconstructs the
     # per-sample path from the original function.
@@ -1089,6 +1161,140 @@ def jacrev(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
     if grad_of is not None and argnum == 0:
         jacobian._pycograd_hessian_of = grad_of  # type: ignore[attr-defined]
     return jacobian
+
+
+# ---------------------------------------------------------------------------
+# autograd/JAX-style convenience operators (jacobian / hessian / elementwise_grad /
+# make_jvp / make_vjp). The differentiated argument ``args[argnum]`` must be a single
+# array (autograd's ``jacobian``/``make_vjp`` likewise do not differentiate list/dict
+# arguments). The reverse operators reuse ``_forward_for_vjp`` -- which instruments ``f``
+# via ``_make_runner`` so its ``np.*`` calls are woven (pycograd disables the numpy array
+# protocol on ``Var``, so an *un*-instrumented ``f`` cannot be traced), lifts only the
+# selected argument onto the tape, and leaves the rest as plain constants -- then walk one
+# (or, for the Jacobian, a basis sweep of) ``Var.backward`` pass with a chosen cotangent.
+# ---------------------------------------------------------------------------
+def _forward_for_vjp(
+    f: Callable[..., PyTree],
+    args: tuple[PyTree, ...],
+    kwargs: dict[str, PyTree],
+    argnum: int,
+) -> tuple[Var, Var]:
+    """Run ``f`` once with ``args[argnum]`` lifted to a tape ``Var`` (the rest held as
+    plain constants) and return ``(out_var, x_var)`` -- the output node and the input node
+    whose ``.grad`` a subsequent ``out_var.backward(cotangent=...)`` fills."""
+    runner = _INSTRUMENTED.get(f)
+    if runner is None:
+        runner = _make_runner(_traceable(f))
+        _INSTRUMENTED[f] = runner
+    x_var = Var(_xp().asarray(_value(cast(Operand, args[argnum]))))
+    call_args = list(args)
+    call_args[argnum] = x_var
+    with new_main(ReverseTrace):
+        out = runner(*call_args, **kwargs)
+    out_var = out if isinstance(out, Var) else _lift(cast(Operand, out))
+    return out_var, x_var
+
+
+def jacobian(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
+    """Full Jacobian of ``f`` w.r.t. its ``argnum``-th argument, shaped
+    ``(*out_shape, *in_shape)`` (reverse-mode -- one ``backward`` per output component over
+    a single forward pass). Not restricted to scalar output; for scalar output it is the
+    gradient. The differentiated argument must be a single array."""
+
+    def jac(*args: PyTree, **kwargs: PyTree) -> PyTree:
+        out_var, x_var = _forward_for_vjp(f, args, kwargs, argnum)
+        out_shape = out_var.value.shape
+        x_shape = x_var.value.shape
+        m = int(np.prod(out_shape, dtype=np.int64)) if out_shape else 1
+        rows: list[Array] = []
+        for i in range(m):
+            cot = _xp().zeros(out_var.value.size, dtype=float)
+            cot[i] = 1.0
+            out_var.backward(cotangent=cot.reshape(out_shape) if out_shape else cot[0])
+            rows.append(np.asarray(x_var.grad).reshape(-1))
+        return np.stack(rows, axis=0).reshape(out_shape + x_shape)
+
+    return jac
+
+
+def hessian(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]:
+    """Exact Hessian of scalar-output ``f`` w.r.t. its ``argnum``-th argument, shaped
+    ``(*in_shape, *in_shape)`` -- forward-over-reverse (``jacfwd(grad(f))``). Only
+    ``argnum == 0`` of a single-argument ``f`` is supported."""
+    if argnum != 0:
+        raise NotImplementedError(
+            "hessian supports only argnum=0 of a single-argument function; for a held "
+            "argument, close it into a one-argument function first"
+        )
+    # ``grad(f, 0)`` returns the *bare* gradient array (not the 1-tuple the default
+    # ``grad`` returns), so ``jacfwd`` of it is shaped ``(*in, *in)`` rather than
+    # ``(1, *in, *in)``.
+    return jacfwd(grad(f, 0))
+
+
+def elementwise_grad(
+    f: Callable[..., PyTree], argnum: int = 0
+) -> Callable[..., PyTree]:
+    """Gradient of ``sum(f)`` w.r.t. its ``argnum``-th argument -- the sum of each column
+    of the Jacobian in one reverse pass (the diagonal, when the Jacobian is diagonal).
+    """
+
+    def eg(*args: PyTree, **kwargs: PyTree) -> PyTree:
+        out_var, x_var = _forward_for_vjp(f, args, kwargs, argnum)
+        out_var.backward(cotangent=_xp().ones_like(out_var.value))
+        return np.asarray(x_var.grad)
+
+    return eg
+
+
+def make_jvp(
+    f: Callable[..., PyTree], argnum: int = 0
+) -> Callable[..., Callable[..., tuple[PyTree, PyTree]]]:
+    """Builds a forward-mode evaluator: ``make_jvp(f)(x)(v)`` returns
+    ``(f(x), df(x) . v)`` (autograd ordering), reusing :func:`jvp`. The non-differentiated
+    arguments are carried as primals with a zero tangent."""
+
+    def maker(*args: PyTree, **kwargs: PyTree) -> Callable[..., tuple[PyTree, PyTree]]:
+        def jvp_at(v: PyTree) -> tuple[PyTree, PyTree]:
+            tangents = tuple(
+                (
+                    (
+                        v
+                        if i == argnum
+                        else np.zeros_like(np.asarray(_value(cast(Operand, a))))
+                    )
+                    if _is_numeric(a)
+                    else a
+                )
+                for i, a in enumerate(args)
+            )
+            return jvp(_traceable(f), tuple(args), tangents)
+
+        return jvp_at
+
+    return maker
+
+
+def make_vjp(
+    f: Callable[..., PyTree], argnum: int = 0
+) -> Callable[..., tuple[Callable[..., PyTree], PyTree]]:
+    """Builds a reverse-mode evaluator: ``make_vjp(f)(x)`` returns ``(vjp_fn, f(x))``,
+    where ``vjp_fn(g)`` pulls the output cotangent ``g`` back to ``x`` -- a single forward
+    pass reused across cotangents (``Var.backward`` re-seeds and re-zeros each call). This
+    is the one low-level reverse primitive pycograd did not previously expose."""
+
+    def maker(*args: PyTree, **kwargs: PyTree) -> tuple[Callable[..., PyTree], PyTree]:
+        out_var, x_var = _forward_for_vjp(f, args, kwargs, argnum)
+        ans = np.asarray(out_var.value)
+
+        def vjp_fn(g: PyTree) -> PyTree:
+            cot = _xp().asarray(_value(cast(Operand, g)), dtype=float)
+            out_var.backward(cotangent=cot)
+            return np.asarray(x_var.grad)
+
+        return vjp_fn, ans
+
+    return maker
 
 
 def gradient_descent(

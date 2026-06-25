@@ -164,11 +164,16 @@ from pycograd.tensor import Var, detach
 from pycograd.tracer import AutodiffTracer, resolve_call
 from pycograd.training import accuracy, fit, train
 from pycograd.transforms import (
+    elementwise_grad,
     grad,
     gradient_descent,
+    hessian,
     jacfwd,
+    jacobian,
     jacrev,
     jvp,
+    make_jvp,
+    make_vjp,
     value_and_grad,
     vmap,
 )
@@ -218,6 +223,11 @@ __all__ = [
     "jvp",
     "jacfwd",
     "jacrev",
+    "jacobian",
+    "hessian",
+    "elementwise_grad",
+    "make_jvp",
+    "make_vjp",
     "gradient_descent",
     "sgd_update",
     "train",
