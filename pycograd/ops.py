@@ -691,6 +691,111 @@ def contraction_abstract_rule(prim: Prim) -> Callable[..., Boxed]:
 
 
 # ---------------------------------------------------------------------------
+# Axis-reordering ops (np.moveaxis / np.swapaxes / np.rollaxis) -- each is a *transpose*
+# with a permutation computed from the operand rank and the (host-side) axis arguments, so
+# they lower to ``d_transpose`` exactly as the contraction ops lower to ``d_einsum``. No
+# ``_VJP_FOR`` entry (the tape records ``d_transpose``); only the transform tables delegate.
+# ---------------------------------------------------------------------------
+def _as_axis_list(a: Any) -> list[int]:
+    return list(a) if isinstance(a, (list, tuple)) else [int(a)]
+
+
+def moveaxis_perm(ndim: int, source: Any, destination: Any) -> tuple[int, ...]:
+    src = [s % ndim for s in _as_axis_list(source)]
+    dst = [d % ndim for d in _as_axis_list(destination)]
+    order = [n for n in range(ndim) if n not in src]
+    for d, s in sorted(zip(dst, src)):
+        order.insert(d, s)
+    return tuple(order)
+
+
+def swapaxes_perm(ndim: int, axis1: int, axis2: int) -> tuple[int, ...]:
+    perm = list(range(ndim))
+    a1, a2 = axis1 % ndim, axis2 % ndim
+    perm[a1], perm[a2] = perm[a2], perm[a1]
+    return tuple(perm)
+
+
+def rollaxis_perm(ndim: int, axis: int, start: int = 0) -> tuple[int, ...]:
+    axis %= ndim
+    if start < 0:
+        start += ndim
+    if start > axis:
+        start -= 1
+    axes = list(range(ndim))
+    axes.remove(axis)
+    axes.insert(start, axis)
+    return tuple(axes)
+
+
+def d_moveaxis(x: Operand, source: Any, destination: Any) -> Var:
+    return d_transpose(x, moveaxis_perm(_logical_ndim(x), source, destination))
+
+
+def d_swapaxes(x: Operand, axis1: int, axis2: int) -> Var:
+    return d_transpose(x, swapaxes_perm(_logical_ndim(x), axis1, axis2))
+
+
+def d_rollaxis(x: Operand, axis: int, start: int = 0) -> Var:
+    return d_transpose(x, rollaxis_perm(_logical_ndim(x), axis, start))
+
+
+def _transpose_lowering_transform(
+    perm_builder: Callable[..., tuple[int, ...]],
+) -> Callable[..., Boxed]:
+    from pycograd.trace import bind
+
+    def rule(_trace: Boxed, x: Boxed, *args: Any, **kw: Any) -> Boxed:
+        perm = perm_builder(_logical_ndim(x), *args, **kw)
+        return bind(d_transpose, x, axes=perm)
+
+    return rule
+
+
+def _transpose_lowering_abstract(
+    perm_builder: Callable[..., tuple[int, ...]],
+) -> Callable[..., Boxed]:
+    def rule(x: Boxed, *args: Any, **kw: Any) -> Boxed:
+        from pycograd.shapes import abstract_transpose
+
+        perm = perm_builder(_logical_ndim(x), *args, **kw)
+        return cast(Boxed, abstract_transpose(cast(Any, x), perm))
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
+# Triangular ops (np.tril / np.triu) -- multiply by a constant lower/upper-triangular mask
+# (applied to the final two axes, like numpy). A composition of ``d_mul`` with a stop-
+# gradient mask, so again only the transform tables delegate; the tape records ``d_mul``.
+# ---------------------------------------------------------------------------
+def d_tril(x: Operand, k: int = 0) -> Var:
+    x2, xp = _lift(x), _xp()
+    return cast(Var, x2 * xp.tril(xp.ones_like(x2.value), k))
+
+
+def d_triu(x: Operand, k: int = 0) -> Var:
+    x2, xp = _lift(x), _xp()
+    return cast(Var, x2 * xp.triu(xp.ones_like(x2.value), k))
+
+
+def _tri_lowering_transform(np_tri: Callable[..., Array]) -> Callable[..., Boxed]:
+    from pycograd.trace import bind
+
+    def rule(_trace: Boxed, x: Boxed, k: int = 0, **kw: Any) -> Boxed:
+        mask = np_tri(_xp().ones(tuple(cast(Any, x).shape)), k)
+        return bind(d_mul, x, mask)
+
+    return rule
+
+
+def _tri_lowering_abstract(x: Boxed, k: int = 0, **kw: Any) -> Boxed:
+    from pycograd.shapes import abstract_unary
+
+    return cast(Boxed, abstract_unary(cast(Any, x)))
+
+
+# ---------------------------------------------------------------------------
 # Cumulative sum -- a fused primitive (linear; no composition expresses the prefix
 # sum). The VJP is a reverse cumulative sum (flip -> cumsum -> flip).
 # ---------------------------------------------------------------------------
@@ -1154,6 +1259,11 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_einsum: (np.einsum,),
     d_cumsum: (np.cumsum,),
     d_transpose: (np.transpose,),
+    d_moveaxis: (np.moveaxis,),
+    d_swapaxes: (np.swapaxes,),
+    d_rollaxis: (np.rollaxis,),
+    d_tril: (np.tril,),
+    d_triu: (np.triu,),
     d_reshape: (np.reshape,),
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),

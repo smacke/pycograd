@@ -75,6 +75,13 @@ this work** — see below).
   on the tape and need no separate `_VJP_FOR` entry. Flipped ~11 more tests green (suite now
   235 passed / 158 skipped). `np.outer`/`np.trace`/`np.kron`/general broadcast `np.matmul`
   remain (see gaps). Native regression: `test/test_contraction_ops.py`.
+* **Array-manipulation (axis reorder + triangular)** (fourth bridging PR, first batch):
+  `np.moveaxis`/`np.swapaxes`/`np.rollaxis` lower to `d_transpose` (a permutation built from
+  the operand rank), and `np.tril`/`np.triu` lower to `d_mul` against a constant triangular
+  mask -- same einsum-style delegation (eager + forward/vmap/eval_shape rules, no separate
+  `_VJP_FOR`). Flipped ~10 more tests green (suite now 245 passed / 148 skipped). Remaining in
+  this bucket: `repeat`/`tile`/`split` family/`diag`/`roll`/`pad`/`diff`/`sort`/etc. Native
+  regression: `test/test_manip_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

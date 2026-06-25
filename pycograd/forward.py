@@ -657,6 +657,11 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_dot: ops.contraction_transform_rule(ops.d_dot),
             ops.d_inner: ops.contraction_transform_rule(ops.d_inner),
             ops.d_tensordot: ops.contraction_transform_rule(ops.d_tensordot),
+            ops.d_moveaxis: ops._transpose_lowering_transform(ops.moveaxis_perm),
+            ops.d_swapaxes: ops._transpose_lowering_transform(ops.swapaxes_perm),
+            ops.d_rollaxis: ops._transpose_lowering_transform(ops.rollaxis_perm),
+            ops.d_tril: ops._tri_lowering_transform(np.tril),
+            ops.d_triu: ops._tri_lowering_transform(np.triu),
             ops.d_einsum: _einsum_rule,
             # cumsum is linear: the tangent is the cumsum of the tangent.
             ops.d_cumsum: _linear_for(ops.d_cumsum),
