@@ -144,6 +144,83 @@ def d_reciprocal(x: Operand) -> Var:
     return x._unary(xp.reciprocal(x.value), lambda a, g: -g / (a * a), d_reciprocal)
 
 
+def d_tan(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    c = xp.cos(x.value)
+    return x._unary(xp.tan(x.value), lambda a, g: g / (c * c), d_tan)
+
+
+def d_arcsin(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arcsin(x.value), lambda a, g: g / xp.sqrt(1 - a * a), d_arcsin)
+
+
+def d_arccos(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arccos(x.value), lambda a, g: -g / xp.sqrt(1 - a * a), d_arccos)
+
+
+def d_arctanh(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arctanh(x.value), lambda a, g: g / (1 - a * a), d_arctanh)
+
+
+def d_arcsinh(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arcsinh(x.value), lambda a, g: g / xp.sqrt(a * a + 1), d_arcsinh)
+
+
+def d_arccosh(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.arccosh(x.value), lambda a, g: g / xp.sqrt(a * a - 1), d_arccosh)
+
+
+def d_exp2(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    v = xp.exp2(x.value)
+    return x._unary(v, lambda a, g: g * v * math.log(2.0), d_exp2)
+
+
+def d_log2(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.log2(x.value), lambda a, g: g / (a * math.log(2.0)), d_log2)
+
+
+def d_log10(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.log10(x.value), lambda a, g: g / (a * math.log(10.0)), d_log10)
+
+
+def d_deg2rad(x: Operand) -> Var:
+    # Also backs ``np.radians`` (a numpy alias for ``deg2rad``); derivative is the constant
+    # ``pi/180``.
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.deg2rad(x.value), lambda a, g: g * (math.pi / 180.0), d_deg2rad)
+
+
+def d_rad2deg(x: Operand) -> Var:
+    # Also backs ``np.degrees``; derivative is the constant ``180/pi``.
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.rad2deg(x.value), lambda a, g: g * (180.0 / math.pi), d_rad2deg)
+
+
+def d_sign(x: Operand) -> Var:
+    # ``sign`` is piecewise-constant: its derivative is zero a.e. (the kink at 0 is ignored,
+    # matching autograd / the ``forward.py`` mask convention).
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.sign(x.value), lambda a, g: g * 0.0, d_sign)
+
+
+def d_ceil(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.ceil(x.value), lambda a, g: g * 0.0, d_ceil)
+
+
+def d_floor(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    return x._unary(xp.floor(x.value), lambda a, g: g * 0.0, d_floor)
+
+
 # ---------------------------------------------------------------------------
 # Elementwise binary / selection.
 # ---------------------------------------------------------------------------
@@ -870,9 +947,25 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_sinh: (np.sinh, math.sinh),
     d_cosh: (np.cosh, math.cosh),
     d_arctan: (np.arctan, math.atan),
+    d_tan: (np.tan, math.tan),
+    d_arcsin: (np.arcsin, math.asin),
+    d_arccos: (np.arccos, math.acos),
+    d_arctanh: (np.arctanh, math.atanh),
+    d_arcsinh: (np.arcsinh, math.asinh),
+    d_arccosh: (np.arccosh, math.acosh),
+    d_exp2: (np.exp2,),
+    d_log2: (np.log2, math.log2),
+    d_log10: (np.log10, math.log10),
+    # ``radians`` / ``degrees`` are numpy aliases for ``deg2rad`` / ``rad2deg``.
+    d_deg2rad: (np.deg2rad, np.radians, math.radians),
+    d_rad2deg: (np.rad2deg, np.degrees, math.degrees),
+    d_sign: (np.sign,),
+    d_ceil: (np.ceil,),
+    d_floor: (np.floor,),
     d_log1p: (np.log1p, math.log1p),
     d_expm1: (np.expm1, math.expm1),
-    d_abs: (np.abs,),
+    # ``np.fabs`` is ``abs`` for real inputs -- reuse ``d_abs``'s kernel/rules.
+    d_abs: (np.abs, np.fabs),
     d_square: (np.square,),
     d_reciprocal: (np.reciprocal,),
     # elementwise binary
@@ -978,6 +1071,34 @@ def _vjp_unary_derivs() -> dict[Prim, Callable[[Boxed], Boxed]]:
         d_sinh: lambda a: _b(d_cosh, a),
         d_cosh: lambda a: _b(d_sinh, a),
         d_arctan: lambda a: _b(d_reciprocal, _b(d_add, 1.0, _b(d_mul, a, a))),
+        # tan' = 1/cos^2
+        d_tan: lambda a: _b(d_reciprocal, _b(d_mul, _b(d_cos, a), _b(d_cos, a))),
+        # arcsin' = 1/sqrt(1-a^2); arccos' = -that
+        d_arcsin: lambda a: _b(
+            d_reciprocal, _b(d_sqrt, _b(d_sub, 1.0, _b(d_mul, a, a)))
+        ),
+        d_arccos: lambda a: _b(
+            d_neg, _b(d_reciprocal, _b(d_sqrt, _b(d_sub, 1.0, _b(d_mul, a, a))))
+        ),
+        # arctanh' = 1/(1-a^2)
+        d_arctanh: lambda a: _b(d_reciprocal, _b(d_sub, 1.0, _b(d_mul, a, a))),
+        # arcsinh' = 1/sqrt(a^2+1); arccosh' = 1/sqrt(a^2-1)
+        d_arcsinh: lambda a: _b(
+            d_reciprocal, _b(d_sqrt, _b(d_add, _b(d_mul, a, a), 1.0))
+        ),
+        d_arccosh: lambda a: _b(
+            d_reciprocal, _b(d_sqrt, _b(d_sub, _b(d_mul, a, a), 1.0))
+        ),
+        # exp2' = ln2 * 2^a; log2' = 1/(a ln2); log10' = 1/(a ln10)
+        d_exp2: lambda a: _b(d_mul, math.log(2.0), _b(d_exp2, a)),
+        d_log2: lambda a: _b(d_reciprocal, _b(d_mul, math.log(2.0), a)),
+        d_log10: lambda a: _b(d_reciprocal, _b(d_mul, math.log(10.0), a)),
+        # constant-derivative angle conversions; zero-derivative step functions
+        d_deg2rad: lambda a: math.pi / 180.0,
+        d_rad2deg: lambda a: 180.0 / math.pi,
+        d_sign: lambda a: 0.0,
+        d_ceil: lambda a: 0.0,
+        d_floor: lambda a: 0.0,
         d_log1p: lambda a: _b(d_reciprocal, _b(d_add, 1.0, a)),
         d_expm1: lambda a: _b(d_exp, a),
         d_square: lambda a: _b(d_mul, 2.0, a),

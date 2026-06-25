@@ -52,6 +52,14 @@ this work** — see below).
   given order; default `None` keeps the existing tuple-over-all-args behavior) and **`**kwargs`**
   passthrough (held fixed), via selective lifting — only the differentiated argument is put on
   the tape, so an op applied to a *held* argument (e.g. `np.tan`) needs no rule.
+* **Unary ufunc VJP rules** (first bridging PR): `tan`, `arcsin`, `arccos`, `arctanh`,
+  `arcsinh`, `arccosh`, `exp2`, `log2`, `log10`, `deg2rad`/`rad2deg`/`radians`/`degrees`,
+  the zero-gradient step ufuncs `sign`/`ceil`/`floor`, and `fabs` (→ `d_abs`). Each is a
+  `d_*` primitive registered across all four parity-checked tables (`_RULES`/`_UNARY_DERIV`,
+  forward `_JVP`, `_BATCH`, `_ABSTRACT`); the local derivative is written once in
+  `_UNARY_DERIV` and shared by the reverse and forward rules. This flipped ~29 previously
+  skipped tests green (14 in `test_scalar_ops`, ~15 across `test_systematic`/`test_numpy`).
+  Native regression coverage: `test/test_unary_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new
@@ -74,7 +82,7 @@ a `d_*` rule + registering it for the op would flip the corresponding tests gree
 | **numpy *function* forms of arithmetic**: `np.add`/`subtract`/`multiply`/`divide`/`true_divide`/`power`/`mod`/`remainder` and `op.*` | ~15 | the *operators* (`+ - * / **`) work in reverse; the function aliases don't dispatch to a rule. Also forward-mode of a **two-tracer bilinear op** (`x*y` differentiating both args) is unsupported. |
 | **triangular / diagonal**: `tril`, `triu`, `diag` | ~11 | |
 | **split family**: `split`, `vsplit`, `hsplit`, `dsplit`, `array_split` | ~11 | inverse of concatenate |
-| **unary ufuncs**: `tan`, `sign`, `ceil`, `floor`, `fabs`, `exp2`, `log2`, `log10`, `arcsin`, `arccos`, `arccosh`, `arcsinh`, `arctanh`, `rad2deg`/`deg2rad`/`radians`/`degrees`, `sinc` | ~17 (also in test_scalar_ops) | each is a one-line `d_*` rule |
+| **unary ufuncs** — ✅ *landed* (`tan`, inverse-trig, `exp2`/`log2`/`log10`, deg/rad, `sign`/`ceil`/`floor`, `fabs`); only **`sinc`** remains (fiddly derivative, deferred) | 1 left | done in the first bridging PR |
 | `np.prod`, `np.std` (ddof), `np.cumsum` (function form), `nan_to_num`, integer cast, `np.array([...])` of boxes | ~10 | misc reductions/constructors |
 | `einsum` with ≥3 operands / explicit-axes (operand-index tuple) form | ~6 | the 2-operand subscript form works |
 | `fmax`/`fmin`/`logaddexp`/`logaddexp2`/`arctan2`/`hypot` | ~6 | binary, no rule |
@@ -132,9 +140,7 @@ Documented so they aren't mistaken for regressions:
 
 ## Suggested first PRs (best parity-per-line)
 
-1. **Unary ufunc rules** (`tan`, `arcsin`/`arccos`/`arctanh`/`arccosh`/`arcsinh`, `exp2`/`log2`/
-   `log10`, `sign`/`ceil`/`floor`/`fabs`, deg/rad conversions, `sinc`). Each is a one-line
-   derivative; flips ~17 scalar_ops + systematic/numpy tests.
+1. ~~**Unary ufunc rules**~~ — ✅ **done** (see "What was landed"); only `sinc` left.
 2. **numpy *function* forms** of the arithmetic operators + `np.prod` — wire `np.add`/`multiply`/
    `divide`/`power`/`mod`/`negative`/`true_divide` to the existing operator rules.
 3. **Tensor contraction** (`np.dot` general, `tensordot`, `inner`, `outer`) — reuse the existing

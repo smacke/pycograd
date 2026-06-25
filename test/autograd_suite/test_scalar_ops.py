@@ -29,7 +29,6 @@ def test_sin():
     check_grads(fun)(npr.randn())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.sign")
 def test_sign():
     fun = lambda x: 3.0 * np.sign(x)
     check_grads(fun)(1.1)
@@ -46,13 +45,11 @@ def test_log():
     check_grads(fun)(abs(npr.randn()))
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.log2")
 def test_log2():
     fun = lambda x: 3.0 * np.log2(x)
     check_grads(fun)(abs(npr.randn()))
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.log10")
 def test_log10():
     fun = lambda x: 3.0 * np.log10(x)
     check_grads(fun)(abs(npr.randn()))
@@ -68,7 +65,6 @@ def test_expm1():
     check_grads(fun)(abs(npr.randn()))
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.exp2")
 def test_exp2():
     fun = lambda x: 3.0 * np.exp2(x)
     check_grads(fun)(abs(npr.randn()))
@@ -84,7 +80,6 @@ def test_cos():
     check_grads(fun)(npr.randn())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.tan")
 def test_tan():
     fun = lambda x: 3.0 * np.tan(x)
     check_grads(fun)(npr.randn())
@@ -105,13 +100,11 @@ def test_tanh():
     check_grads(fun)(npr.randn())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.arccos")
 def test_arccos():
     fun = lambda x: 3.0 * np.arccos(x)
     check_grads(fun)(0.1)
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.arcsin")
 def test_arcsin():
     fun = lambda x: 3.0 * np.arcsin(x)
     check_grads(fun)(0.1)
@@ -122,19 +115,16 @@ def test_arctan():
     check_grads(fun)(0.2)
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.arccosh")
 def test_arccosh():
     fun = lambda x: 3.0 * np.arccosh(x)
     check_grads(fun)(npr.randn() ** 2 + 1.2)
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.arcsinh")
 def test_arcsinh():
     fun = lambda x: 3.0 * np.arcsinh(x)
     check_grads(fun)(npr.randn())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.arctanh")
 def test_arctanh():
     fun = lambda x: 3.0 * np.arctanh(x)
     check_grads(fun)(0.2)
@@ -251,25 +241,21 @@ def test_negative():
     check_grads(fun)(npr.rand())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.rad2deg")
 def test_rad2deg():
     fun = lambda x: 3.0 * np.rad2deg(x)
     check_grads(fun)(10.0 * npr.rand())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.deg2rad")
 def test_deg2rad():
     fun = lambda x: 3.0 * np.deg2rad(x)
     check_grads(fun)(10.0 * npr.rand())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.radians")
 def test_radians():
     fun = lambda x: 3.0 * np.radians(x)
     check_grads(fun)(10.0 * npr.rand())
 
 
-@pytest.mark.skip(reason="pycograd-gap: no VJP rule for np.degrees")
 def test_degrees():
     fun = lambda x: 3.0 * np.degrees(x)
     check_grads(fun)(10.0 * npr.rand())

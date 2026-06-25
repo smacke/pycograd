@@ -131,7 +131,7 @@ def just_math_exp(x):
 
 
 def uses_unsupported(x):
-    return np.tan(x)  # no differentiation rule registered for np.tan
+    return np.cbrt(x)  # no differentiation rule registered for np.cbrt
 
 
 # --- user helper functions (no autodiff rules; differentiated via instrument-
@@ -149,7 +149,7 @@ def through_nested_helpers(w, b):
 
 
 def bad_helper(z):
-    return np.tan(z)  # unsupported inside a helper
+    return np.cbrt(z)  # unsupported inside a helper
 
 
 def through_bad_helper(x):
@@ -603,7 +603,7 @@ def test_grad_helper():
 
 def test_warns_on_unsupported_function():
     # A Var reaching an un-ruled numpy function warns (and then fails loud, since
-    # np.tan is a ufunc and Var opts out of ufuncs). Record so the warning is
+    # np.cbrt is a ufunc and Var opts out of ufuncs). Record so the warning is
     # captured even though a TypeError follows.
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
