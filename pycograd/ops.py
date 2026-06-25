@@ -570,6 +570,17 @@ def d_einsum(subscripts: str, *operands: Operand) -> Var:
 # ``x: object`` -- a duck-typed shape probe over the whole operand zoo (array / scalar /
 # ``Var`` / any ``Tracer`` / ``ShapedArray`` / ``Weight``), all of which either expose
 # ``.shape`` or are accepted by ``np.ndim``; a narrower type would not cover the union.
+def _on_tape(x: object) -> bool:
+    """True if ``x`` is a tape ``Var`` or a transform ``Tracer`` (i.e. a value being
+    differentiated). A *plain* array/scalar passing through a structural op (e.g. an integer
+    index built with ``np.repeat(np.arange(...))``) is a constant and must stay a plain
+    array, not be lifted onto the tape -- matching autograd, whose primitives only box when
+    an argument is already boxed."""
+    from pycograd.trace import Tracer
+
+    return isinstance(x, (Var, Tracer))
+
+
 def _logical_ndim(x: object) -> int:
     """The rank of an operand that may be a concrete array, a ``Var``, or a higher-level
     tracer / abstract value (all expose ``.shape``)."""
@@ -898,6 +909,8 @@ def d_roll(x: Operand, shift: Any, axis: Any = None) -> Var:
 
     if isinstance(x, Tracer):
         return cast(Var, bind(d_roll, x, shift, axis=axis))
+    if not isinstance(x, Var):
+        return cast(Var, _xp().roll(_xp().asarray(x), shift, axis=axis))
     x, xp = _lift(x), _xp()
     out = Var(xp.roll(x.value, shift, axis=axis), _parents=(x,))
 
@@ -923,6 +936,187 @@ def _roll_abstract(x: Boxed, shift: Any = None, axis: Any = None) -> Boxed:
     from pycograd.shapes import abstract_unary  # roll preserves shape
 
     return cast(Boxed, abstract_unary(cast(Any, x)))
+
+
+# ---------------------------------------------------------------------------
+# np.pad (constant mode) -- linear: place ``x`` into a larger zero-filled array. The VJP
+# slices the padded cotangent back to ``x``'s region (a getitem adjoint); the forward pads
+# the tangent with zeros (the pad constant does not depend on ``x``).
+# ---------------------------------------------------------------------------
+def normalize_pad_width(pad_width: Any, ndim: int) -> tuple[tuple[int, int], ...]:
+    """numpy's ``pad_width`` broadcasting -> one explicit ``(before, after)`` per axis."""
+    if isinstance(pad_width, (int, np.integer)):
+        return tuple((int(pad_width), int(pad_width)) for _ in range(ndim))
+    items = list(pad_width)
+    if all(isinstance(e, (int, np.integer)) for e in items):
+        if len(items) == 1:
+            return tuple((int(items[0]), int(items[0])) for _ in range(ndim))
+        return tuple((int(items[0]), int(items[1])) for _ in range(ndim))
+    if len(items) == 1:  # ((before, after),) broadcast to all axes
+        b, a = items[0]
+        return tuple((int(b), int(a)) for _ in range(ndim))
+    return tuple((int(b), int(a)) for b, a in items)
+
+
+def d_pad(x: Operand, pad_width: Any, mode: str = "constant", **kw: Any) -> Var:
+    if not _on_tape(x):
+        return cast(Var, _xp().pad(_xp().asarray(x), pad_width, mode=mode, **kw))
+    if mode != "constant":
+        raise NotImplementedError(
+            f"pad: only mode='constant' is differentiable so far (got {mode!r})"
+        )
+    x, xp = _lift(x), _xp()
+    out = Var(xp.pad(x.value, pad_width, mode=mode, **kw), _parents=(x,))
+    pw = normalize_pad_width(pad_width, x.value.ndim)
+    sl = tuple(slice(b, b + n) for (b, _a), n in zip(pw, x.value.shape))
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, out.grad[sl])
+
+    out._backward = _backward
+    _record_vjp(out, d_pad, (x,), {"slices": sl})
+    return out
+
+
+def _vjp_pad(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    return [_b(d_getitem, g, params["slices"])]
+
+
+def _pad_abstract(x: Boxed, pad_width: Any, mode: str = "constant", **kw: Any) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, x))
+    pw = normalize_pad_width(pad_width, len(a.shape))
+    out_shape = tuple(d + b + af for d, (b, af) in zip(a.shape, pw))
+    return cast(Boxed, ShapedArray(out_shape, a.dtype))
+
+
+# ---------------------------------------------------------------------------
+# np.repeat / np.tile -- linear "copy" ops whose VJP is the matching *sum over copies*.
+# ``repeats`` (np.repeat) and ``reps`` (np.tile) are integer constants here (the array-valued
+# ``repeats`` form is not supported).
+# ---------------------------------------------------------------------------
+def _repeat_grad_spec(
+    x_shape: tuple[int, ...], repeats: int, axis: Any
+) -> tuple[tuple[int, ...], int]:
+    """The ``(reshape_shape, sum_axis)`` whose ``reshape(g).sum(sum_axis)`` is the repeat
+    adjoint (``axis=None`` ravels first)."""
+    if axis is None:
+        n = int(np.prod(x_shape, dtype=np.int64))
+        return ((n, repeats), 1)
+    ax = axis % len(x_shape)
+    new = x_shape[:ax] + (x_shape[ax], repeats) + x_shape[ax + 1 :]
+    return (new, ax + 1)
+
+
+def d_repeat(x: Operand, repeats: int, axis: Any = None) -> Var:
+    if not _on_tape(x):
+        return cast(Var, _xp().repeat(_xp().asarray(x), repeats, axis=axis))
+    x, xp = _lift(x), _xp()
+    out = Var(xp.repeat(x.value, repeats, axis=axis), _parents=(x,))
+    rshape, sax = _repeat_grad_spec(x.value.shape, repeats, axis)
+    x_shape = x.value.shape
+
+    def _backward() -> None:
+        x.grad = _accumulate(
+            x.grad, out.grad.reshape(rshape).sum(axis=sax).reshape(x_shape)
+        )
+
+    out._backward = _backward
+    _record_vjp(out, d_repeat, (x,), {"repeats": repeats, "axis": axis})
+    return out
+
+
+def _vjp_repeat(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    (x,) = operands
+    x_shape = _pshape(primals[0])
+    rshape, sax = _repeat_grad_spec(x_shape, params["repeats"], params["axis"])
+    summed = _b(d_sum, _b(d_reshape, g, rshape), axis=sax)
+    return [_b(d_reshape, summed, x_shape)]
+
+
+def _repeat_abstract(x: Boxed, repeats: int, axis: Any = None) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, x))
+    if axis is None:
+        return cast(
+            Boxed,
+            ShapedArray(
+                (int(np.prod(cast(Any, a.shape), dtype=np.int64)) * repeats,), a.dtype
+            ),
+        )
+    ax = axis % len(a.shape)
+    sh = list(a.shape)
+    sh[ax] = sh[ax] * repeats
+    return cast(Boxed, ShapedArray(tuple(sh), a.dtype))
+
+
+def _tile_dims(
+    x_shape: tuple[int, ...], reps: Any
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    rp = (
+        (int(reps),)
+        if isinstance(reps, (int, np.integer))
+        else tuple(int(r) for r in reps)
+    )
+    d = max(len(x_shape), len(rp))
+    xs = (1,) * (d - len(x_shape)) + tuple(x_shape)
+    rp = (1,) * (d - len(rp)) + rp
+    return xs, rp
+
+
+def d_tile(x: Operand, reps: Any) -> Var:
+    if not _on_tape(x):
+        return cast(Var, _xp().tile(_xp().asarray(x), reps))
+    x, xp = _lift(x), _xp()
+    out = Var(xp.tile(x.value, reps), _parents=(x,))
+    x_shape = x.value.shape
+    xs, rp = _tile_dims(x_shape, reps)
+    inter = tuple(v for pair in zip(rp, xs) for v in pair)  # (r0, x0, r1, x1, ...)
+    rep_axes = tuple(range(0, 2 * len(xs), 2))
+
+    def _backward() -> None:
+        x.grad = _accumulate(
+            x.grad, out.grad.reshape(inter).sum(axis=rep_axes).reshape(x_shape)
+        )
+
+    out._backward = _backward
+    _record_vjp(out, d_tile, (x,), {"reps": reps})
+    return out
+
+
+def _vjp_tile(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    (x,) = operands
+    x_shape = _pshape(primals[0])
+    xs, rp = _tile_dims(x_shape, params["reps"])
+    inter = tuple(v for pair in zip(rp, xs) for v in pair)
+    rep_axes = tuple(range(0, 2 * len(xs), 2))
+    summed = _b(d_sum, _b(d_reshape, g, inter), axis=rep_axes)
+    return [_b(d_reshape, summed, x_shape)]
+
+
+def _tile_abstract(x: Boxed, reps: Any) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, x))
+    xs, rp = _tile_dims(tuple(cast(Any, a.shape)), reps)
+    return cast(Boxed, ShapedArray(tuple(r * s for r, s in zip(rp, xs)), a.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -1395,6 +1589,9 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_tril: (np.tril,),
     d_triu: (np.triu,),
     d_roll: (np.roll,),
+    d_pad: (np.pad,),
+    d_repeat: (np.repeat,),
+    d_tile: (np.tile,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),
@@ -2049,6 +2246,9 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_sum: _vjp_sum,
             d_prod: _vjp_prod,
             d_roll: _vjp_roll,
+            d_pad: _vjp_pad,
+            d_repeat: _vjp_repeat,
+            d_tile: _vjp_tile,
             d_reshape: _vjp_reshape,
             d_broadcast_to: _vjp_broadcast_to,
             d_expand_dims: _vjp_reshape,  # expand_dims is a reshape; the VJP reshapes back

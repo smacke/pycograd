@@ -87,6 +87,14 @@ this work** — see below).
   reverse/forward/vmap/eval_shape rules), and `np.ravel`/`np.squeeze`/`np.atleast_{1,2,3}d`
   lowering to `d_reshape` (target shape computed from the operand shape). Flipped ~9 more
   tests green (suite now 254 passed / 139 skipped).
+* **Array-manipulation (segment/scatter)** (fourth PR, third batch): `np.pad` (constant mode --
+  linear; the VJP slices the padded cotangent back via `d_getitem`), `np.repeat`, and `np.tile`
+  (the VJP is the matching sum-over-copies), each with full reverse/forward/vmap/eval_shape
+  rules. The new structural primitives pass a *plain* (non-tape) input straight through to
+  numpy -- matching autograd, and a correctness fix so the conv `im2col` index arrays
+  (`np.repeat(np.arange(...))`) stay plain. Flipped ~8 more tests green (suite now 262 passed /
+  131 skipped). The forward checker (`_jvp`) was also adjusted to hold *structural positional*
+  args (e.g. `pad`'s `pad_width`) fixed rather than lifting them to tracers.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

@@ -445,6 +445,45 @@ def _roll_rule(
     )
 
 
+def _pad_rule(
+    trace: BatchTrace, x: Boxed, pad_width: Any, mode: str = "constant", **kw: Any
+) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(
+            trace, bind(ops.d_pad, t.value, pad_width, mode=mode, **kw), None
+        )
+    # Batch axis at the front: pad it by (0, 0) so only the logical axes are padded.
+    pw = ops.normalize_pad_width(pad_width, _logical_ndim(t))
+    full = ((0, 0),) + pw
+    return _result(
+        trace, bind(ops.d_pad, _move_bdim_to_front(t), full, mode=mode, **kw), 0
+    )
+
+
+def _repeat_rule(
+    trace: BatchTrace, x: Boxed, repeats: Any, axis: Any = None
+) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_repeat, t.value, repeats, axis=axis), None)
+    if axis is None:
+        raise NotImplementedError("vmap(np.repeat) with axis=None is not supported")
+    ax = axis % _logical_ndim(t)
+    return _result(
+        trace, bind(ops.d_repeat, _move_bdim_to_front(t), repeats, axis=ax + 1), 0
+    )
+
+
+def _tile_rule(trace: BatchTrace, x: Boxed, reps: Any) -> BatchTracer:
+    t = trace._raise(x)
+    if t.bdim is None:
+        return _result(trace, bind(ops.d_tile, t.value, reps), None)
+    # numpy right-aligns ``reps`` to the array shape, so the leading batch axis (at the
+    # front) gets an implicit ``reps=1`` and is left untiled.
+    return _result(trace, bind(ops.d_tile, _move_bdim_to_front(t), reps), 0)
+
+
 # -- getitem (incl. batched gather) -----------------------------------------
 def _getitem_rule(trace: BatchTrace, x: Boxed, key: Index) -> BatchTracer:
     tx = trace._raise(x)
@@ -654,6 +693,9 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_tril: ops._tri_lowering_transform(np.tril),
             ops.d_triu: ops._tri_lowering_transform(np.triu),
             ops.d_roll: _roll_rule,
+            ops.d_pad: _pad_rule,
+            ops.d_repeat: _repeat_rule,
+            ops.d_tile: _tile_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),

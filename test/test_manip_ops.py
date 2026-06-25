@@ -131,3 +131,45 @@ def test_roll_jvp_and_vmap():
     v = np.asarray(vmap(lambda m: np.roll(m, 1, axis=1))(np.stack([_A, _A + 0.1])))
     assert v.shape == (2, 3, 4)
     assert np.allclose(v[0], np.roll(_A, 1, axis=1))
+
+
+# --- pad / repeat / tile (segment/scatter adjoints) ------------------------
+def f_pad(x):
+    return np.sum(np.pad(x, ((1, 2), (3, 4))) ** 2)
+
+
+def f_repeat0(x):
+    return np.sum(np.repeat(x, 2, axis=0) ** 2)
+
+
+def f_repeat_none(x):
+    return np.sum(np.repeat(x, 3) ** 2)
+
+
+def f_tile(x):
+    return np.sum(np.tile(x, (2, 3)) ** 2)
+
+
+@pytest.mark.parametrize("fn", [f_pad, f_repeat0, f_repeat_none, f_tile])
+def test_segment_grad_vs_fd(fn):
+    assert np.allclose(np.asarray(grad(fn)(_A)[0]), _fd(fn, _A), atol=1e-5)
+    assert eval_shape(fn, _A).shape == ()
+
+
+def test_pad_eval_shape_and_vmap():
+    assert eval_shape(lambda x: np.pad(x, 2), _A).shape == (7, 8)
+    v = np.asarray(vmap(lambda m: np.pad(m, ((1, 1), (2, 2))))(np.stack([_A, _A])))
+    assert v.shape == (2, 5, 8)
+    assert np.allclose(v[0], np.pad(_A, ((1, 1), (2, 2))))
+
+
+def f_uses_index_repeat(x):
+    # np.repeat/np.tile on a *plain* index array must stay a plain array (not a tape Var),
+    # so fancy indexing still works -- regression for the conv im2col index path.
+    idx = np.repeat(np.arange(x.shape[0]), 1)
+    return np.sum(x[idx] ** 2)
+
+
+def test_structural_ops_pass_through_plain_indices():
+    g = np.asarray(grad(f_uses_index_repeat)(_A)[0])
+    assert np.allclose(g, _fd(f_uses_index_repeat, _A), atol=1e-5)

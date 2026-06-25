@@ -392,6 +392,33 @@ def _roll_rule(trace: JVPTrace, x: Boxed, shift: Any, axis: Any = None) -> JVPTr
     return _result(trace, primal_out, tangent_out)
 
 
+def _pad_rule(
+    trace: JVPTrace, x: Boxed, pad_width: Any, mode: str = "constant", **kw: Any
+) -> JVPTracer:
+    """``pad`` (constant mode) is linear: pad the tangent with *zeros* (the pad constant
+    does not depend on ``x``)."""
+    t = trace._raise(x)
+    primal_out = bind(ops.d_pad, t.primal, pad_width, mode=mode, **kw)
+    tangent_out = bind(ops.d_pad, t.tangent, pad_width, mode="constant")
+    return _result(trace, primal_out, tangent_out)
+
+
+def _repeat_rule(
+    trace: JVPTrace, x: Boxed, repeats: Any, axis: Any = None
+) -> JVPTracer:
+    t = trace._raise(x)
+    primal_out = bind(ops.d_repeat, t.primal, repeats, axis=axis)
+    tangent_out = bind(ops.d_repeat, t.tangent, repeats, axis=axis)
+    return _result(trace, primal_out, tangent_out)
+
+
+def _tile_rule(trace: JVPTrace, x: Boxed, reps: Any) -> JVPTracer:
+    t = trace._raise(x)
+    return _result(
+        trace, bind(ops.d_tile, t.primal, reps), bind(ops.d_tile, t.tangent, reps)
+    )
+
+
 def _select_for(prim: Prim) -> Rule:
     """max / min of two operands: route each operand's tangent through wherever that
     operand was selected (``mask = primal_out == operand``)."""
@@ -671,6 +698,9 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_tril: ops._tri_lowering_transform(np.tril),
             ops.d_triu: ops._tri_lowering_transform(np.triu),
             ops.d_roll: _roll_rule,
+            ops.d_pad: _pad_rule,
+            ops.d_repeat: _repeat_rule,
+            ops.d_tile: _tile_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),

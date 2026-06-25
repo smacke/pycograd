@@ -141,22 +141,32 @@ def _vjp(fun, args, kwargs, argnum):
 def _jvp(fun, args, kwargs, argnum, v):
     """Forward-mode tangent ``df(args) . v`` w.r.t. the ``argnum`` argument(s)."""
     idxs = _idxs(argnum)
-    if isinstance(argnum, int):
-        parts = {argnum: v}
-    else:
-        parts = dict(zip(argnum, v))
+    primitive = (
+        _traceable(fun) is not fun
+    )  # a bare ufunc/builtin (no instrumentable source)
+    if kwargs or primitive:
+        # Hold every non-``argnum`` argument (positional *and* keyword) fixed in a closure and
+        # ``jvp`` only over the differentiated argument(s). This keeps a *structural*
+        # positional argument -- ``np.pad(x, pad_width, mode)``'s ``pad_width``/``mode`` -- a
+        # plain constant instead of letting ``jvp`` lift it to a tracer. For a primitive
+        # ``fun`` the single woven call routes through the rule with those constants intact.
+        def picked(*da):
+            full = list(args)
+            for i, d in zip(idxs, da):
+                full[i] = d
+            return fun(*full, **kwargs)
+
+        diff = tuple(args[i] for i in idxs)
+        tang = (v,) if isinstance(argnum, int) else tuple(v)
+        _, tangent = _pg_jvp(picked, diff, tang)
+        return tangent
+    # A composite (source-bearing) ``fun`` with no kwargs: instrument it directly so its
+    # internal ``np.*`` calls are woven; the held numeric args carry a zero tangent.
+    parts = {argnum: v} if isinstance(argnum, int) else dict(zip(argnum, v))
     tangents = tuple(
         parts[i] if i in idxs else _zeros_like_tree(a) for i, a in enumerate(args)
     )
-    if kwargs:
-        # Bind kwargs into a closure; for a primitive ``fun`` the woven call forwards them
-        # to the rule, which is the case combo_check exercises (axis=/keepdims=).
-        def bound(*a):
-            return fun(*a, **kwargs)
-
-        primal, tangent = _pg_jvp(bound, tuple(args), tangents)
-    else:
-        primal, tangent = _pg_jvp(_traceable(fun), tuple(args), tangents)
+    _, tangent = _pg_jvp(fun, tuple(args), tangents)
     return tangent
 
 
