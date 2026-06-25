@@ -560,6 +560,137 @@ def d_einsum(subscripts: str, *operands: Operand) -> Var:
 
 
 # ---------------------------------------------------------------------------
+# Tensor contraction ops (np.dot / np.inner / np.outer / np.tensordot) -- each *lowers to
+# einsum*: the eager call and all three transform rules build the appropriate einsum
+# subscript from the operand ranks and dispatch ``d_einsum``, which already carries the
+# reverse / forward / vmap / shape rules. So these ops appear only in the forward / batch /
+# abstract tables (delegating to einsum); they never become tape nodes themselves (the tape
+# records the underlying ``d_einsum``), so they need no ``_VJP_FOR`` entry.
+# ---------------------------------------------------------------------------
+# ``x: object`` -- a duck-typed shape probe over the whole operand zoo (array / scalar /
+# ``Var`` / any ``Tracer`` / ``ShapedArray`` / ``Weight``), all of which either expose
+# ``.shape`` or are accepted by ``np.ndim``; a narrower type would not cover the union.
+def _logical_ndim(x: object) -> int:
+    """The rank of an operand that may be a concrete array, a ``Var``, or a higher-level
+    tracer / abstract value (all expose ``.shape``)."""
+    shp = getattr(x, "shape", None)
+    if shp is not None:
+        return len(cast(Any, shp))
+    return int(np.ndim(cast(Any, x)))  # a raw scalar/array
+
+
+def _abc(n: int, start: int) -> str:
+    import string
+
+    return string.ascii_lowercase[start : start + n]
+
+
+def dot_subscript(na: int, nb: int) -> str:
+    """``np.dot``: last axis of ``a`` contracts with the second-to-last of ``b`` (or the
+    single axis of a 1-D ``b``)."""
+    if na == 1 and nb == 1:
+        return "i,i->"
+    la = _abc(na, 0)
+    if nb == 1:
+        return f"{la},{la[-1]}->{la[:-1]}"
+    lb = list(_abc(nb, na))
+    lb[nb - 2] = la[-1]  # contraction axis of b shares a's last label
+    lbs = "".join(lb)
+    out = la[:-1] + "".join(c for k, c in enumerate(lbs) if k != nb - 2)
+    return f"{la},{lbs}->{out}"
+
+
+def inner_subscript(na: int, nb: int) -> str:
+    """``np.inner``: the last axes of both operands contract."""
+    la = _abc(na, 0)
+    lb = list(_abc(nb, na))
+    lb[-1] = la[-1]
+    lbs = "".join(lb)
+    return f"{la},{lbs}->{la[:-1]}{lbs[:-1]}"
+
+
+def tensordot_subscript(na: int, nb: int, axes: Any) -> str:
+    """``np.tensordot``: contract the given axis pairs (``axes`` an int N -> last N of ``a``
+    with first N of ``b``; or a pair of axis lists)."""
+    if isinstance(axes, int):
+        a_ax = list(range(na - axes, na))
+        b_ax = list(range(axes))
+    else:
+        a_raw, b_raw = axes
+        a_ax = [
+            a % na for a in (a_raw if isinstance(a_raw, (list, tuple)) else [a_raw])
+        ]
+        b_ax = [
+            b % nb for b in (b_raw if isinstance(b_raw, (list, tuple)) else [b_raw])
+        ]
+    la = list(_abc(na, 0))
+    lb = list(_abc(nb, na))
+    for ai, bi in zip(a_ax, b_ax):
+        lb[bi] = la[ai]  # contracted pair shares a label
+    out = [la[k] for k in range(na) if k not in a_ax]
+    out += [lb[k] for k in range(nb) if k not in b_ax]
+    return f"{''.join(la)},{''.join(lb)}->{''.join(out)}"
+
+
+def d_dot(a: Operand, b: Operand) -> Var:
+    na, nb = _logical_ndim(a), _logical_ndim(b)
+    if na == 0 or nb == 0:  # np.dot with a scalar is just multiplication
+        return cast(Var, _lift(a) * b)
+    return d_einsum(dot_subscript(na, nb), a, b)
+
+
+def d_inner(a: Operand, b: Operand) -> Var:
+    na, nb = _logical_ndim(a), _logical_ndim(b)
+    if na == 0 or nb == 0:
+        return cast(Var, _lift(a) * b)
+    return d_einsum(inner_subscript(na, nb), a, b)
+
+
+def d_tensordot(a: Operand, b: Operand, axes: Any = 2) -> Var:
+    na, nb = _logical_ndim(a), _logical_ndim(b)
+    return d_einsum(tensordot_subscript(na, nb, axes), a, b)
+
+
+def _contraction_subscript(prim: Prim, na: int, nb: int, params: dict[str, Any]) -> str:
+    if prim is d_dot:
+        return dot_subscript(na, nb)
+    if prim is d_inner:
+        return inner_subscript(na, nb)
+    return tensordot_subscript(na, nb, params.get("axes", 2))
+
+
+def contraction_transform_rule(prim: Prim) -> Callable[..., Boxed]:
+    """The forward (jvp) and batching (vmap) rule for a contraction op: build the einsum
+    subscript from the operand ranks and re-bind ``d_einsum`` (whose own rule then fires at
+    the live level). A scalar operand degrades to elementwise multiply."""
+    from pycograd.trace import bind
+
+    def rule(_trace: Boxed, a: Boxed, b: Boxed, **params: Any) -> Boxed:
+        na, nb = _logical_ndim(a), _logical_ndim(b)
+        if na == 0 or nb == 0:
+            return bind(d_mul, a, b)
+        return bind(d_einsum, _contraction_subscript(prim, na, nb, params), a, b)
+
+    return rule
+
+
+def contraction_abstract_rule(prim: Prim) -> Callable[..., Boxed]:
+    """The shape-inference (eval_shape) rule: delegate to ``abstract_einsum`` on the built
+    subscript."""
+
+    def rule(a: Boxed, b: Boxed, **params: Any) -> Boxed:
+        from pycograd.shapes import abstract_binary, abstract_einsum
+
+        na, nb = _logical_ndim(a), _logical_ndim(b)
+        if na == 0 or nb == 0:
+            return cast(Boxed, abstract_binary(cast(Any, a), cast(Any, b)))
+        sub = _contraction_subscript(prim, na, nb, params)
+        return cast(Boxed, abstract_einsum(sub, cast(Any, a), cast(Any, b)))
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
 # Cumulative sum -- a fused primitive (linear; no composition expresses the prefix
 # sum). The VJP is a reverse cumulative sum (flip -> cumsum -> flip).
 # ---------------------------------------------------------------------------
@@ -1016,7 +1147,10 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_max: (np.max, np.amax),
     d_min: (np.min, np.amin),
     # linear algebra / shape / structure
-    _matmul: (np.dot, np.matmul),
+    _matmul: (np.matmul,),
+    d_dot: (np.dot,),
+    d_inner: (np.inner,),
+    d_tensordot: (np.tensordot,),
     d_einsum: (np.einsum,),
     d_cumsum: (np.cumsum,),
     d_transpose: (np.transpose,),

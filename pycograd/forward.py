@@ -654,6 +654,9 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_mod: _mod_rule,
             ops.d_pow: _pow_rule,
             ops._matmul: _matmul_rule,
+            ops.d_dot: ops.contraction_transform_rule(ops.d_dot),
+            ops.d_inner: ops.contraction_transform_rule(ops.d_inner),
+            ops.d_tensordot: ops.contraction_transform_rule(ops.d_tensordot),
             ops.d_einsum: _einsum_rule,
             # cumsum is linear: the tangent is the cumsum of the tangent.
             ops.d_cumsum: _linear_for(ops.d_cumsum),

@@ -68,6 +68,13 @@ this work** — see below).
   (`np.prod`), each with reverse, forward (jvp), batching (vmap) and **shape-inference
   (eval_shape)** rules. Flipped ~44 more skipped tests green (the suite is now 224 passed /
   169 skipped). Native regression: `test/test_arith_reduce_ops.py`.
+* **Tensor contraction** (third bridging PR): `np.dot` (general -- routed off `_matmul` to a
+  new `d_dot`), `np.inner`, `np.tensordot`. Each **lowers to `d_einsum`**: the eager call and
+  all three transform rules (forward jvp, batching/vmap, abstract/eval_shape) build the einsum
+  subscript from the operand ranks and re-bind `d_einsum`, so they reuse einsum's reverse rule
+  on the tape and need no separate `_VJP_FOR` entry. Flipped ~11 more tests green (suite now
+  235 passed / 158 skipped). `np.outer`/`np.trace`/`np.kron`/general broadcast `np.matmul`
+  remain (see gaps). Native regression: `test/test_contraction_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new
@@ -86,7 +93,7 @@ a `d_*` rule + registering it for the op would flip the corresponding tests gree
 | Op family | ~tests | Notes |
 |---|---:|---|
 | **array-manipulation**: `repeat`, `tile`, `diff`, `gradient`, `roll`, `moveaxis`, `swapaxes`, `rollaxis`, `pad`, `select`, `sort`, `partition`, `atleast_{1,2,3}d`, `squeeze`, `ravel`, `append` | ~30 | mostly index/gather-shaped backward |
-| **tensor contraction**: `np.dot` (general/≥2-D), `inner`, `outer`, `tensordot`, `kron`, `cross`, `trace`, `matmul` (general/broadcast) | ~21 | `einsum` already covers the math; these are the high-value linear-algebra entry points |
+| **tensor contraction** — ✅ *mostly landed* (`np.dot` general, `inner`, `tensordot` lower to einsum); **`outer`/`trace`/`kron`/general-broadcast `matmul`** remain (`trace` needs a diagonal einsum einsum rejects; `outer` needs a flatten+abstract-reshape path) | ~6 left | `einsum` covers the math; the rest are follow-ups |
 | **numpy *function* forms of arithmetic** — ✅ *landed* (`np.add`/`subtract`/`multiply`/`divide`/`true_divide`/`power`/`negative`, `op.*`, `mod`/`remainder`, `%`) | 2 left | only the `x**0`/`0**y` power-at-zero edge (autograd #116) remains |
 | **triangular / diagonal**: `tril`, `triu`, `diag` | ~11 | |
 | **split family**: `split`, `vsplit`, `hsplit`, `dsplit`, `array_split` | ~11 | inverse of concatenate |
@@ -150,8 +157,8 @@ Documented so they aren't mistaken for regressions:
 
 1. ~~**Unary ufunc rules**~~ — ✅ **done** (see "What was landed"); only `sinc` left.
 2. ~~**numpy *function* forms** + `np.prod` + `mod`~~ — ✅ **done** (see "What was landed").
-3. **Tensor contraction** (`np.dot` general, `tensordot`, `inner`, `outer`) — reuse the existing
-   `einsum` backward; unblocks ~21 tests and most of `test_wrappers`' jacobian-product family.
+3. ~~**Tensor contraction**~~ — ✅ **done** for `dot`/`inner`/`tensordot` (lower to einsum);
+   `outer`/`trace`/`kron`/broadcast-`matmul` are follow-ups.
 4. **Array-manipulation gather/scatter rules** (`repeat`, `tile`, `split` family, `tril`/`triu`/
    `diag`, `roll`, `moveaxis`/`swapaxes`) — the largest single bucket (~50 tests across the two
    op-coverage files).
