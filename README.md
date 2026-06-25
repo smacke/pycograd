@@ -95,15 +95,47 @@ graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
 ```
 
 `grad_graph(g)` returns one graph holding the value **and** the gradient w.r.t.
-every input — but, written naïvely, the backward pass recomputes `tanh`, doubles
-a multiply, and broadcasts a constant 1.0. `optimize` removes the redundancy
-(common-subexpression elimination, constant folding, dead code):
+every input. Written naïvely, the backward pass is wasteful — it recomputes
+`tanh` (`%13`, `%14`), doubles a multiply (`%10`, `%11`), and broadcasts a
+constant 1.0 (`%8`, `%9`):
+
+```text
+# grad_graph(g) -- BEFORE
+graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
+  %3 = matmul %0 %1 -> f64[4,2]
+  %4 = add %3 %2 -> f64[4,2]
+  %5 = tanh %4 -> f64[4,2]
+  %6 = mul %5 %5 -> f64[4,2]
+  %7 = sum %6 -> f64[]
+  %8 = const 1.0 -> f64[]
+  %9 = broadcast_to %8 [4, 2] -> f64[4,2]
+  %10 = mul %9 %5 -> f64[4,2]
+  %11 = mul %9 %5 -> f64[4,2]
+  %12 = add %10 %11 -> f64[4,2]
+  %13 = tanh %4 -> f64[4,2]              # recomputes %5
+  %14 = tanh %4 -> f64[4,2]              # recomputes %5
+  %15 = mul %13 %14 -> f64[4,2]          # recomputes %6
+  %16 = sub 1.0 %15 -> f64[4,2]
+  %17 = mul %12 %16 -> f64[4,2]
+  %18 = sum %17 {axis=0} -> f64[2]
+  %19 = transpose %1 [1, 0] -> f64[2,3]
+  %20 = matmul %17 %19 -> f64[4,3]
+  %21 = transpose %0 [1, 0] -> f64[3,4]
+  %22 = matmul %21 %17 -> f64[3,2]
+  outputs: %7, %20, %22, %18
+}
+```
+
+`optimize` removes the redundancy by common-subexpression elimination, constant
+folding, and dead-code elimination — the recomputed `tanh`/`mul` collapse back
+onto `%5`/`%6` and the broadcast folds away:
 
 ```python
 opt = optimize(grad_graph(g))
 ```
 
 ```text
+# optimize(grad_graph(g)) -- AFTER
 graph(%0:f64[4,3], %1:f64[3,2], %2:f64[2]) {
   %3 = matmul %0 %1 -> f64[4,2]
   %4 = add %3 %2 -> f64[4,2]
