@@ -98,20 +98,8 @@ SKIPS = {
     ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_systematic.py",
-        "test_angle",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    (
-        "test_systematic.py",
         "test_column_stack_1d",
     ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
-    (
-        "test_systematic.py",
-        "test_conj",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    (
-        "test_systematic.py",
-        "test_conjugate",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
     (
         "test_systematic.py",
         "test_einsum2_three_args",
@@ -126,20 +114,12 @@ SKIPS = {
     ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
-        "test_imag",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    (
-        "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
     (
         "test_systematic.py",
-        "test_real",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    (
-        "test_systematic.py",
         "test_real_ic",
-    ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
+    ): "pycograd-gap: np.real_if_close has no rule (a niche data-dependent variant of real(); complex real/imag/conj/conjugate/angle ARE supported)",
     (
         "test_systematic.py",
         "test_row_stack_1d",

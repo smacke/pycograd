@@ -60,6 +60,10 @@ def _as_torch(
         # preserve its dtype rather than casting to the working float dtype (else
         # ``table[idx]`` sees a float index and torch rejects it).
         t = torch.as_tensor(np.asarray(x))
+    elif np.iscomplexobj(x):
+        # A complex leaf keeps its complex dtype (torch has native complex64/128); casting
+        # to the float working dtype would drop the imaginary part.
+        t = torch.as_tensor(np.asarray(x))
     elif dt.name == "bfloat16":
         # torch can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
         t = torch.as_tensor(np.asarray(x, dtype=np.float32)).to(torch.bfloat16)
@@ -199,6 +203,10 @@ def _make_adapters(
 
     by_name: dict[str, Prim] = {
         "abs": unary("abs"),
+        # ``np.abs``/``np.fabs`` carry __name__ "absolute"/"fabs"; torch.abs covers both
+        # (and is the magnitude for complex inputs).
+        "absolute": unary("abs"),
+        "fabs": unary("abs"),
         "square": unary("square"),
         "reciprocal": unary("reciprocal"),
         "maximum": maximum,
@@ -218,6 +226,11 @@ def _make_adapters(
         "transpose": transpose,
         "reshape": reshape,
         "astype": astype,
+        # complex component ops (``np.conj``/``np.conjugate`` share __name__ "conjugate").
+        "conjugate": lambda x: torch.conj_physical(as_t(x)),
+        "real": lambda x: torch.real(as_t(x)),
+        "imag": lambda x: torch.imag(as_t(x)),
+        "angle": lambda x: torch.angle(as_t(x)),
         "expand_dims": expand_dims,
         "concatenate": concatenate,
         "stack": stack,

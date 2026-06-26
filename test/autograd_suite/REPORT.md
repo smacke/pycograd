@@ -201,7 +201,7 @@ an *effort/shape-of-work* estimate (what new machinery each needs), not a scope 
 
 | Subsystem | Effort | What it would take |
 |---|---|---|
-| **Complex numbers** (`real`/`imag`/`conj`/`angle`, complex dtypes, `holomorphic_grad`) | large | a parallel cotangent convention; pycograd is real-only today |
+| **Complex numbers** — **supported.** complex64/complex128 differentiate across eager / graph / vmap / jvp / compile (torch·jax·tf) under the real (non-holomorphic) convention `grad = dL/da + i·dL/db`; `real`/`imag`/`conj`/`conjugate`/`angle` + complex `abs` are ops, `holomorphic_grad` gives the analytic `f'(z)`, order ops (max/min/sort) raise. Validated by the finite-difference adjoint check (complex-aware `_pytree.VSpace`) and `test/test_complex.py`. Remaining edges: `np.real_if_close`, complex `np.linalg`/`np.fft`. |
 | **`np.linalg`** gradients (`inv`/`pinv`/`solve`/`det`/`slogdet`/`eigh`/`svd`/`qr`/`cholesky`) | large | a bespoke VJP per decomposition |
 | **`np.fft`** | medium | FFT/IFFT primitives + their (complex) adjoints |
 | **`scipy`** (`special`/`stats`/`linalg`/`signal`/`integrate`) | large | a scipy backend + per-fn rules |

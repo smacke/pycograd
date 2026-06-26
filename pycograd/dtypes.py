@@ -45,6 +45,12 @@ _ALIASES = {
     "float16": "float16",
     "f16": "float16",
     "half": "float16",
+    "complex64": "complex64",
+    "c64": "complex64",
+    "csingle": "complex64",
+    "complex128": "complex128",
+    "c128": "complex128",
+    "cdouble": "complex128",
 }
 _BFLOAT16_NAMES = frozenset({"bfloat16", "bf16"})
 
@@ -62,12 +68,13 @@ def _bfloat16() -> np.dtype:
 
 
 def resolve_dtype(spec: DTypeLike | None) -> np.dtype:
-    """Resolve a dtype spec to a concrete (floating) numpy dtype.
+    """Resolve a dtype spec to a concrete floating-or-complex numpy dtype.
 
     ``spec`` may be ``None`` (-> float64, the default working dtype), a numpy dtype or
-    scalar type, or a friendly string (``"float32"``/``"f32"``, ``"bf16"``, ...). bf16
-    resolves via ``ml_dtypes``. Non-floating dtypes are rejected -- the tape
-    differentiates real-valued tensors.
+    scalar type, or a friendly string (``"float32"``/``"f32"``, ``"bf16"``,
+    ``"complex128"``/``"c128"``, ...). bf16 resolves via ``ml_dtypes``. The tape
+    differentiates real-or-complex tensors, so floating (kind ``"f"``) and complex (kind
+    ``"c"``) dtypes are accepted; ints/bools/etc. are rejected.
     """
     if spec is None:
         return np.dtype(np.float64)
@@ -85,12 +92,14 @@ def resolve_dtype(spec: DTypeLike | None) -> np.dtype:
     dt = np.dtype(
         cast(Any, spec)
     )  # a numpy dtype / scalar type / "<f4" / an ml_dtypes one
-    # Accept the native floats (kind "f") and bfloat16 -- whose ml_dtypes dtype reports
-    # kind "V" yet is the floating type we resolve "bf16" to. Reject ints/bools/etc.
-    if dt.kind != "f" and dt.name != "bfloat16":
+    # Accept the native floats (kind "f"), complex (kind "c"), and bfloat16 -- whose
+    # ml_dtypes dtype reports kind "V" yet is the floating type we resolve "bf16" to.
+    # Reject ints/bools/etc.
+    if dt.kind not in "fc" and dt.name != "bfloat16":
         raise ValueError(
-            f"dtype {dt.name!r} is not a floating-point dtype; the tape computes "
-            "gradients over real-valued tensors (use float64/float32/float16/bfloat16)"
+            f"dtype {dt.name!r} is not a floating-point or complex dtype; the tape "
+            "computes gradients over real- or complex-valued tensors (use "
+            "float64/float32/float16/bfloat16 or complex64/complex128)"
         )
     return dt
 
@@ -98,6 +107,24 @@ def resolve_dtype(spec: DTypeLike | None) -> np.dtype:
 def current_dtype() -> np.dtype:
     """The working dtype the tape should create arrays in right now (float64 unless set)."""
     return resolve_dtype(_DTYPE.get())
+
+
+def is_complex_dtype(dt: DTypeLike) -> bool:
+    """True if ``dt`` is a complex numpy dtype (kind ``"c"``)."""
+    return np.dtype(cast(Any, dt)).kind == "c"
+
+
+def conj_if_complex(x: Any) -> Any:
+    """``np.conj(x)`` when ``x`` is a complex array/scalar, else ``x`` unchanged.
+
+    This is the single source for the "Hermitian-adjoint wrap": the reverse pass of a
+    holomorphic op needs ``g * conj(f'(z))`` under the real inner product on complex
+    tensors, which we obtain centrally as ``conj_if_complex(rule(conj_if_complex(g)))``.
+    For a *real* dtype it is the identity (no-op, no allocation), so the real fast path is
+    byte-for-byte unchanged. Operates on raw arrays/scalars; the tracer-aware variant for
+    tape/transform-level values lives in :mod:`pycograd.ops`.
+    """
+    return np.conj(x) if np.iscomplexobj(x) else x
 
 
 def is_integral_array(x: object) -> bool:

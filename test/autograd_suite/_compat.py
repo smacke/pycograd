@@ -69,10 +69,7 @@ def deriv(fun, argnum=0):
     return d
 
 
-def holomorphic_grad(fun, argnum=0):  # pragma: no cover - pycograd is real-only
-    raise NotImplementedError(
-        "holomorphic_grad needs complex support, which pycograd does not have"
-    )
+from pycograd.transforms import holomorphic_grad  # noqa: E402,F401  (pycograd-native)
 
 
 def grad_and_aux(fun, argnum=0):

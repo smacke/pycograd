@@ -685,6 +685,33 @@ def _d_abs(x: Boxed) -> Boxed:
     return _xp().sign(np.asarray(cast(Any, _value(cast(Any, x)))))
 
 
+def _abs_jvp_rule(trace: "JVPTrace", x: Boxed, **kwargs: Any) -> Boxed:
+    # |z| forward tangent: real ``sign(z)*dz``; complex ``Re(conj(z)*dz)/|z|`` (non-
+    # holomorphic, so not a ``deriv*dz`` form -- a custom rule).
+    t = trace._raise(x)
+    z = t.primal
+    primal_out = bind(ops.d_abs, z, **kwargs)
+    if ops._boxed_is_complex(z):
+        num = bind(ops.d_real, bind(ops.d_mul, bind(ops.d_conj, z), t.tangent))
+        tangent_out = bind(ops.d_div, num, primal_out)
+    else:
+        tangent_out = bind(ops.d_mul, _d_abs(z), t.tangent)
+    return _result(trace, primal_out, tangent_out)
+
+
+def _angle_jvp_rule(trace: "JVPTrace", x: Boxed, **kwargs: Any) -> Boxed:
+    # angle forward tangent: complex ``Im(conj(z)*dz)/|z|^2``; zero for a real primal.
+    t = trace._raise(x)
+    z = t.primal
+    primal_out = bind(ops.d_angle, z, **kwargs)
+    if ops._boxed_is_complex(z):
+        num = bind(ops.d_imag, bind(ops.d_mul, bind(ops.d_conj, z), t.tangent))
+        tangent_out = bind(ops.d_div, num, bind(ops.d_square, bind(ops.d_abs, z)))
+    else:
+        tangent_out = bind(ops.d_mul, 0.0, t.tangent)
+    return _result(trace, primal_out, tangent_out)
+
+
 # ---------------------------------------------------------------------------
 # Small predicates.
 # ---------------------------------------------------------------------------
@@ -713,10 +740,20 @@ def _build_jvp_for() -> dict[Prim, Rule]:
     # The smooth-unary local derivatives are the *shared* ``ops._UNARY_DERIV`` table (the
     # reverse rules use the same one), so ``1 - tanh²`` etc. is written once. ``abs`` is
     # special (its derivative is a value-dependent ``sign`` mask, not a bind-expression).
-    unary_deriv = {**ops._UNARY_DERIV, ops.d_abs: _d_abs}
     jvp_for: dict[Prim, Rule] = {
-        prim: _unary_for(deriv)(prim) for prim, deriv in unary_deriv.items()
+        prim: _unary_for(deriv)(prim) for prim, deriv in ops._UNARY_DERIV.items()
     }
+    jvp_for.update(
+        {
+            # abs/angle have non-holomorphic (Re/Im-projecting) forward tangents; conj/real/
+            # imag are R-linear (the tangent flows through the same op).
+            ops.d_abs: _abs_jvp_rule,
+            ops.d_angle: _angle_jvp_rule,
+            ops.d_conj: _linear_for(ops.d_conj),
+            ops.d_real: _linear_for(ops.d_real),
+            ops.d_imag: _linear_for(ops.d_imag),
+        }
+    )
     jvp_for.update(
         {
             # linear operator primitives: tangent flows through the same op.

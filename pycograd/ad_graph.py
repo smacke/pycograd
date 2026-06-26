@@ -112,8 +112,12 @@ def _mask_to_float(cond: Boxed) -> Boxed:
 
 
 def _g_abs(operands: tuple, params: dict, g: Boxed, out: Boxed) -> "list[Boxed]":
-    # d|x|/dx = sign(x), built as graph nodes (where(x>0,1,where(x<0,-1,0))).
     (x,) = operands
+    # Complex |z|: non-holomorphic real-adjoint ``g * z/|z|`` (matches ``ops._vjp_abs``);
+    # comparisons are undefined on complex so the sign-mask form is real-only.
+    if ops._boxed_is_complex(x):
+        return [_b(ops.d_mul, g, _b(ops.d_div, x, _b(ops.d_abs, x)))]
+    # d|x|/dx = sign(x), built as graph nodes (where(x>0,1,where(x<0,-1,0))).
     sign = _b(
         ops.d_where,
         _b(ops.d_gt, x, 0.0),
@@ -217,13 +221,17 @@ def _vjp_on_graph(
 ) -> "list[Boxed]":
     rule = _VJP_GRAPH.get(prim)
     if rule is not None:
+        # ``_VJP_GRAPH`` rules already produce the final (real-adjoint for the complex
+        # component ops, mask-based otherwise) cotangent in the graph, so no conj wrap.
         return rule(tuple(operands), params, g, out)
     base = ops._VJP_FOR.get(prim)
     if base is None:
         raise NotImplementedError(
             f"_grad_graph: no graph VJP rule for {getattr(prim, '__name__', prim)!r}"
         )
-    return base(tuple(operands), tuple(operands), params, g)
+    # Apply the same Hermitian-adjoint conj wrap as the eager higher-order path so a
+    # captured complex graph differentiates identically (identity on real dtypes).
+    return ops._vjp_apply(prim, base, tuple(operands), tuple(operands), params, g)
 
 
 # ---------------------------------------------------------------------------

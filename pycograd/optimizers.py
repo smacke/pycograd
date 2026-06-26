@@ -62,9 +62,9 @@ def _leaf_value(leaf: Leaf) -> Array:
     """
     value = leaf.value if isinstance(leaf, Param) else leaf
     arr = _xp().asarray(value)
-    # Keep an existing float precision (f64/f32/f16/bf16); promote a non-float leaf
-    # (a bare int) to the working dtype so the update stays real-valued.
-    return arr if arr.dtype.kind == "f" else arr.astype(current_dtype())
+    # Keep an existing float precision (f64/f32/f16/bf16) or complex (c64/c128); promote a
+    # non-float/complex leaf (a bare int) to the working dtype so the update is well typed.
+    return arr if arr.dtype.kind in "fc" else arr.astype(current_dtype())
 
 
 class Optimizer:
@@ -211,7 +211,10 @@ class Adam(Optimizer):
         m *= b1
         m += (1 - b1) * g  # m <- b1*m + (1-b1)*g  (in place)
         v *= b2
-        v += (1 - b2) * (g * g)  # v <- b2*v + (1-b2)*g^2  (in place)
+        # Second moment is ``|g|^2``: for complex grads ``g*conj(g)`` (real-valued) rather
+        # than the complex square ``g*g``, so the adaptive scale ``sqrt(v_hat)`` is real.
+        g2 = g * _xp().conj(g) if g.dtype.kind == "c" else g * g
+        v += (1 - b2) * g2  # v <- b2*v + (1-b2)*|g|^2  (in place)
         m_hat = m / (1 - b1**self.t)
         v_hat = v / (1 - b2**self.t)
         if wd and self._decoupled:  # AdamW: decay the weight directly
@@ -243,7 +246,7 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
     # The norm is accumulated in float64 for stability regardless of the grads' dtype...
     total = math.sqrt(
         sum(
-            float(xp.sum(xp.asarray(g, dtype=float) ** 2))
+            float(xp.sum(xp.abs(xp.asarray(g)) ** 2))
             for g in tree_leaves(grads)
             if g is not None
         )

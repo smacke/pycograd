@@ -36,6 +36,10 @@ def _as_tf(tf: ModuleType, x: BackendArray) -> BackendArray:
         # An integer array is an index/label, not a differentiable float operand;
         # preserve its dtype rather than casting to the working float dtype.
         return tf.constant(np.asarray(x))
+    if np.iscomplexobj(x):
+        # A complex leaf keeps its complex dtype (tf has native complex64/128); casting to
+        # the float working dtype would drop the imaginary part.
+        return tf.constant(np.asarray(x))
     dt = current_dtype()
     if dt.name == "bfloat16":
         # TF can't ingest an ml_dtypes.bfloat16 buffer; stage through float32.
@@ -235,6 +239,11 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
         "transpose": transpose,
         "reshape": reshape,
         "astype": astype,
+        # complex component ops (``np.conj``/``np.conjugate`` share __name__ "conjugate").
+        "conjugate": lambda x: tf.math.conj(as_t(x)),
+        "real": lambda x: tf.math.real(as_t(x)),
+        "imag": lambda x: tf.math.imag(as_t(x)),
+        "angle": lambda x: tf.math.angle(as_t(x)),
         "expand_dims": expand_dims,
         "concatenate": concatenate,
         "stack": stack,

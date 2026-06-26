@@ -62,7 +62,7 @@ import numpy as np
 
 from pycograd._typing import Array, ArrayLike, Boxed, DTypeLike, Index, Operand, Prim
 from pycograd.backends import current_backend
-from pycograd.dtypes import current_dtype, resolve_dtype
+from pycograd.dtypes import conj_if_complex, current_dtype, resolve_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +114,16 @@ def _unbroadcast(
     The default (``keep_axes=()``) is exactly the historical behavior: every broadcast
     axis is summed away, so nothing else regresses.
     """
-    grad = _xp().asarray(grad, dtype=current_dtype())
+    arr = _xp().asarray(grad)
+    wd = current_dtype()
+    # Keep complex gradients (and any natural dtype under a complex working dtype) -- casting
+    # a complex cotangent to a float working dtype would drop its imaginary part. Otherwise
+    # carry the gradient in the working float dtype (the precision seam).
+    grad = (
+        arr
+        if (arr.dtype.kind == "c" or wd.kind == "c")
+        else _xp().asarray(grad, dtype=wd)
+    )
     # Extra leading axes (rank grew under broadcasting) are summed unless kept: a kept
     # leading axis is reshaped into ``shape`` below, preserving the per-example stack.
     # An empty explicit ``keep_axes`` falls back to the backward-pass-global set (the
@@ -144,7 +153,14 @@ def _accumulate(acc: Array, delta: Array) -> Array:
     per-sample path has ``_unbroadcast`` keep a leading per-example axis (``keep_axes``),
     so the contribution outgrows the unbatched accumulator and must broadcast-grow it.
     The right-hand side is always derived from a *child*'s ``.grad`` (never the
-    accumulator itself), so the in-place add can never alias its own input."""
+    accumulator itself), so the in-place add can never alias its own input.
+
+    A complex cotangent flowing into a *real-valued* primal contributes only its real
+    part: perturbing a real variable moves only along the real axis, so ``dL/dx`` is real.
+    Dropping the imaginary part keeps a real node's gradient real (and lets the in-place
+    add stay same-dtype)."""
+    if acc.dtype.kind != "c" and np.iscomplexobj(delta):
+        delta = delta.real
     if acc.shape == delta.shape:
         acc += delta
         return acc
@@ -242,7 +258,9 @@ def _is_array(x: object) -> bool:
 
 
 def _is_numeric(x: object) -> bool:
-    return (isinstance(x, (int, float)) and not isinstance(x, bool)) or _is_array(x)
+    return (
+        isinstance(x, (int, float, complex)) and not isinstance(x, bool)
+    ) or _is_array(x)
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +279,27 @@ class Var:
         dtype: DTypeLike | None = None,
     ) -> None:
         xp = _xp()
-        dt = current_dtype() if dtype is None else resolve_dtype(dtype)
-        self.value: Array = xp.asarray(value, dtype=dt)
+        if dtype is not None:
+            self.value: Array = xp.asarray(value, dtype=resolve_dtype(dtype))
+        else:
+            arr = xp.asarray(value)
+            wd = current_dtype()
+            if arr.dtype.kind == "c":
+                # A complex value is preserved unconditionally -- casting it to a float
+                # working dtype would silently drop the imaginary part. So complex tensors
+                # flow through the tape whether or not a ``dtype("complex128")`` block is
+                # active (the suite passes complex arrays straight to ``grad``).
+                self.value = arr
+            elif wd.kind == "c":
+                # Complex working dtype: a complex computation mixes real- and complex-valued
+                # tensors (``abs``/``real`` are real, the rest complex), so intermediates
+                # follow numpy's *natural* promotion. Only a non-floating value (a python
+                # scalar / int leaf) is lifted to the complex working dtype.
+                self.value = (
+                    arr if arr.dtype.kind == "f" else xp.asarray(value, dtype=wd)
+                )
+            else:
+                self.value = xp.asarray(value, dtype=wd)
         self.grad: Array = xp.zeros_like(self.value)
         self._parents = _parents
         self._backward: Callable[[], None] = lambda: None
@@ -290,9 +327,15 @@ class Var:
             # a private accumulator the driver pre-zeros for every topo node, summed in
             # reverse order before any parent reads it. The differentiable path
             # (``_backward_differentiable``) is separate and untouched.
-            self.grad = _accumulate(
-                self.grad, _unbroadcast(grad_fn(self.value, out.grad), self.value.shape)
-            )
+            #
+            # Hermitian-adjoint wrap (complex): a holomorphic op's grad_fn is C-linear in
+            # the cotangent (returns ``g * f'(z)``), so ``conj(grad_fn(z, conj(g)))`` =
+            # ``g * conj(f'(z))`` -- the adjoint under the real inner product. ``conj_if_
+            # complex`` is the identity on real dtypes, so the real path is unchanged. The
+            # non-holomorphic prims (conj/real/imag/angle) set ``_backward`` directly and
+            # never reach this generic path.
+            contrib = conj_if_complex(grad_fn(self.value, conj_if_complex(out.grad)))
+            self.grad = _accumulate(self.grad, _unbroadcast(contrib, self.value.shape))
 
         out._backward = _backward
         if prim is not None:
@@ -310,7 +353,12 @@ class Var:
         out = Var(value_fn(self.value, other.value), _parents=(self, other))
 
         def _backward() -> None:
-            ga, gb = grad_fn(self.value, other.value, out.grad)
+            # Hermitian-adjoint wrap for complex (see ``_unary``): conjugate the cotangent
+            # in and each contribution out so a C-linear grad_fn yields ``g * conj(D)``.
+            # Identity on real dtypes.
+            cg = conj_if_complex(out.grad)
+            ga, gb = grad_fn(self.value, other.value, cg)
+            ga, gb = conj_if_complex(ga), conj_if_complex(gb)
             # Accumulate in place on the base path (see ``_unary``). ``self`` and
             # ``other`` may be the same node (``x + x``); accumulating twice still sums
             # correctly, and neither rhs aliases the accumulator.

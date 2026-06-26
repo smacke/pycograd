@@ -36,7 +36,7 @@ from pycograd._typing import (
     Shape,
 )
 from pycograd.backends import current_backend
-from pycograd.dtypes import resolve_dtype
+from pycograd.dtypes import conj_if_complex, resolve_dtype
 from pycograd.tensor import (
     Var,
     _accumulate,
@@ -107,9 +107,97 @@ def d_sigmoid(x: Operand) -> Var:
     return x._unary(v, lambda a, g: g * v * (1 - v), d_sigmoid)
 
 
+def _nonholo_unary(
+    x: Operand,
+    value: Array,
+    adjoint: Callable[[Array, Array], Array],
+    prim: Prim,
+    out_dtype: DTypeLike | None = None,
+) -> Var:
+    """Build a non-holomorphic unary op (conj/real/imag/angle/abs).
+
+    Unlike ``Var._unary``, the eager backward applies ``adjoint(z, g)`` *directly* -- it is
+    already the real-adjoint contribution under the real inner product on complex tensors,
+    so it must NOT go through the holomorphic ``conj_if_complex`` wrap. ``out_dtype`` pins
+    the result dtype (real/imag/angle/abs are real-valued even inside a complex ``dtype``
+    context, where ``Var`` would otherwise re-cast to the complex working dtype).
+    """
+    from pycograd.tensor import _accumulate, _unbroadcast
+
+    x = _lift(x)
+    out = Var(value, _parents=(x,), dtype=out_dtype)
+
+    def _backward() -> None:
+        x.grad = _accumulate(
+            x.grad, _unbroadcast(adjoint(x.value, out.grad), x.value.shape)
+        )
+
+    out._backward = _backward
+    _record_vjp(out, prim, (x,))
+    return out
+
+
+def _real_dtype_of(arr: Array) -> "np.dtype":
+    """The real-component dtype of ``arr`` (complex128 -> float64; a real dtype unchanged)."""
+    return np.asarray(arr).real.dtype
+
+
 def d_abs(x: Operand) -> Var:
     x, xp = _lift(x), _xp()
-    return x._unary(xp.abs(x.value), lambda a, g: g * xp.sign(a), d_abs)
+    # |z| is non-holomorphic for complex: the real-adjoint is ``g * z/|z|`` (which reduces
+    # to ``g * sign(x)`` for real x). Output is real-valued in both cases.
+    val = xp.abs(x.value)
+    if np.iscomplexobj(x.value):
+        return _nonholo_unary(
+            x, val, lambda z, g: g * (z / xp.abs(z)), d_abs, _real_dtype_of(x.value)
+        )
+    return x._unary(val, lambda a, g: g * xp.sign(a), d_abs)
+
+
+def d_conj(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    # conj: z -> conj(z); real-adjoint of conj is conj (an involution).
+    return _nonholo_unary(x, xp.conj(x.value), lambda z, g: xp.conj(g), d_conj)
+
+
+def d_real(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    # real: z -> Re(z); adjoint embeds the real cotangent back as a complex number.
+    return _nonholo_unary(
+        x,
+        xp.real(x.value),
+        lambda z, g: xp.asarray(g, dtype=z.dtype),
+        d_real,
+        _real_dtype_of(x.value),
+    )
+
+
+def d_imag(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    # imag: z -> Im(z); adjoint of Im is multiply-by-i (real g -> imaginary cotangent).
+    return _nonholo_unary(
+        x,
+        xp.imag(x.value),
+        lambda z, g: (1j * g).astype(z.dtype) if np.iscomplexobj(z) else g * 0.0,
+        d_imag,
+        _real_dtype_of(x.value),
+    )
+
+
+def d_angle(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    # angle: z -> atan2(Im, Re); real-adjoint is ``g * i*z/|z|^2``.
+    return _nonholo_unary(
+        x,
+        xp.angle(x.value),
+        lambda z, g: (
+            (g * (1j * z) / (xp.abs(z) ** 2)).astype(z.dtype)
+            if np.iscomplexobj(z)
+            else g * 0.0
+        ),
+        d_angle,
+        _real_dtype_of(x.value),
+    )
 
 
 def d_square(x: Operand) -> Var:
@@ -211,6 +299,7 @@ def d_sign(x: Operand) -> Var:
     # ``sign`` is piecewise-constant: its derivative is zero a.e. (the kink at 0 is ignored,
     # matching autograd / the ``forward.py`` mask convention).
     x, xp = _lift(x), _xp()
+    _reject_complex("sign", x)
     return x._unary(xp.sign(x.value), lambda a, g: g * 0.0, d_sign)
 
 
@@ -227,10 +316,23 @@ def d_floor(x: Operand) -> Var:
 # ---------------------------------------------------------------------------
 # Elementwise binary / selection.
 # ---------------------------------------------------------------------------
+def _reject_complex(op_name: str, *operands: Operand) -> None:
+    """Raise a clear error if any operand is complex -- order-dependent ops (max/min/clip/
+    sort/sign/...) have no meaning on the unordered complex field."""
+    for o in operands:
+        arr = o.value if isinstance(o, Var) else o
+        if np.iscomplexobj(cast(Any, arr)):
+            raise TypeError(
+                f"{op_name}: complex tensors are unordered, so {op_name} (and its "
+                "gradient) is undefined; restrict it to real-valued operands"
+            )
+
+
 def _elementwise_max(
     a: Operand, b: Operand, pick_a: Callable[..., Array], prim: Prim
 ) -> Var:
     a, b = _lift(a), _lift(b)
+    _reject_complex(getattr(prim, "__name__", "maximum/minimum"), a, b)
     out = Var(pick_a(a.value, b.value), _parents=(a, b))
 
     def _backward() -> None:
@@ -465,7 +567,12 @@ def _matmul(a: Operand, b: Operand) -> Var:
     out = Var(primal, _parents=(a, b))
 
     def _backward() -> None:
-        da, db = _matmul_grads(a.value, b.value, out.grad)
+        # Conjugate the operand factors (not the cotangent) for the complex Hermitian
+        # adjoint: ``da = g @ conj(b).T``, ``db = conj(a).T @ g``. ``conj_if_complex`` is
+        # the identity on real arrays, so the real path is unchanged.
+        da, db = _matmul_grads(
+            conj_if_complex(a.value), conj_if_complex(b.value), out.grad
+        )
         a.grad = _accumulate(a.grad, _unbroadcast(da, a.value.shape))
         b.grad = _accumulate(b.grad, _unbroadcast(db, b.value.shape))
 
@@ -652,7 +759,9 @@ def d_einsum(subscripts: Any, *operands: Operand) -> Var:
     def _backward() -> None:
         for i, op in enumerate(lifted):
             spec, others, missing = _einsum_grad_spec(ins, out, i)
-            arrays = [node.grad] + [vals[j] for j in others]
+            # Conjugate the *other* operand factors (not the cotangent) for the complex
+            # Hermitian adjoint; identity on real operands.
+            arrays = [node.grad] + [conj_if_complex(vals[j]) for j in others]
             if missing:
                 mshape = tuple(op.value.shape[ins[i].index(c)] for c in missing)
                 arrays.append(xp.ones(mshape, dtype=node.grad.dtype))
@@ -1699,12 +1808,14 @@ def _take_along_var(x: Operand, perm: Array, axis: int) -> Var:
 
 def d_sort(x: Operand, axis: int = -1) -> Var:
     x = _lift(x)
+    _reject_complex("sort", x)
     perm = _xp().argsort(x.value, axis=axis)
     return _take_along_var(x, perm, axis)
 
 
 def d_partition(x: Operand, kth: Any, axis: int = -1) -> Var:
     x = _lift(x)
+    _reject_complex("partition", x)
     perm = _xp().argpartition(x.value, kth, axis=axis)
     return _take_along_var(x, perm, axis)
 
@@ -1970,7 +2081,11 @@ def d_var(
     x = _lift(x)
     centered = x - d_mean(x, axis=axis, keepdims=True)
     n = _reduced_count(x, axis)
-    return d_sum(centered * centered, axis=axis, keepdims=keepdims) / (n - ddof)
+    # Variance is ``mean(|x - mean|^2)``; for complex x the squared magnitude
+    # ``|centered|^2`` (real) is required -- ``centered*centered`` would be the complex
+    # square. ``d_abs(centered)**2`` reduces to ``centered**2`` for real x.
+    sq = d_square(d_abs(centered)) if x.value.dtype.kind == "c" else centered * centered
+    return d_sum(sq, axis=axis, keepdims=keepdims) / (n - ddof)
 
 
 def d_std(
@@ -1994,6 +2109,7 @@ def _reduce_select(
 ) -> Var:
     # max/min: the gradient flows only to the selected element(s), split on ties.
     x, xp = _lift(x), _xp()
+    _reject_complex(getattr(prim, "__name__", "max/min"), x)
     kept = reducer(x.value, axis=axis, keepdims=True)
     out = Var(reducer(x.value, axis=axis, keepdims=keepdims), _parents=(x,))
 
@@ -2158,14 +2274,16 @@ def d_reshape(x: Operand, *shape: Shape) -> Var:
 
 
 def d_astype(x: Operand, dtype: DTypeLike, **_ignored: Any) -> Var:
-    """Cast ``x`` to floating dtype ``dtype`` -- the in-graph precision cast behind mixed
-    precision (e.g. ``x.astype("float64")`` inside a float32 tape).
+    """Cast ``x`` to floating-or-complex dtype ``dtype`` -- the in-graph precision/kind cast
+    behind mixed precision (e.g. ``x.astype("float64")`` inside a float32 tape) and real<->
+    complex embedding (``x.astype("complex128")``).
 
-    A cast is *linear* (identity up to rounding), so the VJP simply casts the cotangent
-    back to the input's dtype. Only floating targets are supported: ``resolve_dtype``
-    rejects ints/bools (a ``Var`` holds real-valued tensors), so casting to an integer
-    dtype -- an index/label -- is not a differentiable tape op. Extra numpy ``astype``
-    kwargs (``order``/``casting``/``copy``/``subok``/``device``) are accepted and ignored.
+    A cast is *linear*, so the VJP casts the cotangent back to the input's dtype (a
+    complex->real cast-back drops the imaginary part via ``_accumulate``, which is the
+    adjoint of the real->complex embedding). ``resolve_dtype`` rejects ints/bools (a ``Var``
+    holds real- or complex-valued tensors), so casting to an integer dtype -- an index/label
+    -- is not a differentiable tape op. Extra numpy ``astype`` kwargs (``order``/``casting``/
+    ``copy``/``subok``/``device``) are accepted and ignored.
     """
     x, xp = _lift(x), _xp()
     target = resolve_dtype(dtype)
@@ -2174,7 +2292,9 @@ def d_astype(x: Operand, dtype: DTypeLike, **_ignored: Any) -> Var:
     out = Var(xp.asarray(x.value).astype(target), _parents=(x,), dtype=target)
 
     def _backward() -> None:
-        x.grad = _accumulate(x.grad, out.grad.astype(x.value.dtype))
+        # ``_accumulate`` reconciles the dtype (complex cotangent -> real input keeps the
+        # real part), so no explicit cast here -- avoids a noisy ComplexWarning.
+        x.grad = _accumulate(x.grad, out.grad)
 
     out._backward = _backward
     _record_vjp(out, d_astype, (x,), {"dtype": target})
@@ -2381,6 +2501,12 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_expm1: (np.expm1, math.expm1),
     # ``np.fabs`` is ``abs`` for real inputs -- reuse ``d_abs``'s kernel/rules.
     d_abs: (np.abs, np.fabs),
+    # Complex component ops (non-holomorphic; excluded from the conj wrap, see
+    # ``_NONHOLOMORPHIC``).
+    d_conj: (np.conj, np.conjugate),
+    d_real: (np.real,),
+    d_imag: (np.imag,),
+    d_angle: (np.angle,),
     d_square: (np.square,),
     d_reciprocal: (np.reciprocal,),
     # elementwise binary
@@ -2634,9 +2760,63 @@ def _vjp_abs(
     params: dict[str, Any],
     g: Boxed,
 ) -> list[Boxed]:
-    # sign(primal) is a piecewise-constant derivative -> a stop-gradient constant.
+    # Real: d|x|/dx = sign(x), a piecewise-constant derivative -> a stop-gradient constant.
+    # Complex: |z| is non-holomorphic; the real-adjoint is ``g * z/|z|``. Excluded from the
+    # holomorphic conj wrap (it is already the final real-coords gradient).
     (p,) = primals
+    if _pdtype(p).kind == "c":
+        z = operands[0]
+        return [_b(d_mul, g, _b(d_div, z, _b(d_abs, z)))]
     return [_b(d_mul, g, _const_like(_xp().sign(p.value)))]
+
+
+def _vjp_conj(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # Real-adjoint of conj is conj (an involution); identity on a real cotangent.
+    return [_b(d_conj, g)]
+
+
+def _vjp_real(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # Adjoint of Re embeds the real cotangent back into the complex input's space; a real
+    # ``g`` promotes into the complex parent grad on accumulation, so pass it through.
+    return [g]
+
+
+def _vjp_imag(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # Adjoint of Im is multiply-by-i for a complex input (real g -> imaginary cotangent);
+    # for a real input, Im is identically zero, so no gradient flows.
+    (p,) = primals
+    if _pdtype(p).kind == "c":
+        return [_b(d_mul, 1j, g)]
+    return [_b(d_mul, 0.0, g)]
+
+
+def _vjp_angle(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # Real-adjoint of angle is ``g * i*z/|z|^2`` (complex input); zero for a real input.
+    (p,) = primals
+    if not _pdtype(p).kind == "c":
+        return [_b(d_mul, 0.0, g)]
+    z = operands[0]
+    return [_b(d_mul, g, _b(d_div, _b(d_mul, 1j, z), _b(d_square, _b(d_abs, z))))]
 
 
 def _vjp_add(
@@ -3140,6 +3320,10 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
     vjp_for.update(
         {
             d_abs: _vjp_abs,
+            d_conj: _vjp_conj,
+            d_real: _vjp_real,
+            d_imag: _vjp_imag,
+            d_angle: _vjp_angle,
             d_add: _vjp_add,
             d_sub: _vjp_sub,
             d_neg: _vjp_neg,
@@ -3192,6 +3376,56 @@ _UNARY_DERIV: dict[Prim, Callable[[Boxed], Boxed]] = _vjp_unary_derivs()
 _VJP_FOR: dict[Prim, Callable[..., list[Boxed]]] = _build_vjp_for()
 
 
+# The non-holomorphic primitives, whose ``_VJP_FOR`` rules already return the final
+# real-adjoint cotangent (in the real (a, b) coordinates packed as a complex number). They
+# are EXCLUDED from the holomorphic ``conj`` wrap below; every other primitive's rule is
+# C-linear in ``g`` and the wrap turns it into the correct Hermitian adjoint.
+_NONHOLOMORPHIC: "frozenset[Prim]" = frozenset({d_abs, d_conj, d_real, d_imag, d_angle})
+
+
+def _boxed_is_complex(x: Boxed) -> bool:
+    """Whether a trace-level cotangent/operand carries a complex dtype."""
+    if x is None:
+        return False
+    if isinstance(x, Var):
+        return x.value.dtype.kind == "c"
+    aval = getattr(x, "aval", None)
+    dt = getattr(aval, "dtype", None)
+    if dt is not None:
+        return np.dtype(dt).kind == "c"
+    try:
+        return np.asarray(cast(Any, x)).dtype.kind == "c"
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _conj_boxed(x: Boxed) -> Boxed:
+    """Tracer-aware ``conj`` for the Hermitian-adjoint wrap: ``bind(d_conj, x)`` when ``x``
+    is complex (so it composes under graph/jvp/vmap and grad-of-grad), else ``x`` itself.
+    Identity on real cotangents, so the real path adds no nodes."""
+    return _b(d_conj, x) if _boxed_is_complex(x) else x
+
+
+def _vjp_apply(
+    prim: Prim,
+    rule: Callable[..., list[Boxed]],
+    primals: tuple[Boxed, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    """Invoke a VJP ``rule`` with the central Hermitian-adjoint conj wrap.
+
+    For a holomorphic primitive the rule is C-linear in ``g`` (returns ``g * D``), so
+    ``conj(rule(conj(g)))`` = ``g * conj(D)`` -- the adjoint under the real inner product on
+    complex tensors. The non-holomorphic prims are already real-adjoint, so the wrap is
+    skipped for them. Real cotangents short-circuit ``_conj_boxed`` to the identity."""
+    if prim in _NONHOLOMORPHIC:
+        return rule(primals, operands, params, g)
+    contribs = rule(primals, operands, params, _conj_boxed(g))
+    return [None if c is None else _conj_boxed(c) for c in contribs]
+
+
 def _vjp_contributions(v: Var, g: Boxed, operands: tuple[Boxed, ...]) -> list[Boxed]:
     """Per-parent cotangent contributions for node ``v`` given its cotangent ``g``.
 
@@ -3208,7 +3442,7 @@ def _vjp_contributions(v: Var, g: Boxed, operands: tuple[Boxed, ...]) -> list[Bo
             f"higher-order reverse: no differentiable VJP rule for "
             f"{getattr(prim, '__name__', prim)!r}"
         )
-    return rule(v._vjp_operands, operands, v._vjp_params, g)
+    return _vjp_apply(prim, rule, v._vjp_operands, operands, v._vjp_params, g)
 
 
 # ---------------------------------------------------------------------------

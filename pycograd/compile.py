@@ -31,6 +31,16 @@ from pycograd.transforms import _check_param_ownership, _match_arg
 from pycograd.tree import Leaf, PyTree, TreeDef, tree_flatten, tree_unflatten
 
 
+def _leaf_array(value: object) -> Array:
+    """A trainable leaf as a numpy array in the working dtype, preserving complex.
+
+    A complex leaf keeps its complex dtype (casting to the float working dtype would drop
+    the imaginary part); everything else is carried in :func:`~pycograd.dtypes.current_dtype`
+    (the precision seam), mirroring ``Var.__init__`` and the backends' cast helpers."""
+    arr = np.asarray(value)
+    return arr if arr.dtype.kind == "c" else np.asarray(value, dtype=current_dtype())
+
+
 def _runner_for(f: Prim) -> Prim:
     """The instrumented version of ``f`` (cached, shared with the numpy path)."""
     runner = _INSTRUMENTED.get(f)
@@ -94,7 +104,7 @@ def _plan_leaf(
             idx = tie_slot.get(leaf.tie)
             if idx is None:
                 idx = len(trainable)
-                trainable.append(np.asarray(leaf.value, dtype=current_dtype()))
+                trainable.append(_leaf_array(leaf.value))
                 devices.append(leaf.device)
                 tie_slot[leaf.tie] = idx
             elif devices[idx] != leaf.device:
@@ -104,12 +114,12 @@ def _plan_leaf(
                 )
             return ("train", idx, leaf)
         idx = len(trainable)
-        trainable.append(np.asarray(leaf.value, dtype=current_dtype()))
+        trainable.append(_leaf_array(leaf.value))
         devices.append(leaf.device)
         return ("train", idx, leaf)
     if _is_numeric(leaf):
         idx = len(trainable)
-        trainable.append(np.asarray(leaf, dtype=current_dtype()))
+        trainable.append(_leaf_array(leaf))
         devices.append(None)
         return ("train", idx, leaf)
     return ("none", leaf)

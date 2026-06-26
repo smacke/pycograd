@@ -33,6 +33,10 @@ def _as_jnp(jnp: ModuleType, x: BackendArray) -> BackendArray:
     keep its dtype rather than casting to the working float dtype."""
     if is_integral_array(x):
         return jnp.asarray(np.asarray(x))
+    if np.iscomplexobj(x):
+        # A complex leaf keeps its complex dtype (jax has native complex with x64 enabled);
+        # casting to the float working dtype would drop the imaginary part.
+        return jnp.asarray(np.asarray(x))
     return jnp.asarray(np.asarray(x, dtype=current_dtype()))
 
 
@@ -47,6 +51,17 @@ def _build_intercept(jnp: ModuleType) -> dict[Prim, Prim]:
         if repl is not None:
             table[fn] = repl
     return table
+
+
+def _match_complex_convention(g: BackendArray) -> Array:
+    """Bring a jax gradient into pycograd's complex convention.
+
+    For a real-valued loss of complex input, jax returns the *conjugate* Wirtinger
+    gradient, whereas pycograd's tape (and torch) return ``dL/da + i*dL/db`` -- the
+    conjugate of jax's. Conjugating a complex jax grad makes the compiled result agree with
+    the eager tape; a real grad is returned unchanged."""
+    arr = np.asarray(g)
+    return np.conj(arr) if np.iscomplexobj(arr) else arr
 
 
 def _unmapped(func: Prim, is_tensor: Callable[[object], bool]) -> Prim:
@@ -167,7 +182,7 @@ class JaxBackend(Backend):
     ) -> tuple[BackendArray, list[BackendArray]]:
         self._reject_devices(devices)  # per-leaf placement is torch-only for now
         jax, jnp = self._jax, self._jnp
-        arrs = [jnp.asarray(np.asarray(leaf, dtype=current_dtype())) for leaf in leaves]
+        arrs = [_as_jnp(jnp, leaf) for leaf in leaves]
 
         def f(ts: list[BackendArray]) -> BackendArray:
             return jnp.asarray(scalar_fn(ts)).reshape(())
@@ -175,7 +190,7 @@ class JaxBackend(Backend):
         if not arrs:
             return np.asarray(f(arrs)), []
         value, grads = jax.value_and_grad(f)(arrs)
-        return np.asarray(value), [np.asarray(g) for g in grads]
+        return np.asarray(value), [_match_complex_convention(g) for g in grads]
 
     def compile_grad(
         self,
@@ -198,10 +213,10 @@ class JaxBackend(Backend):
         def run(
             leaves: list[BackendArray],
         ) -> tuple[BackendArray, list[BackendArray]]:
-            arrs = [jnp.asarray(np.asarray(x, dtype=current_dtype())) for x in leaves]
+            arrs = [_as_jnp(jnp, x) for x in leaves]
             if not arrs:
                 return np.asarray(f(arrs)), []
             value, grads = compiled(arrs)
-            return np.asarray(value), [np.asarray(g) for g in grads]
+            return np.asarray(value), [_match_complex_convention(g) for g in grads]
 
         return run

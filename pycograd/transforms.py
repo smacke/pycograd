@@ -1281,6 +1281,25 @@ def make_jvp(
     return maker
 
 
+def holomorphic_grad(
+    f: Callable[..., PyTree], argnum: int = 0
+) -> Callable[..., PyTree]:
+    """The complex derivative ``f'(z)`` of an analytic ``f: C -> C`` w.r.t. ``argnum``.
+
+    Computed as the forward tangent along a ones tangent (``make_jvp`` seeded with ``1``):
+    ``d/dt f(z + t)|_{t=0} = f'(z)``. The complex tangent is preserved end to end. This is
+    the analytic (holomorphic) derivative; for a real-valued loss use :func:`grad`, whose
+    complex gradient is ``dL/da + i*dL/db`` (the conjugate convention)."""
+
+    def hg(*args: PyTree, **kwargs: PyTree) -> PyTree:
+        x = np.asarray(_value(cast(Operand, args[argnum])))
+        v = cast("PyTree", np.ones_like(x) if x.ndim else complex(1.0))
+        _, tangent = make_jvp(f, argnum)(*args, **kwargs)(v)
+        return tangent
+
+    return hg
+
+
 def make_vjp(
     f: Callable[..., PyTree], argnum: int = 0
 ) -> Callable[..., tuple[Callable[..., PyTree], PyTree]]:

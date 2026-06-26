@@ -36,6 +36,14 @@ TOL = 1e-6
 RTOL = 1e-6
 EPS = 1e-6
 
+
+def _as_tape_arr(leaf: object) -> np.ndarray:
+    """A numeric leaf as a tape array: preserve a complex dtype (so complex ops are
+    exercised end to end), otherwise carry it as float (the historical real path)."""
+    arr = np.asarray(leaf)
+    return arr if arr.dtype.kind == "c" else np.asarray(leaf, dtype=float)
+
+
 _RNG = np.random.default_rng(0)
 
 
@@ -107,7 +115,7 @@ def _vjp(fun, args, kwargs, argnum):
     in_info: dict[int, tuple] = {}
     for i in idxs:
         leaves, td = tree_flatten(args[i])
-        vs = [Var(np.asarray(l, dtype=float)) if _is_num(l) else None for l in leaves]
+        vs = [Var(_as_tape_arr(l)) if _is_num(l) else None for l in leaves]
         in_info[i] = (td, vs)
         call_args[i] = tree_unflatten(
             td, [v if v is not None else l for v, l in zip(vs, leaves)]
@@ -122,7 +130,11 @@ def _vjp(fun, args, kwargs, argnum):
         cot_leaves, _ = tree_flatten(cot)
         scalar = None
         for ov, c in zip(out_vars, cot_leaves):
-            term = ops.d_sum(ov * np.asarray(c, dtype=float))
+            # The cotangent contraction in the real inner product is ``Re(sum(conj(c)*out))``
+            # -- a real scalar whose gradient is the Hermitian VJP ``J^H c``. For real
+            # ``c``/``out`` this is the historical ``sum(c*out)`` (``Re``/``conj`` are no-ops).
+            cc = _as_tape_arr(c)
+            term = ops.d_sum(ops.d_real(ov * np.conj(cc)))
             scalar = term if scalar is None else scalar + term
         scalar.backward(differentiable=False)
         grads = {

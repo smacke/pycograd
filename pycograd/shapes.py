@@ -432,6 +432,18 @@ def abstract_unary(x: AbstractVal) -> ShapedArray:
     return ShapedArray(a.shape, a.dtype)
 
 
+def _real_component_dtype(dt: "np.dtype") -> "np.dtype":
+    """The real-component dtype of ``dt`` (complex128 -> float64; a real dtype unchanged)."""
+    return np.zeros((), np.dtype(dt)).real.dtype
+
+
+def abstract_real_component(x: AbstractVal) -> ShapedArray:
+    """Shape rule for ``real``/``imag``/``angle``/``abs``: same shape, real-valued dtype
+    (a complex input yields its real component dtype; a real input is unchanged)."""
+    a = _aval(x)
+    return ShapedArray(a.shape, _real_component_dtype(a.dtype))
+
+
 def abstract_axis_preserving(
     x: AbstractVal, axis: Axis = None, **_: Any
 ) -> ShapedArray:
@@ -862,7 +874,6 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
         ops.d_floor,
         ops.d_log1p,
         ops.d_expm1,
-        ops.d_abs,
         ops.d_square,
         ops.d_reciprocal,
     )
@@ -946,6 +957,12 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_einsum: abstract_einsum,
             ops.d_cumsum: abstract_cumsum,
             ops.d_transpose: abstract_transpose,
+            # complex component ops: abs/real/imag/angle are real-valued; conj preserves dtype
+            ops.d_abs: abstract_real_component,
+            ops.d_real: abstract_real_component,
+            ops.d_imag: abstract_real_component,
+            ops.d_angle: abstract_real_component,
+            ops.d_conj: abstract_unary,
             ops.d_reshape: abstract_reshape,
             ops.d_astype: abstract_astype,
             ops.d_broadcast_to: abstract_broadcast_to,
