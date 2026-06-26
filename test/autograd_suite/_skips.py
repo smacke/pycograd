@@ -25,12 +25,4 @@ SKIPS = {
         "test_numpy.py",
         "test_simple_append_list_2D",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
-    (
-        "test_systematic.py",
-        "test_einsum2_three_args",
-    ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
-    (
-        "test_systematic.py",
-        "test_einsum_three_args",
-    ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
 }

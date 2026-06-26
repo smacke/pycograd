@@ -138,10 +138,19 @@ def test_einsum_eval_shape():
     assert tuple(out.shape) == (7, 3, 5)
 
 
-def test_einsum_rejects_diagonal():
+def test_einsum_within_operand_diagonal():
+    # A label repeated within one operand extracts that diagonal (the operand is gathered via
+    # getitem before the contraction, so the gradient scatters back onto the diagonal).
     x = np.arange(9.0).reshape(3, 3)
-    with pytest.raises(NotImplementedError):
-        einsum("ii->i", x)  # within-operand diagonal
+
+    def f(a):
+        return np.sum(einsum("ii->i", a) ** 2)
+
+    val, grads = value_and_grad(f)(x)
+    assert np.isclose(float(np.asarray(val)), float(np.sum(np.einsum("ii->i", x) ** 2)))
+    expected = np.zeros((3, 3))
+    np.fill_diagonal(expected, 2 * np.diag(x))  # gradient only on the diagonal
+    assert np.allclose(np.asarray(grads[0]), expected)
 
 
 def test_einsum_ellipsis_broadcasts_size_one():

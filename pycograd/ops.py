@@ -700,7 +700,7 @@ def _normalize_einsum_args(subscripts: Any, operands: tuple) -> tuple[str, tuple
     import string
 
     if isinstance(subscripts, str):
-        return subscripts, operands
+        return _diagonalize_einsum(subscripts, operands)
     args = (subscripts, *operands)
     ops_list: list = []
     sublists: list = []
@@ -725,7 +725,63 @@ def _normalize_einsum_args(subscripts: Any, operands: tuple) -> tuple[str, tuple
     spec = ",".join("".join(lbl(x) for x in sl) for sl in sublists)
     if out_sublist is not None:
         spec += "->" + "".join(lbl(x) for x in out_sublist)
-    return spec, tuple(ops_list)
+    return _diagonalize_einsum(spec, tuple(ops_list))
+
+
+def _einsum_diag_key(sub: str, op: Any) -> tuple[tuple, str]:
+    """For an operand subscript with a label repeated (a diagonal inside einsum), return a
+    fancy ``getitem`` key extracting that diagonal and the collapsed subscript. Supports a
+    single label repeated exactly twice over two *contiguous* axes (covers the suite).
+    """
+    from collections import Counter
+
+    counts = Counter(sub)
+    rep = [c for c, n in counts.items() if n > 1]
+    axes = [i for i, c in enumerate(sub) if c == rep[0]] if rep else []
+    if len(rep) != 1 or counts[rep[0]] != 2 or axes != [axes[0], axes[0] + 1]:
+        raise NotImplementedError(
+            f"einsum: only a single twice-repeated label over two adjacent axes is "
+            f"supported ({sub!r})"
+        )
+    n = int(cast(Any, op).shape[axes[0]])
+    ar = _xp().arange(n)
+    key = tuple(ar if i in axes else slice(None) for i in range(len(sub)))
+    # numpy keeps a contiguous advanced-index block in place: the diagonal axis sits where
+    # the repeated label began, with the other axes before/after it preserved.
+    before = sub[: axes[0]]
+    after = sub[axes[1] + 1 :]
+    return key, before + rep[0] + after
+
+
+def _diagonalize_einsum(subscripts: str, operands: tuple) -> tuple[str, tuple]:
+    """Rewrite any operand with a repeated label (e.g. ``'lli'``) by gathering its diagonal
+    via ``d_getitem`` and collapsing the subscript, so the einsum the rules see has no repeated
+    label and ``d_getitem`` carries the (scatter-to-diagonal) gradient. Explicit-output form
+    only; an implicit-output spec with a repeat is left for ``_parse_einsum`` to reject.
+    """
+    if "->" not in subscripts or "..." in subscripts:
+        return subscripts, operands
+    lhs, _, out = subscripts.partition("->")
+    ins = lhs.split(",")
+    if len(ins) != len(operands):
+        return subscripts, operands
+    from pycograd.trace import bind
+
+    new_ins: list[str] = []
+    new_ops: list = []
+    changed = False
+    for sub, op in zip(ins, operands):
+        if len(set(sub)) == len(sub):
+            new_ins.append(sub)
+            new_ops.append(op)
+            continue
+        key, nsub = _einsum_diag_key(sub, op)
+        new_ins.append(nsub)
+        new_ops.append(bind(d_getitem, op, key))
+        changed = True
+    if not changed:
+        return subscripts, operands
+    return ",".join(new_ins) + "->" + out, tuple(new_ops)
 
 
 def _parse_einsum(subscripts: str, ranks: "Sequence[int]") -> tuple[list[str], str]:

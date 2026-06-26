@@ -178,6 +178,14 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **einsum repeated-label (diagonal inside einsum)** (twentieth PR): a label repeated within one
+  operand (`'lli'`, or `(3,3,0)` in the interleaved form) is a diagonal. Rather than a bespoke
+  scatter-to-diagonal VJP, `_normalize_einsum_args` now *diagonalizes* such an operand up front --
+  gathering its diagonal with a fancy `d_getitem` index and collapsing the subscript -- so the
+  einsum the rules see has no repeated label and `d_getitem`'s rules carry the gradient
+  (scatter-to-diagonal), forward, vmap, eval_shape, and graph capture. Flipped test_einsum_three_args
+  and test_einsum2_three_args green (suite now 347 passed / 46 skipped). Native regression in
+  `test/test_einsum.py`.
 * **General np.matmul** (nineteenth PR): the matmul VJP handled only the four exact-rank cases
   (1d.1d / 2d@1d / 1d@2d / 2d@2d-or-batched); a *mixed*-rank case (1-D @ batched, or 2-D @ batched
   broadcast) hit `swapaxes` on a 1-D array. Reimplemented `_matmul_grads` to promote a 1-D operand
