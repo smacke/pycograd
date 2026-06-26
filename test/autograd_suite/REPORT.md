@@ -178,6 +178,11 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **Niche misc ops** (sixteenth PR): `np.nan_to_num` (gradient masked to finite inputs --
+  `isfinite(x)`; nan/inf become constants), `np.real_if_close` (identity on the values, so an
+  identity adjoint), and `np.concatenate` with a *positional* axis (`np.concatenate(seq, 1)` --
+  the forward sequence rule now accepts `*args`). Flipped 3 more tests green (suite now 341 passed
+  / 52 skipped). Native regression: `test/test_misc_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

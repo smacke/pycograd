@@ -963,6 +963,8 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             # complex component ops: abs/real/imag/angle are real-valued; conj preserves dtype
             ops.d_abs: abstract_real_component,
             ops.d_real: abstract_real_component,
+            ops.d_real_if_close: abstract_unary,
+            ops.d_nan_to_num: abstract_unary,
             ops.d_imag: abstract_real_component,
             ops.d_angle: abstract_real_component,
             ops.d_conj: abstract_unary,

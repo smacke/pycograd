@@ -200,6 +200,29 @@ def d_angle(x: Operand) -> Var:
     )
 
 
+def d_real_if_close(x: Operand) -> Var:
+    x, xp = _lift(x), _xp()
+    # real_if_close: drop a near-zero imaginary part (else pass through). It is identity on
+    # the values, so its real-adjoint is identity on the cotangent.
+    return _nonholo_unary(x, xp.real_if_close(x.value), lambda z, g: g, d_real_if_close)
+
+
+def d_nan_to_num(x: Operand, *args: Any, **kwargs: Any) -> Var:
+    # Replace nan -> 0 and +/-inf -> large finite. Differentiable where the input is finite
+    # (those pass through ~unchanged); a nan/inf input becomes a constant, so its gradient is
+    # zero -- the VJP masks by ``isfinite(x)``.
+    x, xp = _lift(x), _xp()
+    mask = xp.isfinite(x.value).astype(x.value.dtype)
+    out = Var(xp.nan_to_num(x.value, *args, **kwargs), _parents=(x,))
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, _unbroadcast(out.grad * mask, x.value.shape))
+
+    out._backward = _backward
+    _record_vjp(out, d_nan_to_num, (x,), {"mask": mask})
+    return out
+
+
 def d_square(x: Operand) -> Var:
     x, xp = _lift(x), _xp()
     return x._unary(xp.square(x.value), lambda a, g: g * 2 * a, d_square)
@@ -2552,6 +2575,8 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     # ``_NONHOLOMORPHIC``).
     d_conj: (np.conj, np.conjugate),
     d_real: (np.real,),
+    d_real_if_close: (np.real_if_close,),
+    d_nan_to_num: (np.nan_to_num,),
     d_imag: (np.imag,),
     d_angle: (np.angle,),
     d_square: (np.square,),
@@ -2825,6 +2850,24 @@ def _vjp_conj(
 ) -> list[Boxed]:
     # Real-adjoint of conj is conj (an involution); identity on a real cotangent.
     return [_b(d_conj, g)]
+
+
+def _vjp_real_if_close(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    return [g]  # identity on the values -> identity on the cotangent
+
+
+def _vjp_nan_to_num(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    return [_b(d_mul, g, params["mask"])]  # zero where the input was nan/inf
 
 
 def _vjp_real(
@@ -3369,6 +3412,8 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_abs: _vjp_abs,
             d_conj: _vjp_conj,
             d_real: _vjp_real,
+            d_real_if_close: _vjp_real_if_close,
+            d_nan_to_num: _vjp_nan_to_num,
             d_imag: _vjp_imag,
             d_angle: _vjp_angle,
             d_add: _vjp_add,

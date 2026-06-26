@@ -237,10 +237,13 @@ def _linear_seq_for(prim: Prim) -> Rule:
     """Linear over a *sequence* operand (concatenate / stack): the tangent of the join is
     the join of the per-element tangents."""
 
-    def rule(trace: JVPTrace, seq: Sequence[Boxed], **kwargs: Any) -> JVPTracer:
+    def rule(
+        trace: JVPTrace, seq: Sequence[Boxed], *args: Any, **kwargs: Any
+    ) -> JVPTracer:
+        # ``*args`` carries a *positional* axis (``np.concatenate(seq, 1)``).
         tracers = [trace._raise(s) for s in seq]
-        primal_out = bind(prim, _primals(tracers), **kwargs)
-        tangent_out = bind(prim, _tangents(tracers), **kwargs)
+        primal_out = bind(prim, _primals(tracers), *args, **kwargs)
+        tangent_out = bind(prim, _tangents(tracers), *args, **kwargs)
         return _result(trace, primal_out, tangent_out)
 
     return rule
@@ -384,6 +387,17 @@ def _einsum_rule(trace: JVPTrace, subscripts: Any, *operands: Boxed) -> JVPTrace
         tangent_out = (
             term if tangent_out is None else bind(ops.d_add, tangent_out, term)
         )
+    return _result(trace, primal_out, tangent_out)
+
+
+def _nan_to_num_rule(trace: JVPTrace, x: Boxed, *args: Any, **kwargs: Any) -> JVPTracer:
+    """nan_to_num passes finite inputs through and clamps nan/inf to constants: the tangent
+    flows only where the (concrete) primal is finite."""
+    t = trace._raise(x)
+    pv = np.asarray(_value(cast(Any, t.primal)))
+    mask = np.isfinite(pv).astype(pv.dtype)
+    primal_out = bind(ops.d_nan_to_num, t.primal, *args, **kwargs)
+    tangent_out = bind(ops.d_mul, mask, t.tangent)
     return _result(trace, primal_out, tangent_out)
 
 
@@ -751,6 +765,8 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_angle: _angle_jvp_rule,
             ops.d_conj: _linear_for(ops.d_conj),
             ops.d_real: _linear_for(ops.d_real),
+            ops.d_real_if_close: _linear_for(ops.d_real_if_close),
+            ops.d_nan_to_num: _nan_to_num_rule,
             ops.d_imag: _linear_for(ops.d_imag),
         }
     )

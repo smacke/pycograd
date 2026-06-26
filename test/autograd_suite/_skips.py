@@ -15,10 +15,6 @@ SKIPS = {
     ): "pycograd-design: casts an intermediate to int64 (`np.int64(W[:, -1])`) and uses it as a fancy index. A pycograd `Var` holds real-valued tensors only (resolve_dtype rejects ints), so an in-trace int cast has no tape representation -- distinct from the float `.astype` cast, which is supported (ops.d_astype).",
     (
         "test_numpy.py",
-        "test_concatenate_axis_1_unnamed",
-    ): "pycograd-gap: concatenate of 1-D operands along a nonzero axis (degenerate)",
-    (
-        "test_numpy.py",
         "test_diagonal",
     ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
     (
@@ -29,7 +25,6 @@ SKIPS = {
         "test_numpy.py",
         "test_make_diagonal",
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
-    ("test_numpy.py", "test_nan_to_num"): "pycograd-gap: no VJP rule for np.nan_to_num",
     (
         "test_numpy.py",
         "test_simple_append_list",
@@ -50,10 +45,6 @@ SKIPS = {
         "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
-    (
-        "test_systematic.py",
-        "test_real_ic",
-    ): "pycograd-gap: np.real_if_close has no rule (a niche data-dependent variant of real(); complex real/imag/conj/conjugate/angle ARE supported)",
     (
         "test_systematic.py",
         "test_std",

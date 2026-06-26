@@ -703,6 +703,8 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_getitem: _getitem_rule,
             ops.d_conj: _elementwise_for(ops.d_conj),
             ops.d_real: _elementwise_for(ops.d_real),
+            ops.d_real_if_close: _elementwise_for(ops.d_real_if_close),
+            ops.d_nan_to_num: _elementwise_for(ops.d_nan_to_num),
             ops.d_imag: _elementwise_for(ops.d_imag),
             ops.d_angle: _elementwise_for(ops.d_angle),
             ops.d_maximum: _elementwise_for(ops.d_maximum),
