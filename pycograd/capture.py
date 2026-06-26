@@ -446,6 +446,17 @@ def _arg_aval(a: BindArg) -> object:
     return a
 
 
+def _has_tracer(a: object) -> bool:
+    """True if ``a`` is, or (recursively) contains, a :class:`GraphTracer` -- i.e. it is an
+    operand sequence whose elements are graph nodes, not a constant index/shape tuple.
+    """
+    if isinstance(a, GraphTracer):
+        return True
+    if isinstance(a, (list, tuple)):
+        return any(_has_tracer(e) for e in a)
+    return False
+
+
 def _snapshot(a: BindArg) -> Any:
     """The concrete value to store for a captured constant. Resolves an ambient-parameter
     proxy (:class:`~pycograd.params.Weight`) or :class:`~pycograd.params.Param` to its live
@@ -470,7 +481,11 @@ class GraphTrace(Trace):
     def _spec(self, a: BindArg) -> ArgSpec:
         if isinstance(a, GraphTracer):
             return Ref(a.id)
-        if isinstance(a, (list, tuple)):
+        if isinstance(a, (list, tuple)) and _has_tracer(a):
+            # An *operand* sequence (concatenate/stack's list of nodes) is traversed so each
+            # element becomes a Ref. A constant tuple with no tracer -- e.g. a multi-axis
+            # ``getitem`` key ``(slice, slice)`` or a ``pad`` width -- is stored whole, so it
+            # replays as the raw Python value rather than a tuple of ``Const`` wrappers.
             return type(a)(self._spec(e) for e in a)
         if isinstance(a, Weight):
             # A trainable ambient weight becomes a live, keyed ``_WEIGHT`` leaf (so the graph

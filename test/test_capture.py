@@ -532,3 +532,34 @@ def test_lowering_rules_consistent():
     assert keys <= set(forward._JVP_FOR)
     assert keys <= set(batching._RULE_FOR)
     assert keys.isdisjoint(ops._VJP_FOR)
+
+
+def _g_flipud(x):
+    return np.sum(np.flipud(x) ** 2)
+
+
+def _g_trace(x):
+    return np.trace(x) ** 2
+
+
+def _g_diag(x):
+    return np.sum(np.diag(x) ** 2)
+
+
+def _g_diff(x):
+    return np.sum(np.diff(x, axis=0) ** 2)
+
+
+def _g_gradient(x):
+    return np.sum(np.gradient(x, axis=0) ** 2)
+
+
+@pytest.mark.parametrize("fn", [_g_flipud, _g_trace, _g_diag, _g_diff, _g_gradient])
+def test_getitem_lowering_capture_grad(fn):
+    # These lower to getitem with a multi-axis (tuple) key; the captured key must replay as a
+    # raw tuple of slices/arrays, not a tuple of Const wrappers, for the reverse scatter.
+    X = _rng(0).standard_normal((4, 4))
+    val, grads = value_and_grad(capture(fn, X))(X)
+    _, eager = value_and_grad(fn)(X)
+    assert np.allclose(np.asarray(val), fn(X))
+    assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)
