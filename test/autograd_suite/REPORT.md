@@ -168,14 +168,17 @@ forward gap currently skips the whole test even though reverse would pass — so
 
 ### 3. Missing subsystems (wholesale, module-skipped)
 
-| Subsystem | Effort | Roadmap status |
+These are simply **unimplemented** — none is a decided "won't support." The column below is
+an *effort/shape-of-work* estimate (what new machinery each needs), not a scope judgement.
+
+| Subsystem | Effort | What it would take |
 |---|---|---|
-| **Complex numbers** (`real`/`imag`/`conj`/`angle`, complex dtypes, `holomorphic_grad`) | large (a parallel cotangent convention) | explicit non-goal currently |
-| **`np.linalg`** gradients (`inv`/`pinv`/`solve`/`det`/`slogdet`/`eigh`/`svd`/`qr`/`cholesky`) | large | not yet started |
-| **`np.fft`** | medium | not yet started |
-| **`scipy`** (`special`/`stats`/`linalg`/`signal`/`integrate`) | large | no scipy backend |
-| **In-place / scatter** (`A[i] = b`) | medium | Phase 2 (WIP per ROADMAP) |
-| **dtype preservation** (grad keeps float32/float16; longdouble/clongdouble) | medium | pycograd defaults to a float64 working dtype |
+| **Complex numbers** (`real`/`imag`/`conj`/`angle`, complex dtypes, `holomorphic_grad`) | large | a parallel cotangent convention; pycograd is real-only today |
+| **`np.linalg`** gradients (`inv`/`pinv`/`solve`/`det`/`slogdet`/`eigh`/`svd`/`qr`/`cholesky`) | large | a bespoke VJP per decomposition |
+| **`np.fft`** | medium | FFT/IFFT primitives + their (complex) adjoints |
+| **`scipy`** (`special`/`stats`/`linalg`/`signal`/`integrate`) | large | a scipy backend + per-fn rules |
+| **In-place / scatter** (`A[i] = b`) | medium | a forward scatter-add primitive |
+| **dtype preservation** (grad keeps float32/float16; longdouble/clongdouble) | medium | thread the input dtype through; pycograd defaults to a float64 working dtype |
 
 ### Future cleanup: unify `grad` and `make_vjp`
 
