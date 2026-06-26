@@ -494,6 +494,15 @@ class GraphTrace(Trace):
     def process_primitive(
         self, prim: Prim, args: Sequence[BindArg], params: dict[str, Any]
     ) -> Boxed:
+        # A lowering op (dot, outer, trace, a split, ...) carries no VJP of its own: expand it
+        # into the primitives it composes from -- the same rule jvp/vmap use -- so the captured
+        # graph records those (each with a graph reverse rule) instead of an opaque node the
+        # graph reverse pass couldn't differentiate.
+        from pycograd import ops
+
+        lower = ops._LOWERING_RULES.get(prim)
+        if lower is not None:
+            return lower(self, *args, **params)
         rule = _ABS_FOR.get(prim)
         if rule is None:  # pragma: no cover - capture covers what eval_shape covers
             raise NotImplementedError(

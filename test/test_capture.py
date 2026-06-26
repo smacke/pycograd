@@ -480,3 +480,55 @@ def test_reorder_matmul_chain_batched():
     gr = reorder_matmul_chain(g)
     assert _n_matmul(gr) == _n_matmul(g) == 2
     _grads_match_after(gr, _chain_batched_fn, args, atol=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# Lowering ops in capture: a composition op (dot, outer, moveaxis, ...) expands into the
+# primitives it's built from, so the captured graph records *those* and the graph reverse
+# pass differentiates it (rather than choking on an opaque node).
+# ---------------------------------------------------------------------------
+def _g_dot(x):
+    return np.sum(np.dot(x, x) ** 2)
+
+
+def _g_outer(x):
+    return np.sum(np.outer(np.ravel(x), np.ravel(x)) ** 2)
+
+
+def _g_moveaxis(x):
+    return np.sum(np.moveaxis(x, 0, 1) ** 2)
+
+
+def _g_swapaxes(x):
+    return np.sum(np.swapaxes(x, 0, 1) ** 2)
+
+
+def _g_tril(x):
+    return np.sum(np.tril(x) ** 2)
+
+
+def _g_ravel(x):
+    return np.sum(np.ravel(x) * np.arange(16.0))
+
+
+@pytest.mark.parametrize(
+    "fn", [_g_dot, _g_outer, _g_moveaxis, _g_swapaxes, _g_tril, _g_ravel]
+)
+def test_lowering_ops_capture_grad(fn):
+    X = _rng(0).standard_normal((4, 4))
+    g = capture(fn, X)
+    val, grads = value_and_grad(g)(X)
+    _, eager = value_and_grad(fn)(X)
+    assert np.allclose(np.asarray(val), fn(X))
+    assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)
+
+
+def test_lowering_rules_consistent():
+    # ops._LOWERING_RULES is what capture lowers through; the forward (jvp) and batch (vmap)
+    # tables list the same rules, and a lowering op never also claims a VJP of its own.
+    from pycograd import batching, forward
+
+    keys = set(ops._LOWERING_RULES)
+    assert keys <= set(forward._JVP_FOR)
+    assert keys <= set(batching._RULE_FOR)
+    assert keys.isdisjoint(ops._VJP_FOR)

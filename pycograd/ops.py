@@ -32,6 +32,7 @@ from pycograd._typing import (
     Index,
     Operand,
     Prim,
+    Rule,
     Shape,
 )
 from pycograd.backends import current_backend
@@ -2314,6 +2315,52 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
 }
 
 _INTERCEPT: dict[Prim, Prim] = {fn: impl for impl, fns in _RULES.items() for fn in fns}
+
+
+# ---------------------------------------------------------------------------
+# Lowering rules: ops that carry no VJP of their own because they *expand* into other
+# primitives (a contraction einsum, a transpose, a stack of getitems, ...). Their single
+# trace-agnostic rule re-``bind``s those primitives, so it runs identically under every trace
+# level -- ``jvp`` (forward._JVP_FOR), ``vmap`` (batching._RULE_FOR), and graph ``capture``
+# (which would otherwise record an opaque node the graph reverse pass can't differentiate).
+# ``capture`` consumes this table directly; the forward/batch tables list the same rules
+# inline, and ``test_lowering_rules_consistent`` guards that they cover exactly these ops and
+# that none of them also claims a ``_VJP_FOR`` entry (a lowering op has no VJP of its own).
+# (``sort``/``partition`` are NOT here: their permutation is value-dependent, so their forward
+# rule needs the concrete primal and they stay genuine primitives.)
+# ---------------------------------------------------------------------------
+_LOWERING_RULES: dict[Prim, Rule] = {
+    d_dot: contraction_transform_rule(d_dot),
+    d_inner: contraction_transform_rule(d_inner),
+    d_tensordot: contraction_transform_rule(d_tensordot),
+    d_moveaxis: _transpose_lowering_transform(moveaxis_perm),
+    d_swapaxes: _transpose_lowering_transform(swapaxes_perm),
+    d_rollaxis: _transpose_lowering_transform(rollaxis_perm),
+    d_tril: _tri_lowering_transform(np.tril),
+    d_triu: _tri_lowering_transform(np.triu),
+    d_split: split_transform_rule("split"),
+    d_array_split: split_transform_rule("array_split"),
+    d_vsplit: split_transform_rule("vsplit"),
+    d_hsplit: split_transform_rule("hsplit"),
+    d_dsplit: split_transform_rule("dsplit"),
+    d_diff: diff_transform_rule,
+    d_diag: diag_transform_rule,
+    d_diagonal: diagonal_transform_rule,
+    d_select: select_transform_rule,
+    d_gradient: gradient_transform_rule,
+    d_append: append_transform_rule,
+    d_flipud: _flip_transform_rule(0),
+    d_fliplr: _flip_transform_rule(1),
+    d_rot90: rot90_transform_rule,
+    d_trace: trace_transform_rule,
+    d_outer: outer_transform_rule,
+    d_array: array_transform_rule,
+    d_ravel: _reshape_lowering_transform(ravel_shape),
+    d_squeeze: _reshape_lowering_transform(squeeze_shape),
+    d_atleast_1d: _reshape_lowering_transform(atleast_1d_shape),
+    d_atleast_2d: _reshape_lowering_transform(atleast_2d_shape),
+    d_atleast_3d: _reshape_lowering_transform(atleast_3d_shape),
+}
 
 
 # ---------------------------------------------------------------------------
