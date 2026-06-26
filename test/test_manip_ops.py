@@ -260,3 +260,14 @@ def test_stack_1d_edges():
         _fd(lambda x: f_row_stack(x, B), A),
         atol=1e-5,
     )
+
+
+def f_append_list(a):
+    # a python list of tape values as the first append operand (1-D)
+    return np.sum(np.append([a, a * 2.0, a + 1.0], 5.0) ** 2)
+
+
+def test_append_python_list_operand():
+    g = float(np.asarray(grad(f_append_list)(1.5)[0]))
+    fd = (f_append_list(1.5 + 1e-6) - f_append_list(1.5 - 1e-6)) / 2e-6
+    assert np.isclose(g, fd, atol=1e-4)

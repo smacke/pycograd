@@ -23,10 +23,6 @@ SKIPS = {
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
     (
         "test_numpy.py",
-        "test_simple_append_list",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
-    (
-        "test_numpy.py",
         "test_simple_append_list_2D",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (

@@ -1947,10 +1947,15 @@ def gradient_abstract_rule(
 
 # ---------------------------------------------------------------------------
 # np.append(arr, values, axis) -- a concatenate (``axis=None`` ravels both operands first).
-# A composition of ``d_concatenate`` (+ ``d_ravel``), so no own VJP. (A python-list ``arr`` is
-# the separate np.array-of-boxes gap; array operands work.)
+# A composition of ``d_concatenate`` (+ ``d_ravel``), so no own VJP. A python-(nested-)list
+# operand is stacked first via the array-of-boxes constructor (``d_array``).
 # ---------------------------------------------------------------------------
+def _append_operand(x: Any) -> Any:
+    return d_array(x) if isinstance(x, (list, tuple)) else x
+
+
 def d_append(arr: Operand, values: Operand, axis: Any = None) -> Var:
+    arr, values = _append_operand(arr), _append_operand(values)
     if axis is None:
         return d_concatenate([d_ravel(arr), d_ravel(values)], axis=0)
     return d_concatenate([arr, values], axis=axis)
@@ -1961,6 +1966,7 @@ def append_transform_rule(
 ) -> Boxed:
     from pycograd.trace import bind
 
+    arr, values = _append_operand(arr), _append_operand(values)
     if axis is None:
         return bind(d_concatenate, [bind(d_ravel, arr), bind(d_ravel, values)], axis=0)
     return bind(d_concatenate, [arr, values], axis=axis)
