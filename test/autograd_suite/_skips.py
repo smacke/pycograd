@@ -8,12 +8,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_astype",
-    ): (
-        "pycograd-design: `.astype` IS supported (ops.d_astype: graph-differentiable cast, "
-        "see test_dtypes.py::test_astype_*). This test asserts the autograd convention that "
-        "the eager grad follows the float32 *input array*'s dtype; pycograd instead follows "
-        "the ambient working dtype (float64 by default) -- use `with pg.dtype('float32')`."
-    ),
+    ): "pycograd-design: `.astype` IS supported (ops.d_astype: graph-differentiable cast, see test_dtypes.py::test_astype_*). This test asserts the autograd convention that the eager grad follows the float32 *input array*'s dtype; pycograd instead follows the ambient working dtype (float64 by default) -- use `with pg.dtype('float32')`.",
     (
         "test_numpy.py",
         "test_c_",
@@ -25,12 +20,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_cast_to_int",
-    ): (
-        "pycograd-design: casts an intermediate to int64 (`np.int64(W[:, -1])`) and uses it "
-        "as a fancy index. A pycograd `Var` holds real-valued tensors only (resolve_dtype "
-        "rejects ints), so an in-trace int cast has no tape representation -- distinct from "
-        "the float `.astype` cast, which is supported (ops.d_astype)."
-    ),
+    ): "pycograd-design: casts an intermediate to int64 (`np.int64(W[:, -1])`) and uses it as a fancy index. A pycograd `Var` holds real-valued tensors only (resolve_dtype rejects ints), so an in-trace int cast has no tape representation -- distinct from the float `.astype` cast, which is supported (ops.d_astype).",
     (
         "test_numpy.py",
         "test_concatenate_axis_1_unnamed",
@@ -41,25 +31,13 @@ SKIPS = {
     ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
     (
         "test_numpy.py",
-        "test_len",
-    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
-    (
-        "test_numpy.py",
         "test_linspace",
     ): "pycograd-gap: no VJP rule for np.linspace (differentiating start/stop)",
     (
         "test_numpy.py",
         "test_make_diagonal",
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
-    (
-        "test_numpy.py",
-        "test_mean_list_of_boxes",
-    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     ("test_numpy.py", "test_nan_to_num"): "pycograd-gap: no VJP rule for np.nan_to_num",
-    (
-        "test_numpy.py",
-        "test_non_numpy_sum",
-    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_numpy.py",
         "test_r_basic",
@@ -88,14 +66,6 @@ SKIPS = {
         "test_numpy.py",
         "test_simple_append_list_2D",
     ): "pycograd-gap: unsupported op (no autodiff rule)",
-    (
-        "test_numpy.py",
-        "test_std_list_of_boxes",
-    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
-    (
-        "test_numpy.py",
-        "test_var_list_of_boxes",
-    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_systematic.py",
         "test_column_stack_1d",

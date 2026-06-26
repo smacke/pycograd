@@ -120,6 +120,62 @@ class Tracer:
     def ndim(self) -> int:
         return len(self.aval.shape)
 
+    def __len__(self) -> int:
+        # Mirror numpy: the length of the leading axis. Needed because the ``len`` builtin
+        # bypasses instrumentation (it calls ``__len__`` in C), so ``len(tracer)`` in user code
+        # would otherwise raise.
+        return int(self.shape[0])  # type: ignore[arg-type]  # concrete for a real tracer
+
+    # -- arithmetic operator surface ------------------------------------------------------
+    # Instrumented ``a + b`` is intercepted by pyccolo's ``before_binop`` (which never consults
+    # these); these dunders are the fallback for *non*-instrumented arithmetic -- e.g. the
+    # ``sum``/``min``/``max`` builtins, which add/compare in C. Each routes through ``bind`` so
+    # the right trace level (jvp/vmap/abstract/capture) processes it. (``ShapedArray`` overrides
+    # some of these for shape inference; its versions win via MRO.)
+    def __add__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_add, self, o)
+
+    __radd__ = __add__
+
+    def __mul__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_mul, self, o)
+
+    __rmul__ = __mul__
+
+    def __sub__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_sub, self, o)
+
+    def __rsub__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_sub, o, self)
+
+    def __truediv__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_div, self, o)
+
+    def __rtruediv__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_div, o, self)
+
+    def __neg__(self) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_neg, self)
+
+    def __pow__(self, o: object) -> "Boxed":
+        from pycograd import ops
+
+        return bind(ops.d_pow, self, o)
+
 
 # ---------------------------------------------------------------------------
 # The base level: EvalTrace.

@@ -322,14 +322,17 @@ class ShapedArray(Tracer):
         return self._keep(abstract_transpose(self))
 
     # -- arithmetic: every elementwise op is a broadcast of operand shapes ----
-    def __add__(self, o: AbstractVal) -> ShapedArray:
-        return self._keep(_ew_binary(self, o))
+    # ``o`` is typed ``object`` (not ``AbstractVal``) to satisfy LSP against the base
+    # ``Tracer`` operator surface, whose operand is any value; ``_ew_binary`` consumes the
+    # ``AbstractVal`` subset.
+    def __add__(self, o: object) -> ShapedArray:
+        return self._keep(_ew_binary(self, cast(AbstractVal, o)))
 
     __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __add__
     __truediv__ = __rtruediv__ = __add__
 
-    def __pow__(self, p: AbstractVal) -> ShapedArray:
-        return self._keep(_ew_binary(self, p))
+    def __pow__(self, p: object) -> ShapedArray:
+        return self._keep(_ew_binary(self, cast(AbstractVal, p)))
 
     __rpow__ = __pow__
 

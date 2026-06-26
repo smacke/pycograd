@@ -157,6 +157,14 @@ this work** — see below).
   axes), and `np.cumsum(axis=None)` (now ravels first, returning a 1-D cumulative sum like numpy,
   instead of raising). Full forward/vmap/eval_shape. Flipped ~9 more tests green (suite now 297
   passed / 96 skipped). Native regression: `test/test_flip_trace_ops.py`.
+* **List-of-box reductions + builtins over boxes** (thirteenth PR): `np.mean`/`np.std`/`np.var`
+  over a python *list/tuple* of tape values (`np.mean([a, b])`) now work -- `_lift` stacks a
+  list/tuple holding boxes onto a new leading axis (a differentiable constructor) so the reduction
+  sees one array. `len(box)` and the `sum`/`min`/`max` builtins over boxes work too: those bypass
+  instrumentation (they call `__len__`/`__add__` in C), so the `Tracer` base class gained `__len__`
+  and the arithmetic operator surface (routing through `bind`, so the right jvp/vmap/abstract/graph
+  level handles them). Flipped 5 more tests green (suite now 327 passed / 66 skipped). Native
+  regression: `test/test_list_reductions.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

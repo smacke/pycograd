@@ -560,6 +560,10 @@ class Var:
     def dtype(self) -> np.dtype:
         return self.value.dtype
 
+    def __len__(self) -> int:
+        # Mirror numpy: the length of the leading axis (a 0-d array has no len).
+        return len(self.value)
+
     def __array__(self, *args: object, **kwargs: object) -> Array:
         # No concrete array view: a numpy call reaching here was NOT intercepted,
         # so fail loudly instead of silently building an object array. Defining it
@@ -719,7 +723,22 @@ def _record_vjp(
 
 def _lift(x: Operand) -> Var:
     x = _unwrap_weight(x)
-    return x if isinstance(x, Var) else Var(x)
+    if isinstance(x, Var):
+        return x
+    if isinstance(x, (list, tuple)) and _seq_has_box(x):
+        # A python list/tuple holding tape values -- e.g. ``np.mean([a, b])`` or a list arg
+        # numpy can't stack because the leaves have no array conversion. Stack it onto a new
+        # leading axis (a differentiable constructor) so the reduction/op sees one array.
+        from pycograd import ops
+
+        return cast(Var, ops.d_stack(list(x)))
+    return Var(x)
+
+
+def _seq_has_box(seq: "list | tuple") -> bool:
+    from pycograd.trace import Tracer
+
+    return any(isinstance(e, (Var, Tracer)) for e in seq)
 
 
 def detach(x: Operand) -> Var:
