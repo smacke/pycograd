@@ -2126,6 +2126,51 @@ def d_dstack(seq: Sequence[Operand]) -> Var:
 
 
 # ---------------------------------------------------------------------------
+# np.array over differentiable leaves -- ``np.array([v0, v1, ...])`` where the (possibly
+# nested) list/tuple holds ``Var``/``Tracer`` boxes. numpy can't build such an array (the
+# boxes have no array conversion), so we *stack* the leaves: each nesting level becomes a
+# ``d_stack`` along a fresh leading axis. A list with no boxes (and ``np.array`` of a single
+# box, an identity) passes straight through to numpy -- so intercepting the pervasive
+# ``np.array`` is transparent for every ordinary call. A composition of ``d_stack`` (full
+# rules), so no own VJP.
+# ---------------------------------------------------------------------------
+def _contains_box(obj: object) -> bool:
+    from pycograd.trace import Tracer
+
+    if isinstance(obj, (Var, Tracer)):
+        return True
+    if isinstance(obj, (list, tuple)):
+        return any(_contains_box(o) for o in obj)
+    return False
+
+
+def _array_build(obj: Any) -> Boxed:
+    from pycograd.trace import bind
+
+    if isinstance(obj, (list, tuple)):
+        return bind(d_stack, [_array_build(o) for o in obj], axis=0)
+    return obj  # a single box -> identity (np.array of an array is a copy)
+
+
+def d_array(obj: Any, *args: Any, **kwargs: Any) -> Var:
+    if not _contains_box(obj):
+        return cast(Var, np.array(obj, *args, **kwargs))
+    return cast(Var, _array_build(obj))
+
+
+def array_transform_rule(_trace: Boxed, obj: Any, *args: Any, **kwargs: Any) -> Boxed:
+    if not _contains_box(obj):
+        return cast(Boxed, np.array(obj, *args, **kwargs))
+    return _array_build(obj)
+
+
+def array_abstract_rule(obj: Any, *args: Any, **kwargs: Any) -> Boxed:
+    if not _contains_box(obj):
+        return cast(Boxed, np.array(obj, *args, **kwargs))
+    return _array_build(obj)
+
+
+# ---------------------------------------------------------------------------
 # Interception tables: which numpy/math callables route to which primitive.
 # ---------------------------------------------------------------------------
 # Only numpy ufuncs / math C-functions need entries here: they bypass our Python
@@ -2252,6 +2297,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_rot90: (np.rot90,),
     d_trace: (np.trace,),
     d_outer: (np.outer,),
+    d_array: (np.array,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),

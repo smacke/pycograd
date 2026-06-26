@@ -7,34 +7,6 @@ Byte-faithful ports: gaps centralized here, applied in conftest via pytest_colle
 SKIPS = {
     (
         "test_numpy.py",
-        "test_1d_array",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_1d_array_fanout",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
-    (
-        "test_numpy.py",
-        "test_2d_array",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_2d_array_fanout",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
-    (
-        "test_numpy.py",
-        "test_array_from_arrays",
-    ): "pycograd-gap: np.array([...]) of Var/box leaves is not a differentiable constructor",
-    (
-        "test_numpy.py",
-        "test_array_from_arrays_2",
-    ): "pycograd-gap: np.array([...]) of Var/box leaves is not a differentiable constructor",
-    (
-        "test_numpy.py",
-        "test_array_from_scalar",
-    ): "pycograd-gap: np.array([...]) of Var/box leaves is not a differentiable constructor",
-    (
-        "test_numpy.py",
         "test_astype",
     ): "pycograd-gap: Var.astype is unsupported (dtype cast)",
     (
@@ -60,7 +32,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_len",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
+    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_numpy.py",
         "test_linspace",
@@ -71,29 +43,13 @@ SKIPS = {
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
     (
         "test_numpy.py",
-        "test_max_equal_values",
-    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
-    (
-        "test_numpy.py",
-        "test_max_equal_values_2d",
-    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
-    (
-        "test_numpy.py",
-        "test_maximum_equal_values_2d",
-    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
-    (
-        "test_numpy.py",
         "test_mean_list_of_boxes",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
-    (
-        "test_numpy.py",
-        "test_min_3_way_equality",
-    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
+    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     ("test_numpy.py", "test_nan_to_num"): "pycograd-gap: no VJP rule for np.nan_to_num",
     (
         "test_numpy.py",
         "test_non_numpy_sum",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
+    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_numpy.py",
         "test_r_basic",
@@ -116,24 +72,20 @@ SKIPS = {
     ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
-        "test_scalar_array_box_attributes",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
-    (
-        "test_numpy.py",
         "test_simple_append_list",
-    ): "pycograd-gap: np.append with a python-list operand (the np.array-of-boxes gap; the array form works)",
+    ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: np.append with a python-list operand (the np.array-of-boxes gap; the array form works)",
+    ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
         "test_std_list_of_boxes",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
+    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_numpy.py",
         "test_var_list_of_boxes",
-    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
+    ): "pycograd-gap: list-of-Var reductions / Python builtins (np.sum/len over a python list of boxes)",
     (
         "test_systematic.py",
         "test_angle",

@@ -508,6 +508,10 @@ class Var:
     def size(self) -> int:
         return self.value.size
 
+    @property
+    def dtype(self) -> np.dtype:
+        return self.value.dtype
+
     def __array__(self, *args: object, **kwargs: object) -> Array:
         # No concrete array view: a numpy call reaching here was NOT intercepted,
         # so fail loudly instead of silently building an object array. Defining it

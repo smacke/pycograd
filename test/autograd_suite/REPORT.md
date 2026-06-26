@@ -123,6 +123,15 @@ this work** — see below).
   `concatenate` composition (`axis=None` ravels both operands first). Flipped ~2 more tests
   green (suite now 288 passed / 105 skipped). The python-*list*-operand `append` cases stay
   skipped (the np.array-of-boxes gap). Native regression in `test/test_manip_ops.py`.
+* **np.array over boxes** (eleventh PR): `np.array([v0, v1, ...])` where the (possibly nested)
+  list holds `Var`/`Tracer` leaves now builds the array by *stacking* -- each nesting level is a
+  `d_stack` along a fresh leading axis (a composition, no own VJP). A list with **no** boxes (and
+  `np.array` of a single box, an identity) passes straight through to numpy, so intercepting the
+  pervasive `np.array` is transparent for every ordinary call (the full suite is unchanged). Also
+  added `Var.dtype`. This unblocked the array-constructor, scalar/2-D *fanout*, equal-value
+  *max/min tie* (the tie-splitting was already correct -- only the construction blocked it), and
+  list-operand `append` tests -- 12 more green (suite now 315 passed / 78 skipped). Native
+  regression: `test/test_array_of_boxes.py`.
 * **np.outer** (tenth PR): the outer product of two flattened vectors -- `einsum('i,j->ij',
   ravel(a), ravel(b))`, a ravel/einsum composition (full rules), so reverse/forward/vmap/eval_shape
   all work and no own VJP. Flipped 2 more tests green (suite now 303 passed / 90 skipped). Native

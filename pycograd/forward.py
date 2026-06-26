@@ -762,6 +762,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_rot90: ops.rot90_transform_rule,
             ops.d_trace: ops.trace_transform_rule,
             ops.d_outer: ops.outer_transform_rule,
+            ops.d_array: ops.array_transform_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),
