@@ -178,6 +178,10 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **np.linspace** (seventeenth PR): evenly spaced points are `start*(1-t) + stop*t` with the
+  constant fractions `t=i/(num-1)` -- a mul/add composition (lowers in graph too), linear in both
+  endpoints (`num<=1` uses `t=0` so a single point is `start`). Flipped 1 more test green (suite now
+  342 passed / 51 skipped). Native regression in `test/test_misc_ops.py`.
 * **Niche misc ops** (sixteenth PR): `np.nan_to_num` (gradient masked to finite inputs --
   `isfinite(x)`; nan/inf become constants), `np.real_if_close` (identity on the values, so an
   identity adjoint), and `np.concatenate` with a *positional* axis (`np.concatenate(seq, 1)` --

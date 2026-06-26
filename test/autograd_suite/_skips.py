@@ -19,10 +19,6 @@ SKIPS = {
     ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
     (
         "test_numpy.py",
-        "test_linspace",
-    ): "pycograd-gap: no VJP rule for np.linspace (differentiating start/stop)",
-    (
-        "test_numpy.py",
         "test_make_diagonal",
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
     (

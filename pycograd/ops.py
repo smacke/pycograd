@@ -2416,6 +2416,35 @@ def d_dstack(seq: Sequence[Operand], **_: Any) -> Var:
     return d_concatenate([_atleast_3d_depth(s) for s in seq], axis=2)
 
 
+# np.linspace(start, stop, num) -- evenly spaced points: ``start*(1-t) + stop*t`` with the
+# constant fractions ``t = i/(num-1)``. A mul/add composition (lowers in graph too), linear in
+# both endpoints. (endpoint=True only; ``num<=1`` uses ``t=0`` so a single point is ``start``.)
+def _linspace_t(num: Any) -> Array:
+    n = int(num)
+    return _xp().zeros(n) if n <= 1 else _xp().arange(n) / (n - 1)
+
+
+def _linspace_build(start: Boxed, stop: Boxed, num: Any) -> Boxed:
+    from pycograd.trace import bind
+
+    t = _linspace_t(num)
+    return bind(d_add, bind(d_mul, start, 1.0 - t), bind(d_mul, stop, t))
+
+
+def d_linspace(start: Operand, stop: Operand, num: Any = 50, **_: Any) -> Var:
+    return cast(Var, _linspace_build(cast(Boxed, start), cast(Boxed, stop), num))
+
+
+def linspace_transform_rule(
+    _trace: Boxed, start: Boxed, stop: Boxed, num: Any = 50, **_: Any
+) -> Boxed:
+    return _linspace_build(start, stop, num)
+
+
+def linspace_abstract_rule(start: Boxed, stop: Boxed, num: Any = 50, **_: Any) -> Boxed:
+    return _linspace_build(start, stop, num)
+
+
 # numpy's ``np.r_[...]`` / ``np.c_[...]`` index-expression objects: row- and column-wise
 # concatenation of the bracketed pieces, where an int ``slice`` (``1:10``) expands to an
 # ``arange``. Routed here from the subscript handler (tracer.py); the array/box pieces stay
@@ -2577,6 +2606,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_real: (np.real,),
     d_real_if_close: (np.real_if_close,),
     d_nan_to_num: (np.nan_to_num,),
+    d_linspace: (np.linspace,),
     d_imag: (np.imag,),
     d_angle: (np.angle,),
     d_square: (np.square,),
@@ -2693,6 +2723,7 @@ _LOWERING_RULES: dict[Prim, Rule] = {
     d_rot90: rot90_transform_rule,
     d_trace: trace_transform_rule,
     d_outer: outer_transform_rule,
+    d_linspace: linspace_transform_rule,
     d_cross: cross_transform_rule,
     d_kron: kron_transform_rule,
     d_array: array_transform_rule,

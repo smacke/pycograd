@@ -63,3 +63,23 @@ def test_concatenate_positional_axis():
     g = np.asarray(grad(f_concat_pos_axis)(A)[0])
     assert np.allclose(g, _fd(f_concat_pos_axis, A), atol=1e-5)
     assert eval_shape(lambda x: np.concatenate((x, x), 1), A).shape == (5, 12, 4)
+
+
+# --- np.linspace (linear in start/stop; lowers to mul/add) ------------------
+def f_linspace(a, b):
+    return np.sum(np.linspace(a, b, 5) ** 2)
+
+
+def test_linspace_grad_and_shapes():
+    ga, gb = grad(f_linspace, [0, 1])(1.2, 3.4)
+    # grad_start = sum(2*pt*(1-t)), grad_stop = sum(2*pt*t); check vs finite diff
+    fda = (f_linspace(1.2 + 1e-6, 3.4) - f_linspace(1.2 - 1e-6, 3.4)) / 2e-6
+    fdb = (f_linspace(1.2, 3.4 + 1e-6) - f_linspace(1.2, 3.4 - 1e-6)) / 2e-6
+    assert np.isclose(float(np.asarray(ga)), fda, atol=1e-4)
+    assert np.isclose(float(np.asarray(gb)), fdb, atol=1e-4)
+    # num<=1 edge: a single point equals start
+    assert np.allclose(
+        np.asarray(eval_shape(lambda a: np.linspace(a, 3.4, 5), 1.2).shape), (5,)
+    )
+    _, t = jvp(f_linspace, (1.2, 3.4), (1.0, 0.0))
+    assert np.isfinite(float(np.asarray(t)))

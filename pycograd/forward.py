@@ -815,6 +815,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_rot90: ops.rot90_transform_rule,
             ops.d_trace: ops.trace_transform_rule,
             ops.d_outer: ops.outer_transform_rule,
+            ops.d_linspace: ops.linspace_transform_rule,
             ops.d_cross: ops.cross_transform_rule,
             ops.d_kron: ops.kron_transform_rule,
             ops.d_array: ops.array_transform_rule,

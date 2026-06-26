@@ -949,6 +949,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_rot90: ops.rot90_abstract_rule,
             ops.d_trace: ops.trace_abstract_rule,
             ops.d_outer: ops.outer_abstract_rule,
+            ops.d_linspace: ops.linspace_abstract_rule,
             ops.d_cross: ops.cross_abstract_rule,
             ops.d_kron: ops.kron_abstract_rule,
             ops.d_array: ops.array_abstract_rule,
