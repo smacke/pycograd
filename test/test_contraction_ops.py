@@ -138,3 +138,23 @@ def test_cross_kron_capture_grad(fn):
     _, gg = value_and_grad(capture(fn, X))(X)
     _, ge = value_and_grad(fn)(X)
     assert np.allclose(np.asarray(gg[0]), np.asarray(ge[0]), atol=1e-7)
+
+
+# --- general np.matmul (1-D / 2-D / batched / broadcast) --------------------
+def s_matmul(a, b):
+    return np.sum(np.matmul(a, b) ** 2)
+
+
+def test_matmul_all_rank_regimes():
+    cases = [
+        (_rng.standard_normal(3), _rng.standard_normal(3)),  # 1d.1d -> scalar
+        (_rng.standard_normal(3), _rng.standard_normal((3, 4))),  # 1d@2d
+        (_rng.standard_normal((2, 3)), _rng.standard_normal(3)),  # 2d@1d
+        (_rng.standard_normal((2, 3)), _rng.standard_normal((3, 4))),  # 2d@2d
+        (_rng.standard_normal(3), _rng.standard_normal((2, 3, 4))),  # 1d@batched
+        (_rng.standard_normal((1, 2, 2)), _rng.standard_normal((3, 2, 1))),  # broadcast
+    ]
+    for a, b in cases:
+        ga, gb = grad(s_matmul, [0, 1])(a, b)
+        assert np.allclose(np.asarray(ga), _fd_grad(s_matmul, [a, b], 0), atol=1e-5)
+        assert np.allclose(np.asarray(gb), _fd_grad(s_matmul, [a, b], 1), atol=1e-5)

@@ -569,14 +569,28 @@ def d_getitem(x: Operand, key: Index) -> Var:
 # Linear algebra.
 # ---------------------------------------------------------------------------
 def _matmul_grads(a: Array, b: Array, g: Array) -> tuple[Array, Array]:
-    xp = _xp()
-    if a.ndim == 1 and b.ndim == 1:
-        return g * b, g * a
-    if a.ndim == 2 and b.ndim == 1:
-        return xp.outer(g, b), a.T @ g
-    if a.ndim == 1 and b.ndim == 2:
-        return b @ g, xp.outer(a, g)
-    return g @ b.swapaxes(-1, -2), a.swapaxes(-1, -2) @ g
+    # General matmul VJP over every rank regime (1-D / 2-D / batched, broadcasting). numpy
+    # promotes a 1-D ``a`` to a row ``(1,k)`` and a 1-D ``b`` to a column ``(k,1)`` and drops
+    # the promoted axis from the result; mirror that promotion here, do the batched 2-D VJP
+    # (``dA = G @ Bᵀ``, ``dB = Aᵀ @ G``), then drop the promoted axes. The caller
+    # ``_unbroadcast``s ``dA``/``dB`` back over any broadcast batch dims.
+    a1, b1 = a.ndim == 1, b.ndim == 1
+    aa = a[None, :] if a1 else a  # (..., 1 | m, k)
+    bb = b[:, None] if b1 else b  # (..., k, 1 | n)
+    gg = g
+    if a1 and b1:
+        gg = g[..., None, None]  # scalar -> (1, 1)
+    elif a1:
+        gg = g[..., None, :]  # (..., n) -> (..., 1, n)
+    elif b1:
+        gg = g[..., :, None]  # (..., m) -> (..., m, 1)
+    da = gg @ bb.swapaxes(-1, -2)
+    db = aa.swapaxes(-1, -2) @ gg
+    if a1:
+        da = da[..., 0, :]
+    if b1:
+        db = db[..., :, 0]
+    return da, db
 
 
 def _matmul(a: Operand, b: Operand) -> Var:

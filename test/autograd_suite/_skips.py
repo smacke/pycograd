@@ -33,8 +33,4 @@ SKIPS = {
         "test_systematic.py",
         "test_einsum_three_args",
     ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
-    (
-        "test_systematic.py",
-        "test_matmul",
-    ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
 }

@@ -178,6 +178,13 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **General np.matmul** (nineteenth PR): the matmul VJP handled only the four exact-rank cases
+  (1d.1d / 2d@1d / 1d@2d / 2d@2d-or-batched); a *mixed*-rank case (1-D @ batched, or 2-D @ batched
+  broadcast) hit `swapaxes` on a 1-D array. Reimplemented `_matmul_grads` to promote a 1-D operand
+  to a row/column (numpy's rule), do the batched 2-D VJP, drop the promoted axis, and let
+  `_unbroadcast` collapse broadcast batch dims -- covering every rank regime (and complex, via the
+  existing Hermitian conj). Flipped test_matmul green (suite now 345 passed / 48 skipped). Native
+  regression in `test/test_contraction_ops.py`.
 * **np.std degenerate gradient** (eighteenth PR): `std = sqrt(var)` gave a *nan* gradient at
   zero variance (e.g. `np.std` of a constant) because `0.5/sqrt(0)=inf` times the zero upstream
   is `0*inf`. Guard the coefficient to 0 where `var==0` (autograd's convention: a flat minimum),
