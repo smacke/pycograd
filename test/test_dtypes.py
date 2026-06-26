@@ -34,6 +34,14 @@ def tanh_net(x):
     return np.sum(h * h)
 
 
+def scalar_net(x):
+    # Pure in x with no python-scalar literals (a scalar literal is a *new* value created at the
+    # working dtype, which would upcast a low-precision x). So the result dtype follows x's dtype
+    # -- the contract the precision tests below exercise.
+    h = np.tanh(x) + np.exp(x)
+    return np.sum(h * h)
+
+
 def affine_loss(params, x):
     return np.sum((params["w"] * x + params["b"]) ** 2)
 
@@ -84,23 +92,31 @@ def test_current_dtype_default_and_context():
 # ---------------------------------------------------------------------------
 # Tape dtype: Var + gradients.
 # ---------------------------------------------------------------------------
-def test_var_creates_in_working_dtype():
+def test_var_dtype_policy():
+    # An *existing* float array keeps its own dtype -- the data dtype flows through the tape,
+    # regardless of the ambient working dtype. The working dtype is only a *default for new
+    # values* (raw python scalars/lists) and an explicit ``dtype=``.
     assert pg.Var(_X).value.dtype == np.float64
     with pg.dtype("float32"):
-        assert pg.Var(_X).value.dtype == np.float32
-    # an explicit dtype= overrides the ambient default
-    assert pg.Var(_X, dtype="float32").value.dtype == np.float32
+        assert pg.Var(_X).value.dtype == np.float64  # preserved, NOT force-cast
+        assert pg.Var(_X.astype("float32")).value.dtype == np.float32  # preserved
+        assert pg.Var(3.0).value.dtype == np.float32  # python scalar -> working dtype
+        assert (
+            pg.Var([1, 2, 3]).value.dtype == np.float32
+        )  # python list -> working dtype
+    assert pg.Var(_X, dtype="float32").value.dtype == np.float32  # explicit override
 
 
 @pytest.mark.parametrize("name", ["float32", "float16"])
-def test_value_and_grad_dtype_context(name):
+def test_grad_dtype_follows_data(name):
+    # Precision is controlled by the *data* dtype (the working dtype is a creation default, not
+    # a propagation cast): a float32/16 input yields a float32/16 value and gradient, like numpy
+    # and autograd -- no context needed.
     dt = np.dtype(name)
-    ref_v, (ref_g,) = pg.value_and_grad(tanh_net)(_X)  # float64 reference
-    with pg.dtype(name):
-        v, (g,) = pg.value_and_grad(tanh_net)(_X)
+    ref_v, (ref_g,) = pg.value_and_grad(scalar_net)(_X)  # float64 reference
+    v, (g,) = pg.value_and_grad(scalar_net)(_X.astype(name))
     assert g.dtype == dt
     assert np.asarray(v).dtype == dt
-    # faithful to the float64 result at a tolerance scaled to the precision
     tol = 1e-2 if name == "float16" else 1e-4
     assert np.allclose(np.asarray(g, dtype=np.float64), ref_g, atol=tol, rtol=tol)
 
@@ -136,10 +152,11 @@ def test_bfloat16_end_to_end():
     ml_dtypes = pytest.importorskip("ml_dtypes")
     bf16 = np.dtype(ml_dtypes.bfloat16)
 
-    ref_v, (ref_g,) = pg.value_and_grad(tanh_net)(_X)  # float64 reference
+    ref_v, (ref_g,) = pg.value_and_grad(scalar_net)(_X)  # float64 reference
+    # a new value created under the bf16 context follows it; bf16 *data* flows as bf16
     with pg.dtype("bf16"):
-        assert pg.Var(_X).value.dtype == bf16
-        v, (g,) = pg.value_and_grad(tanh_net)(_X)
+        assert pg.Var(3.0).value.dtype == bf16
+    v, (g,) = pg.value_and_grad(scalar_net)(_X.astype(bf16))
     assert g.dtype == bf16
     # bf16 has ~3 decimal digits; a coarse tolerance still pins down correctness.
     assert np.allclose(g.astype(np.float64), ref_g, atol=0.2, rtol=0.2)
@@ -195,21 +212,21 @@ def test_astype_forward_dtype_and_value():
     assert np.allclose(y.value, x)
 
 
-def test_astype_grad_casts_back_to_working_dtype():
-    # Under a float32 tape the leaf is float32; the cotangent flows back from the
-    # upcast-to-float64 region into float32 (the cast's VJP is a cast-back).
+def test_astype_grad_casts_back_to_input_dtype():
+    # The leaf is float32; the cotangent flows back from the upcast-to-float64 region into
+    # float32 (the cast's VJP is a cast-back to the input dtype).
+    x32 = _X.astype("float32")
     ref_v, (ref_g,) = pg.value_and_grad(upcast_sin_sum)(_X)  # float64 reference
-    with pg.dtype("float32"):
-        v, (g,) = pg.value_and_grad(upcast_sin_sum)(_X)
+    v, (g,) = pg.value_and_grad(upcast_sin_sum)(x32)
     assert g.dtype == np.float32
     assert np.allclose(np.asarray(g, dtype=np.float64), ref_g, atol=1e-4, rtol=1e-4)
 
 
 def test_astype_graph_differentiable():
     # value_and_grad(capture(f)) lowers the astype node and differentiates it on the graph.
-    with pg.dtype("float32"):
-        gg = pg.value_and_grad(pg.capture(upcast_sin_sum, _X))
-        v, grads = gg(_X)
+    x32 = _X.astype("float32")
+    gg = pg.value_and_grad(pg.capture(upcast_sin_sum, x32))
+    v, grads = gg(x32)
     leaf = np.asarray(_value_leaf(grads))
     assert leaf.dtype == np.float32
     ref_v, (ref_g,) = pg.value_and_grad(upcast_sin_sum)(_X)

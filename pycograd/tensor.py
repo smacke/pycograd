@@ -114,16 +114,10 @@ def _unbroadcast(
     The default (``keep_axes=()``) is exactly the historical behavior: every broadcast
     axis is summed away, so nothing else regresses.
     """
-    arr = _xp().asarray(grad)
-    wd = current_dtype()
-    # Keep complex gradients (and any natural dtype under a complex working dtype) -- casting
-    # a complex cotangent to a float working dtype would drop its imaginary part. Otherwise
-    # carry the gradient in the working float dtype (the precision seam).
-    grad = (
-        arr
-        if (arr.dtype.kind == "c" or wd.kind == "c")
-        else _xp().asarray(grad, dtype=wd)
-    )
+    # Preserve the cotangent's natural dtype -- it follows the forward computation's data
+    # dtype (the working dtype is a creation default, not a propagation cast). In-place
+    # accumulation into each ``.grad`` buffer keeps that buffer's dtype regardless.
+    grad = _xp().asarray(grad)
     # Extra leading axes (rank grew under broadcasting) are summed unless kept: a kept
     # leading axis is reshaped into ``shape`` below, preserving the per-example stack.
     # An empty explicit ``keep_axes`` falls back to the backward-pass-global set (the
@@ -298,7 +292,18 @@ class Var:
                 self.value = (
                     arr if arr.dtype.kind == "f" else xp.asarray(value, dtype=wd)
                 )
+            elif hasattr(value, "dtype") and (
+                arr.dtype.kind == "f" or arr.dtype.name == "bfloat16"
+            ):
+                # An *existing* float array keeps its own dtype: the data dtype flows through
+                # the tape (so a float32 input yields a float32 gradient, like numpy/autograd).
+                # The working dtype is a *default for new values* (the ``else`` below, plus
+                # ``Param``/buffer creation in params.py), not a cast forced onto inputs.
+                # (``bfloat16`` is the floating type we resolve "bf16" to, but reports kind "V".)
+                self.value = arr
             else:
+                # A raw python scalar/list, or a non-float (int/bool) array: no data dtype to
+                # follow, so create it at the working dtype.
                 self.value = xp.asarray(value, dtype=wd)
         self.grad: Array = xp.zeros_like(self.value)
         self._parents = _parents

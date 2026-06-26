@@ -178,6 +178,15 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **dtype policy: data dtype flows, working dtype is a creation default** (twenty-first PR): the
+  `pg.dtype(...)` working dtype previously *force-cast every tape node* to that dtype, so a float32
+  input came back as a float64 gradient. Changed `Var.__init__`/`_unbroadcast`/the grad-output
+  coercion to **preserve an existing float (or bf16) array's dtype** -- the data dtype flows
+  through the tape (a float32 input yields a float32 gradient, like numpy/autograd) -- while the
+  working dtype remains the default for *new* values (raw python scalars/lists, `Param`/buffer
+  creation, `dtype=`). Flipped test_astype green (suite now 348 passed / 45 skipped). The dtype
+  tests were updated to the new contract (precision now follows the data, not an auto-downcast of
+  inputs); see `test/test_dtypes.py`.
 * **einsum repeated-label (diagonal inside einsum)** (twentieth PR): a label repeated within one
   operand (`'lli'`, or `(3,3,0)` in the interleaved form) is a diagonal. Rather than a bespoke
   scatter-to-diagonal VJP, `_normalize_einsum_args` now *diagonalizes* such an operand up front --

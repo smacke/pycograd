@@ -18,7 +18,6 @@ from pycograd import ops
 from pycograd._typing import Array, ArrayLike, Boxed, Operand
 from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.capture import Graph
-from pycograd.dtypes import current_dtype
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import (
@@ -272,7 +271,9 @@ def value_and_grad(
                     "grad(lambda x: np.sum(grad(f)(x)[0]))."
                 )
             else:
-                value = _xp().asarray(_value(cast(Operand, out)), dtype=current_dtype())
+                # Preserve the output's natural dtype (it follows the computation's data
+                # dtype); the working dtype is a creation default, not a propagation cast.
+                value = _xp().asarray(_value(cast(Operand, out)))
 
         def _grad_leaf(orig: Leaf, v: Var | None) -> Operand | None:
             if v is None:
