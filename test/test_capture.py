@@ -563,3 +563,35 @@ def test_getitem_lowering_capture_grad(fn):
     _, eager = value_and_grad(fn)(X)
     assert np.allclose(np.asarray(val), fn(X))
     assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)
+
+
+def _g_roll(x):
+    return np.sum(np.roll(x, 1, axis=0) ** 2)
+
+
+def _g_repeat(x):
+    return np.sum(np.repeat(x, 2, axis=0) ** 2)
+
+
+def _g_tile(x):
+    return np.sum(np.tile(x, (2, 1)) ** 2)
+
+
+def _g_pad(x):
+    return np.sum(np.pad(x, 1) ** 2)
+
+
+def _g_select(x):
+    return np.sum(np.select([x > 0], [x], default=0.0) ** 2)
+
+
+@pytest.mark.parametrize("fn", [_g_roll, _g_repeat, _g_tile, _g_pad, _g_select])
+def test_primitive_capture_grad(fn):
+    # Genuine primitives (roll/repeat/tile carry their non-diff arg as a positional operand;
+    # pad derives its un-pad slices; select's condition is a stop-gradient box): each must
+    # round-trip through value_and_grad(capture(f)) matching the eager gradient.
+    X = _rng(0).standard_normal((4, 4))
+    val, grads = value_and_grad(capture(fn, X))(X)
+    _, eager = value_and_grad(fn)(X)
+    assert np.allclose(np.asarray(val), fn(X))
+    assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)

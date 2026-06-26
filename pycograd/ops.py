@@ -1090,7 +1090,15 @@ def _vjp_pad(
     params: dict[str, Any],
     g: Boxed,
 ) -> list[Boxed]:
-    return [_b(d_getitem, g, params["slices"])]
+    # The VJP of a constant pad gathers back the interior. Eager records the precomputed
+    # ``slices``; a captured graph instead carries ``pad_width`` (the bind arg), so derive the
+    # slices from it and the primal's shape when ``slices`` isn't present.
+    slices = params.get("slices")
+    if slices is None:
+        in_shape = _pshape(primals[0])
+        pw = normalize_pad_width(params["pad_width"], len(in_shape))
+        slices = tuple(slice(b, b + n) for (b, _a), n in zip(pw, in_shape))
+    return [_b(d_getitem, g, slices)]
 
 
 def _pad_abstract(x: Boxed, pad_width: Any, mode: str = "constant", **kw: Any) -> Boxed:
@@ -1620,11 +1628,15 @@ def d_select(condlist: Any, choicelist: Any, default: Any = 0) -> Var:
 def select_transform_rule(
     _trace: Boxed, condlist: Any, choicelist: Any, default: Any = 0
 ) -> Boxed:
-    from pycograd.trace import bind
+    from pycograd.trace import Tracer, bind
 
     acc: Boxed = default
     for cond, choice in zip(reversed(list(condlist)), reversed(list(choicelist))):
-        acc = bind(d_where, np.asarray(cond), choice, acc)
+        # The condition is stop-gradient; pass a box (Var/Tracer) straight through. Only
+        # array-ify a plain condition -- ``np.asarray`` on a tracer makes a 0-d *object*
+        # array wrapping it, which then breaks the where mask arithmetic in the graph.
+        c = cond if isinstance(cond, (Var, Tracer)) else np.asarray(cond)
+        acc = bind(d_where, c, choice, acc)
     return acc
 
 

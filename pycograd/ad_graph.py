@@ -66,6 +66,16 @@ def _decompose(prim: Any, args: tuple, params: dict) -> "tuple[list, dict]":
         return list(args[1:]), {"subscripts": _const(args[0]), **params}
     if prim is ops.d_getitem:  # (x, key); key is a param
         return [args[0]], {"key": _const(args[1]), **params}
+    if prim is ops.d_roll:  # (x, shift, axis=...); only x is differentiable
+        return [args[0]], {"shift": _const(args[1]), "axis": params.get("axis")}
+    if prim is ops.d_repeat:  # (x, repeats, axis=...)
+        return [args[0]], {"repeats": _const(args[1]), "axis": params.get("axis")}
+    if prim is ops.d_tile:  # (x, reps)
+        return [args[0]], {"reps": _const(args[1])}
+    if (
+        prim is ops.d_pad
+    ):  # (x, pad_width, ...); the un-pad slices are derived in the VJP
+        return [args[0]], {"pad_width": _const(args[1]), **params}
     if prim is ops._scatter:  # (g, key, shape, dtype); only g is an operand
         return [args[0]], {"key": _const(args[1]), **params}
     if prim is ops.d_reshape or prim is ops.d_expand_dims:  # (x, shape/axis)
