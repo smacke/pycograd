@@ -70,3 +70,21 @@ def test_dot_vmap_and_eval_shape():
     assert np.allclose(out[0], a @ b)
     assert eval_shape(lambda x, y: np.dot(x, y), a, b).shape == (2, 4)
     assert eval_shape(lambda x, y: np.inner(x, y), a, np.zeros((4, 3))).shape == (2, 4)
+
+
+# --- np.outer (ravel/einsum composition) ------------------------------------
+def s_outer(a, b):
+    return np.sum(np.outer(a, b) ** 2)
+
+
+def test_outer_grad_and_shape():
+    a = _rng.standard_normal(7)
+    b = _rng.standard_normal(5)
+    ga, gb = grad(s_outer, [0, 1])(a, b)
+    assert np.allclose(np.asarray(ga), _fd_grad(s_outer, [a, b], 0), atol=1e-5)
+    assert np.allclose(np.asarray(gb), _fd_grad(s_outer, [a, b], 1), atol=1e-5)
+    # outer flattens both operands first
+    M = _rng.standard_normal((2, 3))
+    assert eval_shape(lambda x, y: np.outer(x, y), M, b).shape == (6, 5)
+    out = np.asarray(vmap(lambda x: np.outer(x, b))(np.stack([a, a + 0.1])))
+    assert out.shape == (2, 7, 5) and np.allclose(out[0], np.outer(a, b))

@@ -123,6 +123,10 @@ this work** — see below).
   `concatenate` composition (`axis=None` ravels both operands first). Flipped ~2 more tests
   green (suite now 288 passed / 105 skipped). The python-*list*-operand `append` cases stay
   skipped (the np.array-of-boxes gap). Native regression in `test/test_manip_ops.py`.
+* **np.outer** (tenth PR): the outer product of two flattened vectors -- `einsum('i,j->ij',
+  ravel(a), ravel(b))`, a ravel/einsum composition (full rules), so reverse/forward/vmap/eval_shape
+  all work and no own VJP. Flipped 2 more tests green (suite now 303 passed / 90 skipped). Native
+  regression added to `test/test_contraction_ops.py`.
 * **Interleaved einsum** (ninth PR): numpy's explicit-axes form
   `np.einsum(op0, sublist0, op1, sublist1, ..., out_sublist)` (integer index labels instead of a
   subscript string) now normalizes to the subscript form and reuses the full einsum machinery, so

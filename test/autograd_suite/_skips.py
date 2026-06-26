@@ -96,10 +96,6 @@ SKIPS = {
     ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
-        "test_outer",
-    ): "pycograd-gap: np.outer (deferred; needs flatten+einsum with an abstract-reshape path)",
-    (
-        "test_numpy.py",
         "test_r_basic",
     ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
@@ -176,10 +172,6 @@ SKIPS = {
         "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
-    (
-        "test_systematic.py",
-        "test_outer",
-    ): "pycograd-gap: np.outer (deferred; needs flatten+einsum with an abstract-reshape path)",
     (
         "test_systematic.py",
         "test_real",

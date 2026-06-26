@@ -1487,6 +1487,29 @@ def trace_abstract_rule(
     return cast(Boxed, ShapedArray(tuple(av.shape[2:]), av.dtype))
 
 
+# ---------------------------------------------------------------------------
+# np.outer -- the outer product of two flattened vectors: ``einsum('i,j->ij', ravel(a),
+# ravel(b))``; a ravel/einsum composition (full rules), so no own VJP.
+# ---------------------------------------------------------------------------
+def d_outer(a: Operand, b: Operand) -> Var:
+    return d_einsum("i,j->ij", d_ravel(a), d_ravel(b))
+
+
+def outer_transform_rule(_trace: Boxed, a: Boxed, b: Boxed) -> Boxed:
+    from pycograd.trace import bind
+
+    return bind(d_einsum, "i,j->ij", bind(d_ravel, a), bind(d_ravel, b))
+
+
+def outer_abstract_rule(a: Boxed, b: Boxed) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    av, bv = _aval(cast(Any, a)), _aval(cast(Any, b))
+    na = int(np.prod(cast(Any, av.shape), dtype=np.int64))
+    nb = int(np.prod(cast(Any, bv.shape), dtype=np.int64))
+    return cast(Boxed, ShapedArray((na, nb), av.dtype))
+
+
 def d_diag(v: Operand, k: int = 0) -> Var:
     shape = _logical_shape(v)
     key, out_shape = _diag_key(shape, k)
@@ -2228,6 +2251,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_fliplr: (np.fliplr,),
     d_rot90: (np.rot90,),
     d_trace: (np.trace,),
+    d_outer: (np.outer,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),
