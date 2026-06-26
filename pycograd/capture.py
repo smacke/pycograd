@@ -518,6 +518,17 @@ class GraphTrace(Trace):
         lower = ops._LOWERING_RULES.get(prim)
         if lower is not None:
             return lower(self, *args, **params)
+        if prim is ops.d_einsum:
+            # Normalize numpy's interleaved einsum form (operand, sublist, ...) to the subscript
+            # string before recording, so the node is always (subscripts, *operands) -- the shape
+            # rule and the graph reverse pass (_decompose) both assume that shape.
+            subs, operands = ops._normalize_einsum_args(args[0], tuple(args[1:]))
+            args = (subs, *operands)
+        if prim is ops.d_cumsum and params.get("axis") is None:
+            # Flatten-all cumsum: lower to ravel + cumsum(axis=0), matching the eager lowering, so
+            # the graph records a cumsum node with a concrete axis (whose VJP the reverse handles)
+            # rather than an axis-less node the cumsum VJP can't read.
+            return bind(ops.d_cumsum, bind(ops.d_ravel, args[0]), axis=0)
         rule = _ABS_FOR.get(prim)
         if rule is None:  # pragma: no cover - capture covers what eval_shape covers
             raise NotImplementedError(

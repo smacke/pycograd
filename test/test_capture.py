@@ -595,3 +595,28 @@ def test_primitive_capture_grad(fn):
     _, eager = value_and_grad(fn)(X)
     assert np.allclose(np.asarray(val), fn(X))
     assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)
+
+
+def _g_einsum_interleaved(x):
+    B = np.array([[1.0, 2, 3, 4], [5, 6, 7, 8], [9, 1, 2, 3], [4, 5, 6, 7]])
+    return np.sum(np.einsum(x, [0, 1], B, [1, 2], [0, 2]) ** 2)
+
+
+def _g_cumsum_none(x):
+    return np.sum(np.cumsum(x) ** 2)
+
+
+def _g_cumsum_axis(x):
+    return np.sum(np.cumsum(x, axis=1) ** 2)
+
+
+@pytest.mark.parametrize("fn", [_g_einsum_interleaved, _g_cumsum_none, _g_cumsum_axis])
+def test_einsum_cumsum_capture_grad(fn):
+    # The interleaved einsum form is normalized to the subscript string at capture, and
+    # cumsum(axis=None) is lowered to ravel+cumsum(axis=0) -- so both round-trip through
+    # value_and_grad(capture(f)).
+    X = _rng(0).standard_normal((4, 4))
+    val, grads = value_and_grad(capture(fn, X))(X)
+    _, eager = value_and_grad(fn)(X)
+    assert np.allclose(np.asarray(val), fn(X))
+    assert np.allclose(np.asarray(grads[0]), np.asarray(eager[0]), atol=1e-6)
