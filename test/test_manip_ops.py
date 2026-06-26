@@ -133,6 +133,61 @@ def test_roll_jvp_and_vmap():
     assert np.allclose(v[0], np.roll(_A, 1, axis=1))
 
 
+# --- ndarray methods (.flatten/.ravel/.squeeze) + np.append -----------------
+def f_flatten_method(x):
+    return np.sum(x.flatten() * np.arange(x.size))
+
+
+def f_ravel_method(x):
+    return np.sum(x.ravel() ** 2)
+
+
+def f_squeeze_method(x):
+    return np.sum(x.squeeze() ** 2)
+
+
+def f_append(a, b):
+    return np.sum(np.append(a, b) ** 2)
+
+
+def f_append_axis(a, b):
+    return np.sum(np.append(a, b, axis=0) ** 2)
+
+
+def test_method_grads():
+    A = _rng.standard_normal((3, 4))
+    S = _rng.standard_normal((3, 1, 4))
+    assert np.allclose(
+        np.asarray(grad(f_flatten_method)(A)[0]), _fd(f_flatten_method, A), atol=1e-5
+    )
+    assert np.allclose(
+        np.asarray(grad(f_ravel_method)(A)[0]), _fd(f_ravel_method, A), atol=1e-5
+    )
+    assert np.allclose(
+        np.asarray(grad(f_squeeze_method)(S)[0]), _fd(f_squeeze_method, S), atol=1e-5
+    )
+    # flatten under vmap routes through ravel
+    v = np.asarray(vmap(lambda m: m.flatten())(np.stack([A, A])))
+    assert v.shape == (2, 12) and np.allclose(v[0], A.flatten())
+
+
+def test_append_grad_and_shape():
+    a = _rng.standard_normal(4)
+    b = np.array(3.0)
+    ga, gb = grad(f_append, [0, 1])(a, b)
+    assert np.allclose(np.asarray(ga), 2 * a) and np.isclose(
+        float(np.asarray(gb)), 2 * b
+    )
+    A2 = _rng.standard_normal((2, 3))
+    B2 = _rng.standard_normal((1, 3))
+    assert np.allclose(
+        np.asarray(grad(f_append_axis)(A2, B2)[0]),
+        _fd(lambda x: f_append_axis(x, B2), A2),
+        atol=1e-5,
+    )
+    assert eval_shape(lambda x, y: np.append(x, y), a, b).shape == (5,)
+
+
 # --- pad / repeat / tile (segment/scatter adjoints) ------------------------
 def f_pad(x):
     return np.sum(np.pad(x, ((1, 2), (3, 4))) ** 2)

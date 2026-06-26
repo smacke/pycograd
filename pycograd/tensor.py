@@ -481,6 +481,10 @@ class Var:
 
         np_fn = getattr(np, name, None)
         prim = ops._INTERCEPT.get(np_fn) if callable(np_fn) else None
+        if (
+            prim is None and name == "flatten"
+        ):  # no ``np.flatten``; it's ``ravel`` (a copy)
+            prim = ops.d_ravel
         if prim is None:
             raise AttributeError(name)
         return functools.partial(prim, self)

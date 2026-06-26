@@ -33,18 +33,15 @@ SKIPS = {
         "test_numpy.py",
         "test_array_from_scalar",
     ): "pycograd-gap: np.array([...]) of Var/box leaves is not a differentiable constructor",
-    (
-        "test_numpy.py",
-        "test_astype",
-    ): "pycograd-gap: Var has no such ndarray method (e.g. .flatten()/.squeeze())",
+    ("test_numpy.py", "test_astype"): "pycograd-gap: Var has no such ndarray method",
     (
         "test_numpy.py",
         "test_c_",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break)",
+    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
     (
         "test_numpy.py",
         "test_c_mixed",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break)",
+    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
     (
         "test_numpy.py",
         "test_cast_to_int",
@@ -65,10 +62,6 @@ SKIPS = {
         "test_numpy.py",
         "test_diagonal",
     ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
-    (
-        "test_numpy.py",
-        "test_flatten_method",
-    ): "pycograd-gap: Var has no .flatten()/.ravel() method (the np.* function forms work)",
     ("test_numpy.py", "test_fliplr"): "pycograd-gap: unsupported op (no autodiff rule)",
     ("test_numpy.py", "test_flipud"): "pycograd-gap: unsupported op (no autodiff rule)",
     (
@@ -86,7 +79,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_max_equal_values",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break)",
+    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
     (
         "test_numpy.py",
         "test_max_equal_values_2d",
@@ -123,11 +116,11 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_r_mixed",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break)",
+    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
     (
         "test_numpy.py",
         "test_r_node_and_const",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break)",
+    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
     (
         "test_numpy.py",
         "test_r_slicing",
@@ -139,16 +132,12 @@ SKIPS = {
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
-        "test_simple_append_arr",
-    ): "pycograd-gap: no VJP rule for np.append",
-    (
-        "test_numpy.py",
         "test_simple_append_list",
-    ): "pycograd-gap: no VJP rule for np.append",
+    ): "pycograd-gap: np.append with a python-list operand (the np.array-of-boxes gap; the array form works)",
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: no VJP rule for np.append",
+    ): "pycograd-gap: np.append with a python-list operand (the np.array-of-boxes gap; the array form works)",
     (
         "test_numpy.py",
         "test_std_list_of_boxes",

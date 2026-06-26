@@ -117,6 +117,8 @@ class JVPTracer(Tracer):
             raise AttributeError(name)
         np_fn = getattr(np, name, None)
         prim = ops._INTERCEPT.get(np_fn) if callable(np_fn) else None
+        if prim is None and name == "flatten":  # no ``np.flatten``; it's ``ravel``
+            prim = ops.d_ravel
         if prim is None:
             raise AttributeError(name)
 
@@ -753,6 +755,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_partition: _partition_rule,
             ops.d_select: ops.select_transform_rule,
             ops.d_gradient: ops.gradient_transform_rule,
+            ops.d_append: ops.append_transform_rule,
             ops.d_ravel: ops._reshape_lowering_transform(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_transform(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_transform(ops.atleast_1d_shape),

@@ -919,6 +919,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_partition: ops._sort_like_abstract,
             ops.d_select: ops.select_abstract_rule,
             ops.d_gradient: ops.gradient_abstract_rule,
+            ops.d_append: ops.append_abstract_rule,
             ops.d_ravel: ops._reshape_lowering_abstract(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_abstract(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_abstract(ops.atleast_1d_shape),

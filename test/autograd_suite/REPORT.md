@@ -117,6 +117,12 @@ this work** — see below).
   list for `axis=None`/a tuple of axes). Full reverse/forward/vmap/eval_shape rules. Flipped ~5
   more tests green (suite now 286 passed / 107 skipped). Native regression:
   `test/test_gather_ops.py`.
+* **ndarray methods + np.append** (seventh PR): the `Var`/`JVPTracer`/`BatchTracer` method
+  surface gained **`.flatten()`** (aliased to `d_ravel`, since there is no `np.flatten`);
+  `.ravel()`/`.squeeze()` already routed via the `np.*` names. **`np.append`** is a
+  `concatenate` composition (`axis=None` ravels both operands first). Flipped ~2 more tests
+  green (suite now 288 passed / 105 skipped). The python-*list*-operand `append` cases stay
+  skipped (the np.array-of-boxes gap). Native regression in `test/test_manip_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

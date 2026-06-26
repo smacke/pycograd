@@ -1523,6 +1523,39 @@ def gradient_abstract_rule(
     return cast(Boxed, ShapedArray(a.shape, a.dtype))
 
 
+# ---------------------------------------------------------------------------
+# np.append(arr, values, axis) -- a concatenate (``axis=None`` ravels both operands first).
+# A composition of ``d_concatenate`` (+ ``d_ravel``), so no own VJP. (A python-list ``arr`` is
+# the separate np.array-of-boxes gap; array operands work.)
+# ---------------------------------------------------------------------------
+def d_append(arr: Operand, values: Operand, axis: Any = None) -> Var:
+    if axis is None:
+        return d_concatenate([d_ravel(arr), d_ravel(values)], axis=0)
+    return d_concatenate([arr, values], axis=axis)
+
+
+def append_transform_rule(
+    _trace: Boxed, arr: Boxed, values: Boxed, axis: Any = None
+) -> Boxed:
+    from pycograd.trace import bind
+
+    if axis is None:
+        return bind(d_concatenate, [bind(d_ravel, arr), bind(d_ravel, values)], axis=0)
+    return bind(d_concatenate, [arr, values], axis=axis)
+
+
+def append_abstract_rule(arr: Boxed, values: Boxed, axis: Any = None) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval, abstract_concatenate
+
+    a, v = _aval(cast(Any, arr)), _aval(cast(Any, values))
+    if axis is None:
+        n = int(np.prod(cast(Any, a.shape), dtype=np.int64)) + int(
+            np.prod(cast(Any, v.shape), dtype=np.int64)
+        )
+        return cast(Boxed, ShapedArray((n,), a.dtype))
+    return cast(Boxed, abstract_concatenate([cast(Any, arr), cast(Any, values)], axis))
+
+
 def split_abstract_rule(which: str) -> Callable[..., Boxed]:
     def rule(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
         from pycograd.shapes import ShapedArray, _aval
@@ -2043,6 +2076,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_partition: (np.partition,),
     d_select: (np.select,),
     d_gradient: (np.gradient,),
+    d_append: (np.append,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),
