@@ -16,7 +16,7 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_diagonal",
-    ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
+    ): "autograd-internal: the test body calls np.make_diagonal (autograd-specific, not a numpy function), which raises AttributeError before check_grads runs -- so it never exercises np.diagonal itself.",
     (
         "test_numpy.py",
         "test_make_diagonal",
@@ -24,5 +24,5 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_simple_append_list_2D",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: np.append of a *doubly*-nested python list under jvp -- find_top_trace searches one level into a sequence operand, so the inner tracers of [[t,t,t],[t,t,t]] aren't found and the call dispatches eagerly. The 1-D list case (one level) works; the array-operand case works.",
 }
