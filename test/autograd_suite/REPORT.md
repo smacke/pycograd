@@ -171,6 +171,13 @@ this work** — see below).
   kwargs; and `np.row_stack` (a distinct function from `np.vstack`) is now intercepted. Flipped 4
   more tests green (suite now 331 passed / 62 skipped). Native regression in
   `test/test_manip_ops.py`.
+* **np.r_ / np.c_ index expressions** (fifteenth PR): numpy's `np.r_[...]` / `np.c_[...]` row/
+  column concatenation objects are now intercepted (via the `before_subscript_load` handler, which
+  returns a proxy) and routed to concatenate-compositions -- `r_` concatenates the pieces along
+  axis 0, `c_` reshapes 1-D pieces to columns then concatenates along axis 1, and an int `slice`
+  (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
+  eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
+  (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

@@ -31,6 +31,7 @@ from pycograd.trace import (
     _COMPARE_PRIM,
     _UNARYOP_PRIM,
     Tracer,
+    _IndexExprProxy,
     _SubscriptProxy,
     bind,
     num_transform_levels,
@@ -428,6 +429,14 @@ class AutodiffTracer(pyc.BaseTracer):
         # the object is a ``Var`` or the key involves a ``Tracer``; otherwise it falls
         # through to plain ``obj[key]``, so ordinary array indexing by non-tracer keys --
         # and every dict/list/ParamDict subscript (never wrapped here) -- is unchanged.
+        # ``np.r_[...]`` / ``np.c_[...]`` -- numpy's row/column index-expression objects -- build
+        # a concatenation of the bracketed pieces; route them through ``d_r_``/``d_c_`` so any
+        # tape-value piece stays differentiable. (They are module singletons; compare by
+        # identity.)
+        if ret is np.r_ or ret is np.c_:
+            from pycograd import ops
+
+            return _IndexExprProxy(ops.d_r_ if ret is np.r_ else ops.d_c_)
         if isinstance(ret, Var) or isinstance(ret, np.ndarray):
             return _SubscriptProxy(ret)
         return ret

@@ -31,7 +31,7 @@ import ast
 import contextlib
 import contextvars
 import operator
-from typing import TYPE_CHECKING, Any, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence
 
 from pycograd import ops
 from pycograd._typing import BindArg, Boxed, Index, Prim
@@ -428,6 +428,21 @@ class _SubscriptProxy:
         ):
             return bind(ops.d_getitem, self._obj, key)
         return self._obj[key]  # type: ignore[index]
+
+
+class _IndexExprProxy:
+    """Stand-in for ``np.r_`` / ``np.c_`` returned by the subscript handler: its
+    ``__getitem__`` builds a (differentiable) concatenation of the bracketed pieces via
+    ``build`` (``ops.d_r_`` / ``ops.d_c_``), so ``np.r_[x, c, 1:10]`` stays on the tape.
+    """
+
+    __slots__ = ("_build",)
+
+    def __init__(self, build: "Callable[[object], Boxed]") -> None:
+        self._build = build
+
+    def __getitem__(self, key: object) -> Boxed:
+        return self._build(key)
 
 
 def _is_managed(val: BindArg) -> bool:

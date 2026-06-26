@@ -11,14 +11,6 @@ SKIPS = {
     ): "pycograd-design: `.astype` IS supported (ops.d_astype: graph-differentiable cast, see test_dtypes.py::test_astype_*). This test asserts the autograd convention that the eager grad follows the float32 *input array*'s dtype; pycograd instead follows the ambient working dtype (float64 by default) -- use `with pg.dtype('float32')`.",
     (
         "test_numpy.py",
-        "test_c_",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_c_mixed",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
         "test_cast_to_int",
     ): "pycograd-design: casts an intermediate to int64 (`np.int64(W[:, -1])`) and uses it as a fancy index. A pycograd `Var` holds real-valued tensors only (resolve_dtype rejects ints), so an in-trace int cast has no tape representation -- distinct from the float `.astype` cast, which is supported (ops.d_astype).",
     (
@@ -38,26 +30,6 @@ SKIPS = {
         "test_make_diagonal",
     ): "autograd-internal: np.make_diagonal is autograd-specific (not a numpy function)",
     ("test_numpy.py", "test_nan_to_num"): "pycograd-gap: no VJP rule for np.nan_to_num",
-    (
-        "test_numpy.py",
-        "test_r_basic",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_r_double",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_r_mixed",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_r_node_and_const",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
-    (
-        "test_numpy.py",
-        "test_r_slicing",
-    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_simple_append_list",

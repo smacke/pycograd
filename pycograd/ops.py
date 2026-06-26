@@ -2393,6 +2393,44 @@ def d_dstack(seq: Sequence[Operand], **_: Any) -> Var:
     return d_concatenate([_atleast_3d_depth(s) for s in seq], axis=2)
 
 
+# numpy's ``np.r_[...]`` / ``np.c_[...]`` index-expression objects: row- and column-wise
+# concatenation of the bracketed pieces, where an int ``slice`` (``1:10``) expands to an
+# ``arange``. Routed here from the subscript handler (tracer.py); the array/box pieces stay
+# differentiable, the ``arange`` pieces are constants. (String directives are not supported.)
+def _index_expr_pieces(key: Any) -> list:
+    pieces = list(key) if isinstance(key, tuple) else [key]
+    out: list = []
+    for p in pieces:
+        if isinstance(p, slice):
+            start = 0 if p.start is None else p.start
+            step = 1 if p.step is None else p.step
+            out.append(_xp().arange(start, p.stop, step))
+        else:
+            out.append(p)
+    return out
+
+
+def d_r_(key: Any) -> Var:
+    # row-wise: concatenate the pieces along axis 0 (numpy's default for ``r_``). Routed
+    # through ``bind`` so tracer pieces (under jvp/vmap/capture) dispatch to their level.
+    from pycograd.trace import bind
+
+    return cast(Var, bind(d_concatenate, _index_expr_pieces(key), axis=0))
+
+
+def d_c_(key: Any) -> Var:
+    # column-wise: each piece becomes a column (1-D -> (n, 1)), concatenated along axis 1.
+    # Built directly from reshape/concatenate (not ``d_column_stack``) so it lowers to
+    # graph-differentiable primitives under capture.
+    from pycograd.trace import bind
+
+    cols = []
+    for p in _index_expr_pieces(key):
+        shp = _logical_shape(p)
+        cols.append(bind(d_reshape, p, (shp[0], 1)) if len(shp) == 1 else p)
+    return cast(Var, bind(d_concatenate, cols, axis=1))
+
+
 # ---------------------------------------------------------------------------
 # np.array over differentiable leaves -- ``np.array([v0, v1, ...])`` where the (possibly
 # nested) list/tuple holds ``Var``/``Tracer`` boxes. numpy can't build such an array (the
