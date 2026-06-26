@@ -254,6 +254,24 @@ def test_constant_fold_collapses_const_subgraph():
     assert np.allclose(float(_value(eval_graph(folded))), 5.0)
 
 
+def test_constant_fold_pins_folded_value_to_node_dtype():
+    # ``bind`` folds in whatever working dtype is ambient at optimize time; the folded
+    # constant must take the *node's* recorded dtype, not numpy's default float64 -- else
+    # a float32 graph optimized outside its ``pg.dtype("float32")`` block re-leaks f64.
+    f32 = ShapeDtypeStruct((), np.dtype("float32"))
+    _, td = tree_flatten(np.array(0.0, dtype=np.float32))
+    nodes = [
+        Node(0, _CONST, (), {"value": np.array(2.0)}, f32),  # f64 const value...
+        Node(1, _CONST, (), {"value": np.array(3.0)}, f32),  # ...but f32 node aval
+        Node(2, ops.d_add, (Ref(0), Ref(1)), {}, f32),
+    ]
+    g = Graph(nodes, inputs=[], outputs=[2], out_treedef=td)
+    folded = constant_fold(g)  # default (float64) working dtype -- the leak scenario
+    assert folded.nodes[2].prim is _CONST
+    assert np.asarray(folded.nodes[2].params["value"]).dtype == np.float32
+    assert np.allclose(float(_value(eval_graph(folded))), 5.0)
+
+
 @pytest.mark.parametrize("cid,loss,argf", _CASES, ids=_IDS)
 def test_optimize_preserves_semantics(cid, loss, argf):
     args = argf()

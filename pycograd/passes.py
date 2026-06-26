@@ -135,6 +135,12 @@ def constant_fold(graph: Graph) -> Graph:
             # At base level (no transform live) ``bind`` returns a ``Var``/value,
             # never a ``Tracer``/``None`` -- cast so ``_value`` accepts it.
             val = _value(cast(Operand, bind(nd.prim, *args, **nd.params)))
+            # ``bind`` runs in whatever working dtype is ambient at *optimize* time, which
+            # may differ from the graph's (e.g. a float32 graph optimized outside its
+            # ``pg.dtype("float32")`` block folds to float64). The node's recorded aval is
+            # authoritative, so pin the materialized constant to it -- otherwise the folded
+            # f64 value would silently re-promote its f32 consumers.
+            val = np.asarray(val, dtype=nd.aval.dtype)
             vals[nd.id] = val
             nodes.append(Node(nd.id, _CONST, (), {"value": val}, nd.aval))
         else:
