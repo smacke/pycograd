@@ -623,9 +623,15 @@ def _std_rule(
     keepdims: bool = False,
     **_: Any,
 ) -> JVPTracer:
-    """``std = sqrt(var)``; re-expressed via ``bind`` so the chain rule applies."""
+    """``std = sqrt(var)`` with a degenerate-safe coefficient (0 where var == 0), so a zero-
+    variance input gives a 0 tangent rather than nan (matching the reverse rule / autograd).
+    """
     v = _var_rule(trace, x, axis=axis, ddof=ddof, keepdims=keepdims)
-    return cast(JVPTracer, bind(ops.d_sqrt, v))
+    sv = np.sqrt(np.asarray(_value(cast(Any, v.primal))))
+    coeff = ops._std_coeff(sv)  # constant, from the primal variance
+    primal_out = bind(ops.d_sqrt, v.primal)
+    tangent_out = bind(ops.d_mul, coeff, v.tangent)
+    return _result(trace, primal_out, tangent_out)
 
 
 def _reduce_select_for(prim: Prim) -> Rule:

@@ -178,6 +178,12 @@ this work** — see below).
   (`1:10`) expands to an `arange`. Tape-value pieces stay differentiable across eager / jvp / vmap /
   eval_shape *and* graph capture (both lower to concatenate/reshape). Flipped 7 more tests green
   (suite now 338 passed / 55 skipped). Native regression: `test/test_index_expr.py`.
+* **np.std degenerate gradient** (eighteenth PR): `std = sqrt(var)` gave a *nan* gradient at
+  zero variance (e.g. `np.std` of a constant) because `0.5/sqrt(0)=inf` times the zero upstream
+  is `0*inf`. Guard the coefficient to 0 where `var==0` (autograd's convention: a flat minimum),
+  in both the eager backward and the forward (`_std_rule`) -- and add a `_VJP_FOR[d_std]` so the
+  higher-order path stays composable. Flipped test_std green (suite now 344 passed / 49 skipped).
+  Native regression in `test/test_arith_reduce_ops.py`.
 * **np.linspace** (seventeenth PR): evenly spaced points are `start*(1-t) + stop*t` with the
   constant fractions `t=i/(num-1)` -- a mul/add composition (lowers in graph too), linear in both
   endpoints (`num<=1` uses `t=0` so a single point is `start`). Flipped 1 more test green (suite now

@@ -37,8 +37,4 @@ SKIPS = {
         "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
-    (
-        "test_systematic.py",
-        "test_std",
-    ): "pycograd-gap: np.std gradient mismatch under this check (reduction with ddof/sqrt)",
 }

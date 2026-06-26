@@ -111,3 +111,31 @@ def test_prod_axis_jvp_vmap_shape():
     out = np.asarray(vmap(lambda a: np.prod(a))(X))
     assert np.allclose(out, np.prod(X, axis=1))
     assert eval_shape(f_prod, X[0]).shape == ()
+
+
+def f_std_scalar(x):
+    return np.std(np.array([x, x, x]))  # zero variance -> gradient must be 0, not nan
+
+
+def test_std_zero_variance_grad_is_zero():
+    from pycograd import grad, jvp
+
+    g = float(np.asarray(grad(f_std_scalar)(2.0)[0]))
+    assert g == 0.0 and np.isfinite(g)
+    _, t = jvp(f_std_scalar, (2.0,), (1.0,))
+    assert float(np.asarray(t)) == 0.0
+    # non-degenerate std still matches finite differences
+    A = np.random.default_rng(0).standard_normal((2, 3))
+
+    def f(a):
+        return np.sum(np.std(a, axis=1) ** 2)
+
+    gd = np.asarray(grad(f)(A)[0])
+    fd = np.zeros((2, 3))
+    for i in range(6):
+        ap = A.copy()
+        am = A.copy()
+        ap.flat[i] += 1e-6
+        am.flat[i] -= 1e-6
+        fd.flat[i] = (f(ap) - f(am)) / 2e-6
+    assert np.allclose(gd, fd, atol=1e-5)

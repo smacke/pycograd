@@ -51,7 +51,15 @@ plain batched backward cannot — the gradient of *each* example separately,
 stacked over the batch (what gradient clipping and DP-SGD need):
 
 ```python
+import numpy as np
 from pycograd import grad, vmap, cross_entropy
+
+rng = np.random.default_rng(0)
+N = 64
+w = rng.standard_normal((2, 3))            # shared weights ...
+b = rng.standard_normal(3)                 # ... and bias
+X = rng.standard_normal((N, 2))            # N points, each (2,)
+Y = np.eye(3)[rng.integers(0, 3, N)]       # N one-hot labels, each (3,)
 
 def per_example_loss(w, b, x, y):          # one (2,) point + one label -> scalar
     return cross_entropy(x @ w + b, y)
@@ -79,6 +87,11 @@ from pycograd import capture, value_and_grad, optimize
 def forward(x, w, b):
     h = np.tanh(x @ w + b)
     return np.sum(h * h)
+
+rng = np.random.default_rng(0)
+x = rng.standard_normal((4, 3))
+w = rng.standard_normal((3, 2))
+b = rng.standard_normal(2)
 
 g = capture(forward, x, w, b)              # trace once over (shape, dtype) inputs
 ```
@@ -172,6 +185,11 @@ import numpy as np
 from pycograd import relu, softmax, cross_entropy
 
 rng = np.random.default_rng(42)
+
+# synthetic 3-class data: X is (N, 2), Y one-hot (N, 3)
+centers = np.array([[2.0, 2.0], [-2.0, 2.0], [0.0, -2.5]])
+X = np.vstack([rng.normal(c, 0.5, (40, 2)) for c in centers])
+Y = np.eye(3)[np.repeat(np.arange(3), 40)]
 
 with params{
     w1 = 0.3 * rng.standard_normal((2, 16)); b1 = np.zeros(16)

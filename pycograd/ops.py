@@ -2117,6 +2117,14 @@ def d_var(
     return d_sum(sq, axis=axis, keepdims=keepdims) / (n - ddof)
 
 
+def _std_coeff(sv: Array) -> Array:
+    # d sqrt(var)/d var = 0.5/sqrt(var), but 0 where var == 0: at zero variance the gradient
+    # through std is 0 (a minimum), not nan -- matching autograd. The inner ``where`` keeps the
+    # divide off zero so the masked-away branch is finite.
+    xp = _xp()
+    return xp.where(sv > 0, 0.5 / xp.where(sv > 0, sv, 1.0), 0.0)
+
+
 def d_std(
     x: Operand,
     axis: Axis = None,
@@ -2126,7 +2134,19 @@ def d_std(
     keepdims: bool = False,
     **_: Any,
 ) -> Var:
-    return d_var(x, axis=axis, ddof=ddof, keepdims=keepdims) ** 0.5
+    # std = sqrt(var) with a degenerate-safe gradient (0 where var == 0).
+    v = d_var(x, axis=axis, ddof=ddof, keepdims=keepdims)
+    xp = _xp()
+    sv = xp.sqrt(v.value)
+    node = Var(sv, _parents=(v,))
+    coeff = _std_coeff(sv)
+
+    def _backward() -> None:
+        v.grad = _accumulate(v.grad, node.grad * coeff)
+
+    node._backward = _backward
+    _record_vjp(node, d_std, (v,), {"coeff": coeff})
+    return node
 
 
 def _reduce_select(
@@ -2898,6 +2918,16 @@ def _vjp_real_if_close(
     return [g]  # identity on the values -> identity on the cotangent
 
 
+def _vjp_std(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # d_std's single operand is the variance Var; route through the degenerate-safe coeff.
+    return [_b(d_mul, g, params["coeff"])]
+
+
 def _vjp_nan_to_num(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -3450,6 +3480,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_conj: _vjp_conj,
             d_real: _vjp_real,
             d_real_if_close: _vjp_real_if_close,
+            d_std: _vjp_std,
             d_nan_to_num: _vjp_nan_to_num,
             d_imag: _vjp_imag,
             d_angle: _vjp_angle,
