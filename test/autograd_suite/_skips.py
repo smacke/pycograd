@@ -8,7 +8,12 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_astype",
-    ): "pycograd-gap: Var.astype is unsupported (dtype cast)",
+    ): (
+        "pycograd-design: `.astype` IS supported (ops.d_astype: graph-differentiable cast, "
+        "see test_dtypes.py::test_astype_*). This test asserts the autograd convention that "
+        "the eager grad follows the float32 *input array*'s dtype; pycograd instead follows "
+        "the ambient working dtype (float64 by default) -- use `with pg.dtype('float32')`."
+    ),
     (
         "test_numpy.py",
         "test_c_",
@@ -20,7 +25,12 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_cast_to_int",
-    ): "pycograd-gap: integer cast inside a traced function has no rule",
+    ): (
+        "pycograd-design: casts an intermediate to int64 (`np.int64(W[:, -1])`) and uses it "
+        "as a fancy index. A pycograd `Var` holds real-valued tensors only (resolve_dtype "
+        "rejects ints), so an in-trace int cast has no tape representation -- distinct from "
+        "the float `.astype` cast, which is supported (ops.d_astype)."
+    ),
     (
         "test_numpy.py",
         "test_concatenate_axis_1_unnamed",

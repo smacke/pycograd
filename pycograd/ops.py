@@ -36,6 +36,7 @@ from pycograd._typing import (
     Shape,
 )
 from pycograd.backends import current_backend
+from pycograd.dtypes import resolve_dtype
 from pycograd.tensor import (
     Var,
     _accumulate,
@@ -2156,6 +2157,30 @@ def d_reshape(x: Operand, *shape: Shape) -> Var:
     return out
 
 
+def d_astype(x: Operand, dtype: DTypeLike, **_ignored: Any) -> Var:
+    """Cast ``x`` to floating dtype ``dtype`` -- the in-graph precision cast behind mixed
+    precision (e.g. ``x.astype("float64")`` inside a float32 tape).
+
+    A cast is *linear* (identity up to rounding), so the VJP simply casts the cotangent
+    back to the input's dtype. Only floating targets are supported: ``resolve_dtype``
+    rejects ints/bools (a ``Var`` holds real-valued tensors), so casting to an integer
+    dtype -- an index/label -- is not a differentiable tape op. Extra numpy ``astype``
+    kwargs (``order``/``casting``/``copy``/``subok``/``device``) are accepted and ignored.
+    """
+    x, xp = _lift(x), _xp()
+    target = resolve_dtype(dtype)
+    # Pass ``dtype=target`` so ``Var.__init__`` keeps the cast dtype rather than re-casting
+    # the value back to the ambient ``current_dtype()``.
+    out = Var(xp.asarray(x.value).astype(target), _parents=(x,), dtype=target)
+
+    def _backward() -> None:
+        x.grad = _accumulate(x.grad, out.grad.astype(x.value.dtype))
+
+    out._backward = _backward
+    _record_vjp(out, d_astype, (x,), {"dtype": target})
+    return out
+
+
 def d_broadcast_to(x: Operand, shape: Shape) -> Var:
     """Broadcast ``x`` to ``shape``; the VJP sums the cotangent back over the broadcast
     axes (``_unbroadcast``).
@@ -2420,6 +2445,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_atleast_2d: (np.atleast_2d,),
     d_atleast_3d: (np.atleast_3d,),
     d_reshape: (np.reshape,),
+    d_astype: (np.astype,),
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),
     d_stack: (np.stack,),
@@ -2906,6 +2932,20 @@ def _vjp_reshape(
     return [_b(d_reshape, g, _pshape(p))]
 
 
+def _vjp_astype(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # A cast is linear: pull the cotangent back into the input's dtype. The input is a
+    # ``Var``/``GraphTracer`` (always floating), so the cast-back is well defined; skip it
+    # when the dtype already matches to avoid an identity node.
+    (p,) = primals
+    in_dt = _pdtype(p)
+    return [g if in_dt == params["dtype"] else _b(d_astype, g, in_dt)]
+
+
 def _vjp_broadcast_to(
     primals: tuple[Var, ...],
     operands: tuple[Boxed, ...],
@@ -3120,6 +3160,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_repeat: _vjp_repeat,
             d_tile: _vjp_tile,
             d_reshape: _vjp_reshape,
+            d_astype: _vjp_astype,
             d_broadcast_to: _vjp_broadcast_to,
             d_expand_dims: _vjp_reshape,  # expand_dims is a reshape; the VJP reshapes back
             d_transpose: _vjp_transpose,

@@ -332,6 +332,14 @@ def _reshape_rule(trace: BatchTrace, x: Boxed, *shape: Shape) -> BatchTracer:
     )
 
 
+# -- astype -----------------------------------------------------------------
+def _astype_rule(trace: BatchTrace, x: Boxed, dtype: Any, **kwargs: Any) -> BatchTracer:
+    # A cast is elementwise: shape is unchanged, so the batch axis stays exactly where it
+    # is (no move-to-front needed). ``dtype`` is static metadata, threaded through.
+    t = trace._raise(x)
+    return _result(trace, bind(ops.d_astype, t.value, dtype, **kwargs), t.bdim)
+
+
 # -- broadcast_to -----------------------------------------------------------
 def _broadcast_to_rule(trace: BatchTrace, x: Boxed, shape: Shape) -> BatchTracer:
     t = trace._raise(x)
@@ -753,6 +761,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_cumsum: _cumsum_rule,
             ops.d_transpose: _transpose_rule,
             ops.d_reshape: _reshape_rule,
+            ops.d_astype: _astype_rule,
             ops.d_broadcast_to: _broadcast_to_rule,
             ops.d_expand_dims: _expand_dims_rule,
             ops.d_concatenate: _join_for(ops.d_concatenate, new_axis=False),

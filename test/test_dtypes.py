@@ -169,3 +169,85 @@ def test_to_torch_module_float32():
 
 def quad_params(params, x):
     return np.sum((params["w"] @ x) ** 2)
+
+
+# ---------------------------------------------------------------------------
+# astype: the in-graph precision cast (mixed precision). Differentiable across the
+# eager, graph, vmap, and jvp surfaces; a cast is linear, so its VJP casts the
+# cotangent back to the input dtype.
+# ---------------------------------------------------------------------------
+def upcast_sin_sum(x):
+    # cast up to float64 for the nonlinearity, regardless of the working dtype
+    return np.sum(np.sin(x.astype("float64")))
+
+
+def astype_scaled_sum(x):
+    # free-function form (``np.astype``) so the same forward also lowers onto the compile
+    # backends, which intercept numpy calls but not bound ``.astype`` methods
+    return np.sum(np.astype(x, "float32") * 2.0)
+
+
+def test_astype_forward_dtype_and_value():
+    x = np.arange(3.0)
+    with pg.dtype("float32"):
+        y = pg.Var(x).astype("float64")
+    assert y.value.dtype == np.float64
+    assert np.allclose(y.value, x)
+
+
+def test_astype_grad_casts_back_to_working_dtype():
+    # Under a float32 tape the leaf is float32; the cotangent flows back from the
+    # upcast-to-float64 region into float32 (the cast's VJP is a cast-back).
+    ref_v, (ref_g,) = pg.value_and_grad(upcast_sin_sum)(_X)  # float64 reference
+    with pg.dtype("float32"):
+        v, (g,) = pg.value_and_grad(upcast_sin_sum)(_X)
+    assert g.dtype == np.float32
+    assert np.allclose(np.asarray(g, dtype=np.float64), ref_g, atol=1e-4, rtol=1e-4)
+
+
+def test_astype_graph_differentiable():
+    # value_and_grad(capture(f)) lowers the astype node and differentiates it on the graph.
+    with pg.dtype("float32"):
+        gg = pg.value_and_grad(pg.capture(upcast_sin_sum, _X))
+        v, grads = gg(_X)
+    leaf = np.asarray(_value_leaf(grads))
+    assert leaf.dtype == np.float32
+    ref_v, (ref_g,) = pg.value_and_grad(upcast_sin_sum)(_X)
+    assert np.allclose(np.asarray(leaf, dtype=np.float64), ref_g, atol=1e-4, rtol=1e-4)
+
+
+def test_astype_vmaps():
+    xs = np.arange(6.0).reshape(2, 3)
+    out = pg.vmap(astype_scaled_sum)(xs)
+    expected = [np.sum(r.astype("float32") * 2.0) for r in xs]
+    assert np.allclose(np.asarray(out, dtype=np.float64), expected)
+
+
+def test_astype_jvp():
+    x = np.arange(3.0)
+    v = np.ones(3)
+    _primal, tangent = pg.jvp(astype_scaled_sum, (x,), (v,))
+    assert np.allclose(float(np.asarray(tangent)), 2.0 * float(np.sum(v)))
+
+
+def test_astype_rejects_non_float():
+    from pycograd.ops import d_astype
+
+    # A Var holds real-valued tensors; casting to a non-floating dtype is not a tape op.
+    with pytest.raises(ValueError):
+        d_astype(np.ones(3), np.int64)
+
+
+def test_astype_torch_backend_parity():
+    pytest.importorskip("torch")
+    with pg.dtype("float32"):
+        ref_v, (ref_g,) = pg.value_and_grad(astype_scaled_sum)(_X)
+    v, (g,) = C.value_and_grad(astype_scaled_sum, backend="torch", dtype="float32")(_X)
+    assert np.allclose(np.asarray(g), ref_g, atol=1e-4, rtol=1e-4)
+
+
+def _value_leaf(grads):
+    from pycograd.tensor import _value
+    from pycograd.tree import tree_leaves
+
+    return _value(tree_leaves(grads)[0])

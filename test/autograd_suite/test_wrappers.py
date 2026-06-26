@@ -304,8 +304,10 @@ def test_deprecated_quick_grad_check_wrapper():
 
 
 @pytest.mark.skip(
-    reason="pycograd-gap: grad does not preserve float32/float16/longdouble/clongdouble "
-    "dtypes (works in float64); longdouble/clongdouble unsupported"
+    reason="pycograd-design: float32/float16/bfloat16 ARE supported via the working-dtype "
+    "seam (see test/test_dtypes.py) -- pycograd follows the ambient `pg.dtype(...)` rather "
+    "than the autograd convention of following the input array's dtype; longdouble/"
+    "clongdouble (extended/complex) remain unsupported (the tape is real-valued)"
 )
 def test_dtypes():
     pass

@@ -602,6 +602,13 @@ def abstract_broadcast_to(x: AbstractVal, shape: Shape) -> ShapedArray:
     return ShapedArray(tuple(int(d) for d in target), a.dtype)
 
 
+def abstract_astype(x: AbstractVal, dtype: DTypeLike, **_ignored: Any) -> ShapedArray:
+    # A cast preserves shape and sets the output dtype to the (floating) target.
+    from pycograd.dtypes import resolve_dtype
+
+    return ShapedArray(_aval(x).shape, resolve_dtype(dtype))
+
+
 def abstract_scatter(
     g: AbstractVal, key: object, shape: Shape, dtype: DTypeLike
 ) -> ShapedArray:
@@ -940,6 +947,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_cumsum: abstract_cumsum,
             ops.d_transpose: abstract_transpose,
             ops.d_reshape: abstract_reshape,
+            ops.d_astype: abstract_astype,
             ops.d_broadcast_to: abstract_broadcast_to,
             ops._scatter: abstract_scatter,
             # identity remat/spill markers (pycograd.remat): shape/dtype pass through

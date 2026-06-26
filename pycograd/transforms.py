@@ -18,6 +18,7 @@ from pycograd import ops
 from pycograd._typing import Array, ArrayLike, Boxed, Operand
 from pycograd.batching import BatchTrace, BatchTracer
 from pycograd.capture import Graph
+from pycograd.dtypes import current_dtype
 from pycograd.forward import JVPTrace, JVPTracer
 from pycograd.params import Param, _TieRef
 from pycograd.tensor import (
@@ -271,7 +272,7 @@ def value_and_grad(
                     "grad(lambda x: np.sum(grad(f)(x)[0]))."
                 )
             else:
-                value = _xp().asarray(_value(cast(Operand, out)), dtype=float)
+                value = _xp().asarray(_value(cast(Operand, out)), dtype=current_dtype())
 
         def _grad_leaf(orig: Leaf, v: Var | None) -> Operand | None:
             if v is None:
@@ -1208,7 +1209,7 @@ def jacobian(f: Callable[..., PyTree], argnum: int = 0) -> Callable[..., PyTree]
         m = int(np.prod(out_shape, dtype=np.int64)) if out_shape else 1
         rows: list[Array] = []
         for i in range(m):
-            cot = _xp().zeros(out_var.value.size, dtype=float)
+            cot = _xp().zeros(out_var.value.size, dtype=out_var.value.dtype)
             cot[i] = 1.0
             out_var.backward(cotangent=cot.reshape(out_shape) if out_shape else cot[0])
             rows.append(np.asarray(x_var.grad).reshape(-1))
@@ -1297,7 +1298,10 @@ def make_vjp(
         ans = np.asarray(out_var.value)
 
         def vjp_fn(g: PyTree) -> PyTree:
-            cot = _xp().asarray(_value(cast(Operand, g)), dtype=float)
+            # Keep the user-supplied cotangent's dtype; ``Var.backward`` accumulates
+            # into grads created as ``zeros_like``/``ones_like`` of the working-dtype
+            # forward values, so forcing float64 here would fight that precision.
+            cot = _xp().asarray(_value(cast(Operand, g)))
             out_var.backward(cotangent=cot)
             return np.asarray(x_var.grad)
 

@@ -144,6 +144,15 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
     def expand_dims(x: BackendArray, axis: int) -> BackendArray:
         return tf.expand_dims(as_t(x), axis)
 
+    def astype(x: BackendArray, dtype: DTypeLike, **_kw: object) -> BackendArray:
+        from pycograd.dtypes import resolve_dtype
+
+        dt = resolve_dtype(dtype)
+        # TF has no ml_dtypes.bfloat16 buffer interop, but tf.bfloat16 is a valid cast
+        # target -- name it explicitly; other floats map by numpy dtype.
+        target = tf.bfloat16 if dt.name == "bfloat16" else dt
+        return tf.cast(as_t(x), target)
+
     def concatenate(seq: BackendArray, axis: int = 0) -> BackendArray:
         return tf.concat([as_t(s) for s in seq], axis=axis)
 
@@ -225,6 +234,7 @@ def _make_adapters(tf: ModuleType) -> dict[str, Prim]:
         "matmul": matmul,
         "transpose": transpose,
         "reshape": reshape,
+        "astype": astype,
         "expand_dims": expand_dims,
         "concatenate": concatenate,
         "stack": stack,

@@ -206,7 +206,7 @@ an *effort/shape-of-work* estimate (what new machinery each needs), not a scope 
 | **`np.fft`** | medium | FFT/IFFT primitives + their (complex) adjoints |
 | **`scipy`** (`special`/`stats`/`linalg`/`signal`/`integrate`) | large | a scipy backend + per-fn rules |
 | **In-place / scatter** (`A[i] = b`) | medium | a forward scatter-add primitive |
-| **dtype preservation** (grad keeps float32/float16; longdouble/clongdouble) | medium | thread the input dtype through; pycograd defaults to a float64 working dtype |
+| **dtype: follow the *input array*** (`test_astype`/`test_dtypes` keep a float32 input's grad float32 *without* a context) | small | float32/float16/bfloat16 mixed precision **is** supported via the `pg.dtype(...)` working-dtype seam, and `.astype` is a graph-differentiable cast (`ops.d_astype`); the remaining gap is autograd's convention of *following the input array's dtype* with no ambient context, which conflicts with pycograd's working-dtype model. longdouble/clongdouble stay unsupported (real-valued tape) |
 
 ### Future cleanup: unify `grad` and `make_vjp`
 

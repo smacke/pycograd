@@ -182,6 +182,11 @@ def _make_adapters(
     def expand_dims(x: BackendArray, axis: int) -> BackendArray:
         return torch.unsqueeze(as_t(x), axis)
 
+    def astype(x: BackendArray, dtype: DTypeLike, **_kw: Any) -> BackendArray:
+        from pycograd.dtypes import resolve_dtype
+
+        return as_t(x).to(_torch_dtype(torch, resolve_dtype(dtype)))
+
     def concatenate(seq: BackendArray, axis: int = 0) -> BackendArray:
         return torch.cat(list(_unify(*[as_t(s) for s in seq])), dim=axis)
 
@@ -212,6 +217,7 @@ def _make_adapters(
         "matmul": matmul,
         "transpose": transpose,
         "reshape": reshape,
+        "astype": astype,
         "expand_dims": expand_dims,
         "concatenate": concatenate,
         "stack": stack,

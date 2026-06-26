@@ -80,6 +80,10 @@ def _decompose(prim: Any, args: tuple, params: dict) -> "tuple[list, dict]":
         return [args[0]], {"key": _const(args[1]), **params}
     if prim is ops.d_reshape or prim is ops.d_expand_dims:  # (x, shape/axis)
         return [args[0]], {}  # VJP reshapes the cotangent to the primal's shape
+    if prim is ops.d_astype:  # (x, dtype); dtype is static metadata, x the operand
+        from pycograd.dtypes import resolve_dtype
+
+        return [args[0]], {"dtype": resolve_dtype(_const(args[1]))}
     if prim is ops.d_transpose:  # (x[, axes])
         axes = _const(args[1]) if len(args) > 1 else None
         return [args[0]], {"axes": axes}
@@ -277,8 +281,9 @@ def _grad_graph(forward: Graph, *, include_value: bool = True) -> Graph:
         out_id = forward.outputs[0]
         out_aval = forward.nodes[out_id].aval if out_id < len(forward.nodes) else None
         seed_shape = out_aval.shape if out_aval is not None else ()
+        seed_dt = out_aval.dtype if out_aval is not None else np.dtype(np.float64)
         ct: dict[int, Boxed] = {
-            out_id: trace.pure(np.ones(_ishape(seed_shape), dtype=np.float64))
+            out_id: trace.pure(np.ones(_ishape(seed_shape), dtype=seed_dt))
         }
 
         # Reverse pass: distribute each node's cotangent to its operands.

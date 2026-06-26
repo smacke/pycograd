@@ -803,6 +803,9 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             # shape / structure: all linear.
             ops.d_transpose: _linear_struct_for(ops.d_transpose),
             ops.d_reshape: _linear_struct_for(ops.d_reshape),
+            # cast is linear with the dtype as trailing static metadata: the tangent is
+            # cast to the same target, so the primal/tangent dtypes stay in lock-step.
+            ops.d_astype: _linear_struct_for(ops.d_astype),
             ops.d_broadcast_to: _linear_struct_for(ops.d_broadcast_to),
             ops.d_expand_dims: _linear_struct_for(ops.d_expand_dims),
             ops.d_concatenate: _linear_seq_for(ops.d_concatenate),
