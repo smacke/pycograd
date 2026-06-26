@@ -423,8 +423,46 @@ def _broadcast_shape(op: str, *operands: AbstractVal) -> tuple[int | Dim, ...]:
         raise ShapeError(_shape_context(op, *shapes)) from e
 
 
+def _is_weak_scalar(o: AbstractVal) -> bool:
+    """True if ``o`` is a *weak* Python scalar (NEP 50): a bare ``bool``/``int``/
+    ``float``/``complex`` that is not a numpy ``generic``/``ndarray``.
+
+    numpy weak-promotes such scalars -- ``np.maximum(np.ones(3, np.float32), 0.0)`` is
+    ``float32``, not float64 -- so a captured node must promote the same way rather than
+    materializing the scalar to its default-precision dtype via ``np.asarray``."""
+    return isinstance(o, (bool, int, float, complex)) and not isinstance(
+        o, (np.generic, np.ndarray)
+    )
+
+
 def _result_dtype(*operands: AbstractVal) -> np.dtype:
-    return np.result_type(*[_aval(o).dtype for o in operands])
+    """numpy-faithful elementwise result dtype, anchored to the working dtype.
+
+    Mirrors NEP 50: a weak Python scalar never upcasts a strong float/complex operand
+    (``(f32, 0.0) -> f32``). When the float/complex *width* is otherwise unconstrained --
+    all operands weak, or the only strong operands are bool/int and a weak float/complex is
+    present -- it resolves to :func:`current_dtype` (and its complex pair for a weak
+    complex) instead of numpy's float64 default, so the tape honors the active working
+    dtype. A pure integer/bool result is left to numpy (indices/masks keep their dtype).
+    """
+    from pycograd.dtypes import current_dtype
+
+    strong = [np.dtype(_aval(o).dtype) for o in operands if not _is_weak_scalar(o)]
+    weak = [cast(Any, o) for o in operands if _is_weak_scalar(o)]
+    # A strong float/complex operand anchors the width: numpy's weak promotion against the
+    # passed-through Python value then keeps that width.
+    if any(dt.kind in "fc" for dt in strong):
+        return np.result_type(*strong, *weak)
+    # No float/complex anchor. If a weak float/complex is present the width is the working
+    # dtype; otherwise it is a pure integer/bool promotion numpy handles directly.
+    weak_kinds = {np.result_type(w).kind for w in weak}
+    if "c" in weak_kinds:
+        return np.result_type(current_dtype(), 1j)
+    if "f" in weak_kinds:
+        # A weak float with no float/complex anchor (e.g. a bool mask * 1.0) takes the
+        # working float dtype; strong bool/int operands carry no float precision.
+        return current_dtype()
+    return np.result_type(*strong, *weak)
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +695,7 @@ def abstract_concatenate(seq: Sequence[AbstractVal], axis: int = 0) -> ShapedArr
                 + f" along axis {axis}"
             )
         out[ax] += a.shape[ax]
-    return ShapedArray(tuple(out), np.result_type(*[a.dtype for a in avals]))
+    return ShapedArray(tuple(out), _result_dtype(*avals))
 
 
 def abstract_stack(seq: Sequence[AbstractVal], axis: int = 0) -> ShapedArray:

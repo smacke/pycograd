@@ -289,7 +289,9 @@ def _grad_graph(forward: Graph, *, include_value: bool = True) -> Graph:
         out_id = forward.outputs[0]
         out_aval = forward.nodes[out_id].aval if out_id < len(forward.nodes) else None
         seed_shape = out_aval.shape if out_aval is not None else ()
-        seed_dt = out_aval.dtype if out_aval is not None else np.dtype(np.float64)
+        from pycograd.dtypes import current_dtype
+
+        seed_dt = out_aval.dtype if out_aval is not None else current_dtype()
         ct: dict[int, Boxed] = {
             out_id: trace.pure(np.ones(_ishape(seed_shape), dtype=seed_dt))
         }

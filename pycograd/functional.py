@@ -26,6 +26,7 @@ import numpy as np
 # alias (a value lookup) is fine, but avoid PEP 604 ``X | None`` spellings here.
 from pycograd import ops, random
 from pycograd._typing import Axis, Operand, Tensor
+from pycograd.dtypes import current_dtype
 from pycograd.tensor import Var, _value
 
 
@@ -184,10 +185,10 @@ def _pad2d(x: Tensor, ph: int, pw: int) -> Tensor:
     ``concatenate`` (so the pad is differentiable: its gradient is simply dropped)."""
     n, c = x.shape[0], x.shape[1]
     if ph > 0:
-        z = np.zeros((n, c, ph, x.shape[3]))
+        z = np.zeros((n, c, ph, x.shape[3]), dtype=current_dtype())
         x = np.concatenate([z, x, z], axis=2)
     if pw > 0:
-        z = np.zeros((n, c, x.shape[2], pw))
+        z = np.zeros((n, c, x.shape[2], pw), dtype=current_dtype())
         x = np.concatenate([z, x, z], axis=3)
     return x
 
@@ -246,7 +247,7 @@ def conv1d(
     (atrous/WaveNet convolutions); ``groups`` gives grouped / depthwise convs."""
     c_out, c_in_g, kk = w.shape[0], w.shape[1], w.shape[2]
     if pad > 0:
-        z = np.zeros((x.shape[0], x.shape[1], pad))
+        z = np.zeros((x.shape[0], x.shape[1], pad), dtype=current_dtype())
         x = np.concatenate([z, x, z], axis=2)
     x4 = np.reshape(x, (x.shape[0], x.shape[1], 1, x.shape[2]))
     w4 = np.reshape(w, (c_out, c_in_g, 1, kk))
@@ -272,7 +273,7 @@ def causal_conv1d(
     # Data-shaped zero pad (``x[..., :1] * 0`` broadcast to width ``pad``), the
     # ``rwkv``/``models`` trick: derived from ``x`` so it stays batched under
     # ``vmap`` (a plain ``np.zeros`` would be an unbatched concatenate operand).
-    z = x[:, :, :1] * 0.0 * np.ones((1, 1, pad))
+    z = x[:, :, :1] * 0.0 * np.ones((1, 1, pad), dtype=current_dtype())
     x = np.concatenate([z, x], axis=2)  # left pad only
     return conv1d(x, w, b, stride=stride, pad=0, dilation=dilation, groups=groups)
 
@@ -326,8 +327,12 @@ def conv_transpose2d(
     h, ww = x.shape[2], x.shape[3]
     h_dil, w_dil = (h - 1) * stride + 1, (ww - 1) * stride + 1
     # Selection matrices placing input element i at dilated position i*stride.
-    sh = np.eye(h_dil)[np.arange(h) * stride]  # (h, h_dil), constant
-    sw = np.eye(w_dil)[np.arange(ww) * stride]  # (ww, w_dil), constant
+    sh = np.eye(h_dil, dtype=current_dtype())[
+        np.arange(h) * stride
+    ]  # (h, h_dil), const
+    sw = np.eye(w_dil, dtype=current_dtype())[
+        np.arange(ww) * stride
+    ]  # (ww, w_dil), const
     x_dil = np.einsum("...hw,hH,wW->...HW", x, sh, sw)  # zero-interleaved input
     # Pad by the (dilated) kernel footprint minus 1, less the conv's own padding.
     x_dil = _pad2d(x_dil, (kh - 1) * dilation - pad, (kw - 1) * dilation - pad)
@@ -385,7 +390,7 @@ def streaming_conv1d_init(
     ``state=None`` instead gives *valid* mode -- matching plain ``conv1d(pad=0)``,
     whose first output waits for a full receptive field.)"""
     pad = (kernel_size - 1) * dilation
-    return np.zeros((batch, num_channels, pad)), 0
+    return np.zeros((batch, num_channels, pad), dtype=current_dtype()), 0
 
 
 def streaming_conv1d(
@@ -413,7 +418,7 @@ def streaming_conv1d(
         xa, leftover = xa[:, :, drop:], leftover - drop
     recep = (w.shape[2] - 1) * dilation + 1
     if xa.shape[2] < recep:  # not enough context yet -- keep buffering
-        empty = np.zeros((xa.shape[0], w.shape[0], 0))
+        empty = np.zeros((xa.shape[0], w.shape[0], 0), dtype=current_dtype())
         return empty, (xa, leftover)
     y = np.asarray(
         conv1d(xa, w, b, stride=stride, pad=0, dilation=dilation, groups=groups)
@@ -455,7 +460,7 @@ def streaming_conv_transpose1d(
     )
     post_y, post_t = (None, 0) if state is None else state
     if post_t > 0:  # bias-only positions a large stride left between footprints
-        init_y = np.zeros((xa.shape[0], c_out, post_t))
+        init_y = np.zeros((xa.shape[0], c_out, post_t), dtype=current_dtype())
         if bias is not None:
             init_y = init_y + np.reshape(bias, (1, c_out, 1))
         y = np.concatenate([init_y, y], axis=2)
@@ -489,7 +494,7 @@ def streaming_conv2d_init(
     pad)``), so streaming a clip frame-by-frame reproduces a W-causal conv2d over
     the whole clip. ``height`` is fixed (only the W axis streams)."""
     pad = (kernel_w - 1) * dilation
-    return np.zeros((batch, num_channels, height, pad)), 0
+    return np.zeros((batch, num_channels, height, pad), dtype=current_dtype()), 0
 
 
 def streaming_conv2d(
@@ -520,11 +525,13 @@ def streaming_conv2d(
         h_out = (
             xa.shape[2] + 2 * pad_h - (w.shape[2] - 1) * dilation - 1
         ) // stride + 1
-        empty = np.zeros((xa.shape[0], w.shape[0], h_out, 0))
+        empty = np.zeros((xa.shape[0], w.shape[0], h_out, 0), dtype=current_dtype())
         return empty, (xa, leftover)
     xp = xa
     if pad_h > 0:  # symmetric pad on H only (axis 2); W stays causal via the cache
-        z = np.zeros((xa.shape[0], xa.shape[1], pad_h, xa.shape[3]))
+        z = np.zeros(
+            (xa.shape[0], xa.shape[1], pad_h, xa.shape[3]), dtype=current_dtype()
+        )
         xp = np.concatenate([z, xa, z], axis=2)
     y = np.asarray(conv2d(xp, w, b, stride=stride, pad=0, dilation=dilation))
     t = stride * y.shape[3]  # W columns now fully consumed
@@ -560,7 +567,9 @@ def streaming_conv_transpose2d(
     )
     post_y, post_t = (None, 0) if state is None else state
     if post_t > 0:  # bias-only columns a large stride left between footprints
-        init_y = np.zeros((y.shape[0], c_out, y.shape[2], post_t))
+        init_y = np.zeros(
+            (y.shape[0], c_out, y.shape[2], post_t), dtype=current_dtype()
+        )
         if bias is not None:
             init_y = init_y + np.reshape(bias, (1, c_out, 1, 1))
         y = np.concatenate([init_y, y], axis=3)
@@ -588,7 +597,7 @@ def upsample_nearest2d(x: Tensor, scale: int) -> Tensor:
 def one_hot(indices: "np.ndarray", num_classes: int) -> "np.ndarray":
     """One-hot encode integer ``indices`` along a new last axis. A constant w.r.t. the
     (integer, non-differentiable) indices -- a plain array, not a tape node."""
-    return np.eye(num_classes)[np.asarray(indices)]
+    return np.eye(num_classes, dtype=current_dtype())[np.asarray(indices)]
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +623,9 @@ def rms_norm(x: Tensor, gamma: Tensor, eps: float = 1e-5) -> Tensor:
 def batch_norm_init(num_features: int) -> "tuple[np.ndarray, np.ndarray]":
     """Initial ``(running_mean, running_var)`` buffers for :func:`batch_norm` --
     zeros / ones of length ``num_features`` (the channel count)."""
-    return np.zeros(num_features), np.ones(num_features)
+    return np.zeros(num_features, dtype=current_dtype()), np.ones(
+        num_features, dtype=current_dtype()
+    )
 
 
 def batch_norm(

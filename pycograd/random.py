@@ -27,6 +27,7 @@ from typing import Tuple, Union
 import numpy as np
 
 from pycograd._typing import Array, Key
+from pycograd.dtypes import current_dtype
 
 # A reshape/sample shape: a single length or a tuple of dims (runtime-referenced
 # only in annotations, but kept as ``Union`` for parity with the codebase style).
@@ -74,7 +75,7 @@ def _generator(k: Key) -> "np.random.Generator":
 
 def bernoulli(k: Key, p: float, shape: Shape) -> Array:
     """Sample a 0/1 float array (1 with probability ``p``) of the given ``shape``."""
-    return (_generator(k).random(shape) < p).astype(float)
+    return (_generator(k).random(shape) < p).astype(current_dtype())
 
 
 def uniform(k: Key, shape: Shape, low: float = 0.0, high: float = 1.0) -> Array:

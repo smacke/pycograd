@@ -251,3 +251,84 @@ def _value_leaf(grads):
     from pycograd.tree import tree_leaves
 
     return _value(tree_leaves(grads)[0])
+
+
+# ---------------------------------------------------------------------------
+# Captured-graph dtype: a captured forward+backward must stay in the working
+# dtype, not silently promote to float64. The classic leak is a weak Python
+# scalar (``np.maximum(x, 0.0)`` in relu, the ``* 1.0`` bool->float in its graph
+# VJP, the ``/ N`` in mean's VJP) upcasting a float32 array via numpy's strong,
+# dtype-based promotion -- where eager numpy weak-promotes the scalar and keeps
+# float32. The fix lives in ``shapes._result_dtype`` (NEP 50 weak scalars,
+# anchored to ``current_dtype()``) plus the backward seeds.
+# ---------------------------------------------------------------------------
+def relu_mlp_loss(x, y, w1, b1, w2, b2):
+    # relu (weak 0.0) -> matmul -> softmax cross-entropy (mean's weak / N), so the
+    # captured forward and the value_and_grad backward exercise every weak-scalar
+    # and bool->float promotion site.
+    h = pg.relu(x @ w1 + b1)
+    return pg.cross_entropy(h @ w2 + b2, y)
+
+
+def _float_node_dtypes(graph):
+    # The dtypes of every floating-point node aval (skip the int shape-constants and
+    # bool comparison masks, which legitimately stay i64/bool).
+    return [
+        node.aval.dtype for node in graph.nodes if np.dtype(node.aval.dtype).kind == "f"
+    ]
+
+
+@pytest.mark.parametrize("name", ["float32", "float16"])
+def test_capture_keeps_working_dtype(name):
+    dt = np.dtype(name)
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((8, 3)).astype(dt)
+    y = np.eye(2, dtype=dt)[rng.integers(0, 2, size=8)]
+    w1 = rng.standard_normal((3, 4)).astype(dt)
+    b1 = np.zeros(4, dtype=dt)
+    w2 = rng.standard_normal((4, 2)).astype(dt)
+    b2 = np.zeros(2, dtype=dt)
+
+    with pg.dtype(name):
+        vg = pg.value_and_grad(pg.capture(relu_mlp_loss, x, y, w1, b1, w2, b2))
+        fwd = pg.capture(relu_mlp_loss, x, y, w1, b1, w2, b2)
+
+    # Every floating node -- forward and backward (the relu VJP's bool->float
+    # ``mul(mask, 1.0)``, the mean VJP's ``/ N``, the ones-seed) -- is the working
+    # dtype; nothing leaked to float64.
+    for graph in (fwd, vg):
+        floats = _float_node_dtypes(graph)
+        assert floats, "expected some floating-point nodes"
+        assert all(d == dt for d in floats), {str(d) for d in floats}
+
+
+def test_capture_weak_scalar_does_not_upcast():
+    # The core regression, dtype-block-free: a float32 input through relu's weak
+    # ``0.0`` (and a weak ``* 2.0``) stays float32, matching eager numpy rather
+    # than promoting to float64 the way strong ``np.result_type`` would.
+    x = np.arange(6.0, dtype=np.float32).reshape(2, 3)
+    g = pg.capture(lambda z: np.sum(np.maximum(z, 0.0) * 2.0 - 1.0), x)
+    assert all(d == np.float32 for d in _float_node_dtypes(g))
+
+
+def test_capture_default_context_stays_float64():
+    # Default working dtype is float64: a float64 capture is byte-for-byte
+    # unchanged (no weak-scalar rule narrows it).
+    x = np.arange(6.0).reshape(2, 3)  # float64
+    g = pg.capture(lambda z: np.sum(np.maximum(z, 0.0) * 2.0), x)
+    assert all(d == np.float64 for d in _float_node_dtypes(g))
+
+
+def test_bernoulli_and_max_grad_in_working_dtype():
+    # Eager-tape leaks: bernoulli's mask and max/min's select-mask VJP used a bare
+    # ``.astype(float)`` (float64). Under a float32 tape they must be float32.
+    from pycograd import random as pgr
+
+    with pg.dtype("float32"):
+        assert pgr.bernoulli(pgr.key(0), 0.5, (4,)).dtype == np.float32
+
+        def f(x):
+            return np.sum(np.maximum(x, 0.0) + np.minimum(x, 0.0))
+
+        _v, (gx,) = pg.value_and_grad(f)(np.array([1.0, -2.0, 3.0], dtype=np.float32))
+        assert gx.dtype == np.float32

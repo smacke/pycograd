@@ -36,7 +36,7 @@ from pycograd._typing import (
     Shape,
 )
 from pycograd.backends import current_backend
-from pycograd.dtypes import conj_if_complex, resolve_dtype
+from pycograd.dtypes import conj_if_complex, current_dtype, resolve_dtype
 from pycograd.tensor import (
     Var,
     _accumulate,
@@ -359,7 +359,7 @@ def _elementwise_max(
     out = Var(pick_a(a.value, b.value), _parents=(a, b))
 
     def _backward() -> None:
-        mask = (a.value == out.value).astype(float)
+        mask = (a.value == out.value).astype(current_dtype())
         a.grad = _accumulate(a.grad, _unbroadcast(out.grad * mask, a.value.shape))
         b.grad = _accumulate(b.grad, _unbroadcast(out.grad * (1 - mask), b.value.shape))
 
@@ -2146,7 +2146,7 @@ def _reduce_select(
         g = out.grad
         if axis is not None and not keepdims:
             g = xp.expand_dims(g, axis)
-        mask = (x.value == kept).astype(float)
+        mask = (x.value == kept).astype(current_dtype())
         mask /= mask.sum(axis=axis, keepdims=True)
         x.grad = _accumulate(x.grad, mask * g)
 

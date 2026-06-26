@@ -115,8 +115,11 @@ def vjp_graph(f: Callable[..., PyTree], *primals: PyTree) -> Graph:
                 env[node.id] = bind(node.prim, *args, **node.params)
 
         # Seed the output tangent's cotangent with ones, transpose the linear nodes.
-        seed_shape = _ishape(lin.nodes[tangent_out_id].aval.shape)
-        ct: dict[int, Boxed] = {tangent_out_id: trace.pure(np.ones(seed_shape))}
+        seed_av = lin.nodes[tangent_out_id].aval
+        seed_shape = _ishape(seed_av.shape)
+        ct: dict[int, Boxed] = {
+            tangent_out_id: trace.pure(np.ones(seed_shape, dtype=seed_av.dtype))
+        }
         for node in reversed(lin.nodes):
             if node.prim is _INPUT or node.prim is _CONST or node.id not in linear:
                 continue
@@ -149,7 +152,8 @@ def vjp_graph(f: Callable[..., PyTree], *primals: PyTree) -> Graph:
         for t in tangent_ids:
             gc = ct.get(t)
             if gc is None:
-                gc = trace.pure(np.zeros(_ishape(lin.nodes[t].aval.shape)))
+                av = lin.nodes[t].aval
+                gc = trace.pure(np.zeros(_ishape(av.shape), dtype=av.dtype))
             grads.append(gc)
         out_ids = [trace.output_id(env[primal_out_id])] + [
             trace.output_id(g) for g in grads
