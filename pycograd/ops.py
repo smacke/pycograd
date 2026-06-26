@@ -1519,6 +1519,107 @@ def outer_abstract_rule(a: Boxed, b: Boxed) -> Boxed:
     return cast(Boxed, ShapedArray((na, nb), av.dtype))
 
 
+# ---------------------------------------------------------------------------
+# np.cross -- the 3-vector cross product along an axis. Bilinear: build each output component
+# ``c_i = a_{i+1} b_{i+2} - a_{i+2} b_{i+1}`` (cyclic) from getitem/mul/sub and ``stack`` them
+# back along ``axisc``. A composition (no own VJP), so it also lowers at graph capture.
+# ---------------------------------------------------------------------------
+def _cross_build(a: Boxed, b: Boxed, axisa: int, axisb: int, axisc: int) -> Boxed:
+    from pycograd.trace import bind
+
+    na, nb = len(_logical_shape(a)), len(_logical_shape(b))
+
+    def comp(x: Boxed, ax: int, nd: int, i: int) -> Boxed:
+        axn = ax % nd
+        key = tuple(i if d == axn else slice(None) for d in range(nd))
+        return bind(d_getitem, x, key)
+
+    a0, a1, a2 = (comp(a, axisa, na, i) for i in range(3))
+    b0, b1, b2 = (comp(b, axisb, nb, i) for i in range(3))
+    c0 = bind(d_sub, bind(d_mul, a1, b2), bind(d_mul, a2, b1))
+    c1 = bind(d_sub, bind(d_mul, a2, b0), bind(d_mul, a0, b2))
+    c2 = bind(d_sub, bind(d_mul, a0, b1), bind(d_mul, a1, b0))
+    out_nd = max(na, nb)
+    return bind(d_stack, [c0, c1, c2], axis=axisc % out_nd)
+
+
+def _cross_axes(axisa: int, axisb: int, axisc: int, axis: Any) -> tuple[int, int, int]:
+    return (axis, axis, axis) if axis is not None else (axisa, axisb, axisc)
+
+
+def d_cross(
+    a: Operand,
+    b: Operand,
+    axisa: int = -1,
+    axisb: int = -1,
+    axisc: int = -1,
+    axis: Any = None,
+) -> Var:
+    aa, ab, ac = _cross_axes(axisa, axisb, axisc, axis)
+    return cast(Var, _cross_build(cast(Boxed, a), cast(Boxed, b), aa, ab, ac))
+
+
+def cross_transform_rule(
+    _trace: Boxed,
+    a: Boxed,
+    b: Boxed,
+    axisa: int = -1,
+    axisb: int = -1,
+    axisc: int = -1,
+    axis: Any = None,
+) -> Boxed:
+    aa, ab, ac = _cross_axes(axisa, axisb, axisc, axis)
+    return _cross_build(a, b, aa, ab, ac)
+
+
+def cross_abstract_rule(
+    a: Boxed,
+    b: Boxed,
+    axisa: int = -1,
+    axisb: int = -1,
+    axisc: int = -1,
+    axis: Any = None,
+) -> Boxed:
+    aa, ab, ac = _cross_axes(axisa, axisb, axisc, axis)
+    return _cross_build(a, b, aa, ab, ac)
+
+
+# ---------------------------------------------------------------------------
+# np.kron -- the Kronecker product. Promote both operands to a common ndim (leading 1s), then
+# ``einsum`` with interleaved labels (``ab,cd->acbd``) and reshape each axis-pair to one axis. A
+# reshape/einsum composition (no own VJP), so it also lowers at graph capture.
+# ---------------------------------------------------------------------------
+def _kron_build(a: Boxed, b: Boxed) -> Boxed:
+    import string
+
+    from pycograd.trace import bind
+
+    sa = tuple(int(d) for d in _logical_shape(a))
+    sb = tuple(int(d) for d in _logical_shape(b))
+    nd = max(len(sa), len(sb))
+    sa_p = (1,) * (nd - len(sa)) + sa
+    sb_p = (1,) * (nd - len(sb)) + sb
+    A = bind(d_reshape, a, sa_p) if len(sa) < nd else a
+    B = bind(d_reshape, b, sb_p) if len(sb) < nd else b
+    la, lb = string.ascii_letters[:nd], string.ascii_letters[nd : 2 * nd]
+    spec = ",".join([la, lb]) + "->" + "".join(la[i] + lb[i] for i in range(nd))
+    e = bind(d_einsum, spec, A, B)
+    final = tuple(sa_p[i] * sb_p[i] for i in range(nd))
+    return bind(d_reshape, e, final)
+
+
+def d_kron(a: Operand, b: Operand) -> Var:
+    return cast(Var, _kron_build(cast(Boxed, a), cast(Boxed, b)))
+
+
+def kron_transform_rule(_trace: Boxed, a: Boxed, b: Boxed) -> Boxed:
+    return _kron_build(a, b)
+
+
+def kron_abstract_rule(a: Boxed, b: Boxed) -> Boxed:
+    return _kron_build(a, b)
+
+
 def d_diag(v: Operand, k: int = 0) -> Var:
     shape = _logical_shape(v)
     key, out_shape = _diag_key(shape, k)
@@ -2310,6 +2411,8 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_rot90: (np.rot90,),
     d_trace: (np.trace,),
     d_outer: (np.outer,),
+    d_cross: (np.cross,),
+    d_kron: (np.kron,),
     d_array: (np.array,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
@@ -2366,6 +2469,8 @@ _LOWERING_RULES: dict[Prim, Rule] = {
     d_rot90: rot90_transform_rule,
     d_trace: trace_transform_rule,
     d_outer: outer_transform_rule,
+    d_cross: cross_transform_rule,
+    d_kron: kron_transform_rule,
     d_array: array_transform_rule,
     d_ravel: _reshape_lowering_transform(ravel_shape),
     d_squeeze: _reshape_lowering_transform(squeeze_shape),

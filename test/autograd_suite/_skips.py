@@ -102,7 +102,6 @@ SKIPS = {
         "test_systematic.py",
         "test_conjugate",
     ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    ("test_systematic.py", "test_cross"): "pycograd-gap: no VJP rule for np.cross",
     (
         "test_systematic.py",
         "test_einsum2_three_args",
@@ -119,7 +118,6 @@ SKIPS = {
         "test_systematic.py",
         "test_imag",
     ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    ("test_systematic.py", "test_kron"): "pycograd-gap: no VJP rule for np.kron",
     (
         "test_systematic.py",
         "test_matmul",

@@ -132,6 +132,13 @@ this work** — see below).
   *max/min tie* (the tie-splitting was already correct -- only the construction blocked it), and
   list-operand `append` tests -- 12 more green (suite now 315 passed / 78 skipped). Native
   regression: `test/test_array_of_boxes.py`.
+* **np.cross / np.kron** (twelfth PR): both bilinear and built from existing primitives -- `cross`
+  is per-component `getitem`/`mul`/`sub` then `stack` (handles `axisa`/`axisb`/`axisc`/`axis`);
+  `kron` promotes both operands to a common ndim then `einsum` (interleaved labels) + `reshape`.
+  As compositions they carry no own VJP and are registered in `ops._LOWERING_RULES`, so they also
+  lower at graph capture -- `value_and_grad(capture(f))` differentiates them. Flipped 2 more tests
+  green (suite now 317 passed / 76 skipped). Native regression (eager + graph) in
+  `test/test_contraction_ops.py`.
 * **np.outer** (tenth PR): the outer product of two flattened vectors -- `einsum('i,j->ij',
   ravel(a), ravel(b))`, a ravel/einsum composition (full rules), so reverse/forward/vmap/eval_shape
   all work and no own VJP. Flipped 2 more tests green (suite now 303 passed / 90 skipped). Native
