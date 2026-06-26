@@ -6,7 +6,6 @@ builtins reach in C (bypassing instrumentation).
 
 Module-level functions so pyccolo can re-instrument them from source."""
 import numpy as np
-import pytest
 
 from pycograd import grad, jvp, vmap
 

@@ -165,6 +165,12 @@ this work** — see below).
   and the arithmetic operator surface (routing through `bind`, so the right jvp/vmap/abstract/graph
   level handles them). Flipped 5 more tests green (suite now 327 passed / 66 skipped). Native
   regression: `test/test_list_reductions.py`.
+* **Stack family 1-D / dtype-kwarg edges** (fourteenth PR): `np.hstack`/`np.column_stack` now run
+  `atleast_1d` on each element, so a single 1-D array passed as the sequence (whose elements
+  iterate to 0-d scalars) still concatenates; the stack ops swallow numpy's `dtype=`/`casting=`
+  kwargs; and `np.row_stack` (a distinct function from `np.vstack`) is now intercepted. Flipped 4
+  more tests green (suite now 331 passed / 62 skipped). Native regression in
+  `test/test_manip_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

@@ -2333,9 +2333,18 @@ def d_expand_dims(x: Operand, axis: int) -> Var:
 
 # The ``*stack`` family is just ``concatenate`` after a shape fix-up, so composing
 # the existing differentiable primitives gives correct gradients for free.
-def d_stack(seq: Sequence[Operand], axis: int = 0) -> Var:
+# numpy's stack family accepts a ``dtype=``/``casting=`` kwarg (and ``row_stack`` forwards
+# them to ``vstack``); we compute in the operand dtype, so ``**_`` swallows them.
+def d_stack(seq: Sequence[Operand], axis: int = 0, **_: Any) -> Var:
     # join along a NEW axis: expand each input at ``axis``, then concatenate there.
     return d_concatenate([d_expand_dims(s, axis) for s in seq], axis=axis)
+
+
+def _atleast_1d_part(x: Operand) -> Var:
+    # numpy's hstack/column_stack run atleast_1d on each input, so a single 1-D array passed as
+    # the sequence (its elements iterate to 0-d scalars) still concatenates.
+    x = _lift(x)
+    return d_reshape(x, (1,)) if x.value.ndim == 0 else x
 
 
 def _atleast_2d_row(x: Operand) -> Var:
@@ -2347,23 +2356,23 @@ def _atleast_2d_row(x: Operand) -> Var:
     return x
 
 
-def d_vstack(seq: Sequence[Operand]) -> Var:
+def d_vstack(seq: Sequence[Operand], **_: Any) -> Var:
     # row-wise: 1-D inputs become single rows, then concatenate along axis 0.
     return d_concatenate([_atleast_2d_row(s) for s in seq], axis=0)
 
 
-def d_hstack(seq: Sequence[Operand]) -> Var:
+def d_hstack(seq: Sequence[Operand], **_: Any) -> Var:
     # column-wise: concatenate along axis 1, except 1-D inputs join along axis 0.
-    parts = [_lift(s) for s in seq]
-    axis = 0 if all(p.value.ndim <= 1 for p in parts) else 1
+    parts = [_atleast_1d_part(s) for s in seq]
+    axis = 0 if all(p.value.ndim == 1 for p in parts) else 1
     return d_concatenate(parts, axis=axis)
 
 
-def d_column_stack(seq: Sequence[Operand]) -> Var:
+def d_column_stack(seq: Sequence[Operand], **_: Any) -> Var:
     # 1-D inputs become columns ((n,) -> (n, 1)); then concatenate along axis 1.
     parts = []
     for s in seq:
-        p = _lift(s)
+        p = _atleast_1d_part(s)
         parts.append(d_reshape(p, (p.value.shape[0], 1)) if p.value.ndim == 1 else p)
     return d_concatenate(parts, axis=1)
 
@@ -2379,7 +2388,7 @@ def _atleast_3d_depth(x: Operand) -> Var:
     return x
 
 
-def d_dstack(seq: Sequence[Operand]) -> Var:
+def d_dstack(seq: Sequence[Operand], **_: Any) -> Var:
     # depth-wise: stack along a third axis (after promoting inputs to 3-D).
     return d_concatenate([_atleast_3d_depth(s) for s in seq], axis=2)
 
@@ -2575,7 +2584,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),
     d_stack: (np.stack,),
-    d_vstack: (np.vstack,),
+    d_vstack: (np.vstack, np.row_stack),
     d_hstack: (np.hstack,),
     d_column_stack: (np.column_stack,),
     d_dstack: (np.dstack,),

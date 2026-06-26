@@ -68,10 +68,6 @@ SKIPS = {
     ): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_systematic.py",
-        "test_column_stack_1d",
-    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
-    (
-        "test_systematic.py",
         "test_einsum2_three_args",
     ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
     (
@@ -80,24 +76,12 @@ SKIPS = {
     ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
     (
         "test_systematic.py",
-        "test_hstack_1d",
-    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
-    (
-        "test_systematic.py",
         "test_matmul",
     ): "pycograd-gap: general np.matmul over these shapes (broadcast/complex) is shape-limited",
     (
         "test_systematic.py",
         "test_real_ic",
     ): "pycograd-gap: np.real_if_close has no rule (a niche data-dependent variant of real(); complex real/imag/conj/conjugate/angle ARE supported)",
-    (
-        "test_systematic.py",
-        "test_row_stack_1d",
-    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
-    (
-        "test_systematic.py",
-        "test_row_stack_2d",
-    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
         "test_std",

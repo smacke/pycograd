@@ -228,3 +228,35 @@ def f_uses_index_repeat(x):
 def test_structural_ops_pass_through_plain_indices():
     g = np.asarray(grad(f_uses_index_repeat)(_A)[0])
     assert np.allclose(g, _fd(f_uses_index_repeat, _A), atol=1e-5)
+
+
+# --- stack family 1-D edges + dtype kwarg ----------------------------------
+def f_hstack_single(x):
+    # a single 1-D array passed as the sequence: its scalars promote via atleast_1d
+    return np.sum(np.hstack(x) ** 2)
+
+
+def f_column_stack(a, b):
+    return np.sum(np.column_stack((a, b)) ** 2)
+
+
+def f_row_stack(a, b):
+    return np.sum(np.row_stack((a, b)) ** 2)
+
+
+def test_stack_1d_edges():
+    v = _rng.standard_normal(4)
+    assert np.allclose(
+        np.asarray(grad(f_hstack_single)(v)[0]), _fd(f_hstack_single, v), atol=1e-5
+    )
+    a1, b1 = _rng.standard_normal(3), _rng.standard_normal(3)
+    ga, gb = grad(f_column_stack, [0, 1])(a1, b1)
+    assert np.allclose(np.asarray(ga), 2 * a1) and np.allclose(np.asarray(gb), 2 * b1)
+    # row_stack forwards a dtype kwarg to vstack; it must be swallowed
+    A, B = _rng.standard_normal((2, 3)), _rng.standard_normal((1, 3))
+    assert eval_shape(lambda x, y: np.row_stack((x, y)), A, B).shape == (3, 3)
+    assert np.allclose(
+        np.asarray(grad(f_row_stack)(A, B)[0]),
+        _fd(lambda x: f_row_stack(x, B), A),
+        atol=1e-5,
+    )
