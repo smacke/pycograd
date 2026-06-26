@@ -368,10 +368,11 @@ def _matmul_rule(trace: JVPTrace, a: Boxed, b: Boxed) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
-def _einsum_rule(trace: JVPTrace, subscripts: str, *operands: Boxed) -> JVPTracer:
+def _einsum_rule(trace: JVPTrace, subscripts: Any, *operands: Boxed) -> JVPTracer:
     # einsum is multilinear in its operands, so by the product rule the tangent is the
     # sum over operands of the einsum with that operand replaced by its tangent.
-    # ``subscripts`` is static (not raised).
+    # ``subscripts`` is static (not raised); normalize numpy's interleaved form first.
+    subscripts, operands = ops._normalize_einsum_args(subscripts, operands)
     tracers = [trace._raise(o) for o in operands]
     primals = [t.primal for t in tracers]
     primal_out = bind(ops.d_einsum, subscripts, *primals)

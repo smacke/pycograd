@@ -507,9 +507,10 @@ def abstract_matmul(a: AbstractVal, b: AbstractVal) -> ShapedArray:
     return ShapedArray(batch + (sa[-2], sb[-1]), dtype)
 
 
-def abstract_einsum(subscripts: str, *operands: AbstractVal) -> ShapedArray:
+def abstract_einsum(subscripts: Any, *operands: AbstractVal) -> ShapedArray:
     from pycograd import ops
 
+    subscripts, operands = ops._normalize_einsum_args(subscripts, operands)
     avals = [_aval(o) for o in operands]
     ins, out = ops._parse_einsum(subscripts, [len(av.shape) for av in avals])
     label_dim: dict[str, "int | Dim"] = {}

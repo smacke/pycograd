@@ -123,6 +123,14 @@ this work** — see below).
   `concatenate` composition (`axis=None` ravels both operands first). Flipped ~2 more tests
   green (suite now 288 passed / 105 skipped). The python-*list*-operand `append` cases stay
   skipped (the np.array-of-boxes gap). Native regression in `test/test_manip_ops.py`.
+* **Interleaved einsum** (ninth PR): numpy's explicit-axes form
+  `np.einsum(op0, sublist0, op1, sublist1, ..., out_sublist)` (integer index labels instead of a
+  subscript string) now normalizes to the subscript form and reuses the full einsum machinery, so
+  reverse/forward/vmap/eval_shape all work over any operand count. Flipped 4 more tests green (suite
+  now 301 passed / 92 skipped). The two remaining `einsum*_three_args` tests use a *repeated label
+  within one operand* (a diagonal/trace inside einsum), whose adjoint needs a scatter-to-diagonal
+  the reverse einsum can't express -- still skipped, with an accurate reason. Native regression:
+  `test/test_einsum_interleaved.py`.
 * **Flips / trace / cumsum-flatten** (eighth PR): `np.flipud`/`np.fliplr`/`np.rot90` (an axis
   `::-1` slice, plus a transpose for rot90 -- getitem/transpose compositions), `np.trace` (gather
   the diagonal indices over the leading two axes, then sum -- works for any ndim with the default

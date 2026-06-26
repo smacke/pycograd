@@ -542,6 +542,46 @@ def _expand_ellipsis(
     return new_ins, new_rhs
 
 
+def _normalize_einsum_args(subscripts: Any, operands: tuple) -> tuple[str, tuple]:
+    """Accept either einsum form and return ``(subscripts_string, operands)``.
+
+    numpy's *interleaved* form passes ``op0, sublist0, op1, sublist1, ..., [out_sublist]``
+    instead of a subscript string -- detected by a non-string first argument. Each integer
+    (or ``Ellipsis``) index label is mapped to a stable letter, and a trailing output
+    sublist (present iff the argument count is odd) becomes the ``->`` group. A string
+    first argument passes straight through.
+    """
+    import string
+
+    if isinstance(subscripts, str):
+        return subscripts, operands
+    args = (subscripts, *operands)
+    ops_list: list = []
+    sublists: list = []
+    i = 0
+    while i + 1 < len(args):
+        ops_list.append(args[i])
+        sublists.append(args[i + 1])
+        i += 2
+    out_sublist = args[i] if i < len(args) else None
+
+    label_map: dict = {}
+
+    def lbl(x: Any) -> str:
+        if x is Ellipsis:
+            return "..."
+        if x not in label_map:
+            if len(label_map) >= len(string.ascii_letters):
+                raise ValueError("einsum: too many distinct index labels")
+            label_map[x] = string.ascii_letters[len(label_map)]
+        return label_map[x]
+
+    spec = ",".join("".join(lbl(x) for x in sl) for sl in sublists)
+    if out_sublist is not None:
+        spec += "->" + "".join(lbl(x) for x in out_sublist)
+    return spec, tuple(ops_list)
+
+
 def _parse_einsum(subscripts: str, ranks: "Sequence[int]") -> tuple[list[str], str]:
     """Split an einsum spec into per-operand input labels and the (possibly implicit)
     output labels, expanding any ellipsis into explicit labels (using ``ranks``, the
@@ -584,9 +624,10 @@ def _einsum_grad_spec(
     return ",".join(in_subs) + "->" + sub_i, others, missing
 
 
-def d_einsum(subscripts: str, *operands: Operand) -> Var:
+def d_einsum(subscripts: Any, *operands: Operand) -> Var:
     from pycograd.trace import Tracer, bind
 
+    subscripts, operands = _normalize_einsum_args(subscripts, operands)
     # A higher trace level is live (a vmap/jvp/abstract Tracer flowed in via a direct
     # call rather than ``bind``): route through the stack so the registered rule runs.
     if any(isinstance(o, Tracer) for o in operands):

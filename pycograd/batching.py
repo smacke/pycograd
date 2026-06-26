@@ -399,10 +399,11 @@ def _fresh_label(used: "set[str]") -> str:
     raise ValueError("einsum: ran out of labels to name the vmap batch axis")
 
 
-def _einsum_rule(trace: BatchTrace, subscripts: str, *operands: Boxed) -> BatchTracer:
+def _einsum_rule(trace: BatchTrace, subscripts: Any, *operands: Boxed) -> BatchTracer:
     # vmap of einsum: give each batched operand (and the output) a fresh leading label
     # for the batch axis. An unbatched operand keeps its labels and is reused across the
     # batch -- exactly einsum's semantics for an index it lacks.
+    subscripts, operands = ops._normalize_einsum_args(subscripts, operands)
     tracers = [trace._raise(o) for o in operands]
     if not any(t.bdim is not None for t in tracers):
         vals = tuple(t.value for t in tracers)

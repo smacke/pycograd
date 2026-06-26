@@ -157,28 +157,12 @@ SKIPS = {
     ("test_systematic.py", "test_cross"): "pycograd-gap: no VJP rule for np.cross",
     (
         "test_systematic.py",
-        "test_einsum2_covsum",
-    ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
-    (
-        "test_systematic.py",
-        "test_einsum2_matmult",
-    ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
-    (
-        "test_systematic.py",
-        "test_einsum2_matmult_broadcast",
-    ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
-    (
-        "test_systematic.py",
         "test_einsum2_three_args",
-    ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
-    (
-        "test_systematic.py",
-        "test_einsum2_transpose",
-    ): "pycograd-gap: np.einsum explicit-axes (operand-index tuple) form unsupported (recurses)",
+    ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
     (
         "test_systematic.py",
         "test_einsum_three_args",
-    ): "pycograd-gap: np.einsum with >=3 operands has no VJP rule",
+    ): "pycograd-gap: einsum with a repeated label within one operand (a diagonal/trace inside einsum); the reverse einsum can't scatter to a diagonal",
     (
         "test_systematic.py",
         "test_hstack_1d",
