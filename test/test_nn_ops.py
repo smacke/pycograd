@@ -525,8 +525,12 @@ def test_cumsum_jvp_is_linear():
     assert np.allclose(np.asarray(tangent), np.cumsum(v, axis=1))  # linear
 
 
-def test_cumsum_eval_shape_and_rejects_flatten():
+def test_cumsum_eval_shape_and_flatten_all():
     out = eval_shape(lambda a: np.cumsum(a, axis=1), S((3, 4)))
     assert tuple(out.shape) == (3, 4)
-    with pytest.raises(NotImplementedError):
-        cumsum(np.arange(5.0))  # axis=None flatten is unsupported
+    # axis=None ravels first, so the result is a 1-D cumulative sum.
+    assert tuple(eval_shape(lambda a: np.cumsum(a), S((3, 4))).shape) == (12,)
+    A = np.arange(6.0).reshape(2, 3)
+    primal, tangent = jvp(lambda a: np.cumsum(a), (A,), (np.ones_like(A),))
+    assert np.asarray(primal).shape == (6,)
+    assert np.allclose(np.asarray(primal), np.cumsum(A))  # flattened, matches numpy

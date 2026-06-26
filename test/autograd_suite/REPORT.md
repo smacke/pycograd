@@ -123,6 +123,12 @@ this work** — see below).
   `concatenate` composition (`axis=None` ravels both operands first). Flipped ~2 more tests
   green (suite now 288 passed / 105 skipped). The python-*list*-operand `append` cases stay
   skipped (the np.array-of-boxes gap). Native regression in `test/test_manip_ops.py`.
+* **Flips / trace / cumsum-flatten** (eighth PR): `np.flipud`/`np.fliplr`/`np.rot90` (an axis
+  `::-1` slice, plus a transpose for rot90 -- getitem/transpose compositions), `np.trace` (gather
+  the diagonal indices over the leading two axes, then sum -- works for any ndim with the default
+  axes), and `np.cumsum(axis=None)` (now ravels first, returning a 1-D cumulative sum like numpy,
+  instead of raising). Full forward/vmap/eval_shape. Flipped ~9 more tests green (suite now 297
+  passed / 96 skipped). Native regression: `test/test_flip_trace_ops.py`.
 * New public operators **`jacobian`, `hessian`, `elementwise_grad`** (alias **`egrad`**),
   **`make_jvp`, `make_vjp`**. `make_vjp` is a new *public, eager, function-level* VJP transform
   (`make_vjp(f)(x) -> (vjp_fn, ans)`, vector output, reusable cotangent); it is **not** a new

@@ -1337,6 +1337,115 @@ def _operand_dtype(x: object) -> Any:
     return d if d is not None else np.asarray(cast(Any, x)).dtype
 
 
+# ---------------------------------------------------------------------------
+# np.fliplr / np.flipud / np.rot90 -- reverse an axis (a ``::-1`` slice) and, for rot90, a
+# transpose; both are getitem/transpose compositions (full rules), so no own VJP.
+# ---------------------------------------------------------------------------
+def _flip_key(ndim: int, axis: int) -> tuple:
+    return tuple(
+        slice(None, None, -1) if i == axis else slice(None) for i in range(ndim)
+    )
+
+
+def d_flipud(m: Operand) -> Var:
+    return d_getitem(m, _flip_key(_logical_ndim(m), 0))
+
+
+def d_fliplr(m: Operand) -> Var:
+    return d_getitem(m, _flip_key(_logical_ndim(m), 1))
+
+
+def _rot90_once(m: Boxed, ndim: int, a0: int, a1: int, use_bind: bool) -> Boxed:
+    # One counter-clockwise quarter turn in the (a0, a1) plane: swap the two axes, then
+    # reverse the new a0 -- ``flipud(transpose)`` for the 2-D default.
+    if use_bind:
+        from pycograd.trace import bind
+
+        sw = bind(d_transpose, m, swapaxes_perm(ndim, a0, a1))
+        return bind(d_getitem, sw, _flip_key(ndim, a0))
+    sw = d_transpose(cast(Operand, m), swapaxes_perm(ndim, a0, a1))
+    return d_getitem(sw, _flip_key(ndim, a0))
+
+
+def d_rot90(m: Operand, k: int = 1, axes: tuple = (0, 1)) -> Var:
+    ndim = _logical_ndim(m)
+    a0, a1 = axes[0] % ndim, axes[1] % ndim
+    cur: Boxed = cast(Boxed, m)
+    for _ in range(int(k) % 4):
+        cur = _rot90_once(cur, ndim, a0, a1, use_bind=False)
+    return cast(Var, cur)
+
+
+def _flip_transform_rule(axis: int) -> Callable[..., Boxed]:
+    def rule(_trace: Boxed, m: Boxed) -> Boxed:
+        from pycograd.trace import bind
+
+        return bind(d_getitem, m, _flip_key(len(cast(Any, m).shape), axis))
+
+    return rule
+
+
+def rot90_transform_rule(
+    _trace: Boxed, m: Boxed, k: int = 1, axes: tuple = (0, 1)
+) -> Boxed:
+    ndim = len(cast(Any, m).shape)
+    a0, a1 = axes[0] % ndim, axes[1] % ndim
+    cur: Boxed = m
+    for _ in range(int(k) % 4):
+        cur = _rot90_once(cur, ndim, a0, a1, use_bind=True)
+    return cur
+
+
+def _flip_abstract(m: Boxed) -> Boxed:
+    from pycograd.shapes import abstract_unary  # axis-reversal preserves shape
+
+    return cast(Boxed, abstract_unary(cast(Any, m)))
+
+
+def rot90_abstract_rule(m: Boxed, k: int = 1, axes: tuple = (0, 1)) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    a = _aval(cast(Any, m))
+    sh = list(a.shape)
+    if int(k) % 2 == 1:  # an odd quarter-turn swaps the two plane axes
+        a0, a1 = axes[0] % len(sh), axes[1] % len(sh)
+        sh[a0], sh[a1] = sh[a1], sh[a0]
+    return cast(Boxed, ShapedArray(tuple(sh), a.dtype))
+
+
+# ---------------------------------------------------------------------------
+# np.trace -- sum of a matrix diagonal. Gathers the diagonal indices (``d_getitem`` over the
+# leading two axes) and sums that axis; a getitem/sum composition (default axes only).
+# ---------------------------------------------------------------------------
+def d_trace(a: Operand, offset: int = 0, axis1: int = 0, axis2: int = 1) -> Var:
+    shape = _logical_shape(a)
+    if {axis1 % len(shape), axis2 % len(shape)} != {0, 1}:
+        raise NotImplementedError(
+            "trace: only the leading two axes (0, 1) are supported"
+        )
+    key, _ = _diag_key((shape[0], shape[1]), offset)
+    return d_sum(d_getitem(a, key), axis=0)
+
+
+def trace_transform_rule(
+    _trace: Boxed, a: Boxed, offset: int = 0, axis1: int = 0, axis2: int = 1
+) -> Boxed:
+    from pycograd.trace import bind
+
+    shape = tuple(cast(Any, a).shape)
+    key, _ = _diag_key((shape[0], shape[1]), offset)
+    return bind(d_sum, bind(d_getitem, a, key), axis=0)
+
+
+def trace_abstract_rule(
+    a: Boxed, offset: int = 0, axis1: int = 0, axis2: int = 1
+) -> Boxed:
+    from pycograd.shapes import ShapedArray, _aval
+
+    av = _aval(cast(Any, a))
+    return cast(Boxed, ShapedArray(tuple(av.shape[2:]), av.dtype))
+
+
 def d_diag(v: Operand, k: int = 0) -> Var:
     shape = _logical_shape(v)
     key, out_shape = _diag_key(shape, k)
@@ -1594,13 +1703,10 @@ def split_transform_rule(which: str) -> Callable[..., Boxed]:
 def d_cumsum(x: Operand, axis: int | None = None) -> Var:
     from pycograd.trace import Tracer, bind
 
+    if axis is None:  # flatten-all: ravel and cumsum along the single axis (1-D result)
+        return cast(Var, d_cumsum(d_ravel(x), axis=0))
     if isinstance(x, Tracer):
         return cast(Var, bind(d_cumsum, x, axis=axis))
-    if axis is None:
-        raise NotImplementedError(
-            "cumsum: pass an explicit integer axis (the flatten-all default is not "
-            "supported)"
-        )
     x, xp = _lift(x), _xp()
     out = Var(xp.cumsum(x.value, axis=axis), _parents=(x,))
 
@@ -2077,6 +2183,10 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_select: (np.select,),
     d_gradient: (np.gradient,),
     d_append: (np.append,),
+    d_flipud: (np.flipud,),
+    d_fliplr: (np.fliplr,),
+    d_rot90: (np.rot90,),
+    d_trace: (np.trace,),
     d_ravel: (np.ravel,),
     d_squeeze: (np.squeeze,),
     d_atleast_1d: (np.atleast_1d,),

@@ -8,19 +8,19 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_1d_array",
-    ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_1d_array_fanout",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_2d_array",
-    ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_2d_array_fanout",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_array_from_arrays",
@@ -33,15 +33,18 @@ SKIPS = {
         "test_numpy.py",
         "test_array_from_scalar",
     ): "pycograd-gap: np.array([...]) of Var/box leaves is not a differentiable constructor",
-    ("test_numpy.py", "test_astype"): "pycograd-gap: Var has no such ndarray method",
+    (
+        "test_numpy.py",
+        "test_astype",
+    ): "pycograd-gap: Var.astype is unsupported (dtype cast)",
     (
         "test_numpy.py",
         "test_c_",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_c_mixed",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_cast_to_int",
@@ -49,29 +52,19 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_concatenate_axis_1_unnamed",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
-    (
-        "test_numpy.py",
-        "test_cumsum_1d",
-    ): "pycograd-gap: np.cumsum function form does not dispatch to the d_cumsum rule",
-    (
-        "test_numpy.py",
-        "test_cumsum_no_axis",
-    ): "pycograd-gap: np.cumsum function form does not dispatch to the d_cumsum rule",
+    ): "pycograd-gap: concatenate of 1-D operands along a nonzero axis (degenerate)",
     (
         "test_numpy.py",
         "test_diagonal",
     ): "pycograd-gap: np.diagonal with non-default axes + autograd's make_diagonal helper",
-    ("test_numpy.py", "test_fliplr"): "pycograd-gap: unsupported op (no autodiff rule)",
-    ("test_numpy.py", "test_flipud"): "pycograd-gap: unsupported op (no autodiff rule)",
     (
         "test_numpy.py",
         "test_len",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_linspace",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: no VJP rule for np.linspace (differentiating start/stop)",
     (
         "test_numpy.py",
         "test_make_diagonal",
@@ -79,28 +72,28 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_max_equal_values",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
+    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
     (
         "test_numpy.py",
         "test_max_equal_values_2d",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
     (
         "test_numpy.py",
         "test_maximum_equal_values_2d",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
     (
         "test_numpy.py",
         "test_mean_list_of_boxes",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_min_3_way_equality",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: equal-value max/min tie-breaking splits the gradient differently",
     ("test_numpy.py", "test_nan_to_num"): "pycograd-gap: no VJP rule for np.nan_to_num",
     (
         "test_numpy.py",
         "test_non_numpy_sum",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_outer",
@@ -108,28 +101,27 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_r_basic",
-    ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_r_double",
-    ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_r_mixed",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_r_node_and_const",
-    ): "pycograd-gap: tie/shape handling differs (e.g. equal-value max/min argmax tie-break, or np.array-of-boxes)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_r_slicing",
-    ): "pycograd-gap: gradient mismatch under check_grads (forward-mode or unsupported op semantics)",
-    ("test_numpy.py", "test_rot90"): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: np.r_ / np.c_ index-expression construction (autograd-specific surface)",
     (
         "test_numpy.py",
         "test_scalar_array_box_attributes",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_simple_append_list",
@@ -141,23 +133,11 @@ SKIPS = {
     (
         "test_numpy.py",
         "test_std_list_of_boxes",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
-    (
-        "test_numpy.py",
-        "test_trace",
-    ): "pycograd-gap: np.trace needs a diagonal einsum ('ii->'), which einsum rejects",
-    (
-        "test_numpy.py",
-        "test_trace2",
-    ): "pycograd-gap: np.trace needs a diagonal einsum ('ii->'), which einsum rejects",
-    (
-        "test_numpy.py",
-        "test_trace_extradims",
-    ): "pycograd-gap: np.trace needs a diagonal einsum ('ii->'), which einsum rejects",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_numpy.py",
         "test_var_list_of_boxes",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: np.array-of-boxes / list-of-Var reductions and box attributes",
     (
         "test_systematic.py",
         "test_angle",
@@ -165,7 +145,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_column_stack_1d",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
         "test_conj",
@@ -174,10 +154,7 @@ SKIPS = {
         "test_systematic.py",
         "test_conjugate",
     ): "pycograd-gap: complex-number op (real/imag/conj/angle) -- pycograd is real-only",
-    (
-        "test_systematic.py",
-        "test_cross",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ("test_systematic.py", "test_cross"): "pycograd-gap: no VJP rule for np.cross",
     (
         "test_systematic.py",
         "test_einsum2_covsum",
@@ -205,7 +182,7 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_hstack_1d",
-    ): "pycograd-gap: unsupported op (no autodiff rule)",
+    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
         "test_imag",
@@ -230,17 +207,13 @@ SKIPS = {
     (
         "test_systematic.py",
         "test_row_stack_1d",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
         "test_row_stack_2d",
-    ): "pycograd-gap: forward-mode (jvp) of a two-tracer op, or an unsupported numpy-function form",
+    ): "pycograd-gap: 1-D / dtype-kwarg edge of the stack family (column_stack/hstack/row_stack)",
     (
         "test_systematic.py",
         "test_std",
     ): "pycograd-gap: np.std gradient mismatch under this check (reduction with ddof/sqrt)",
-    (
-        "test_systematic.py",
-        "test_trace",
-    ): "pycograd-gap: np.trace needs a diagonal einsum ('ii->'), which einsum rejects",
 }

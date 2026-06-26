@@ -539,7 +539,9 @@ def _einsum_label_dim(a: "int | Dim", b: "int | Dim", label: str) -> "int | Dim"
 
 def abstract_cumsum(x: AbstractVal, axis: "int | None" = None) -> ShapedArray:
     a = _aval(x)
-    return ShapedArray(a.shape, a.dtype)  # cumsum is shape-preserving for an int axis
+    if axis is None:  # flatten-all cumsum -> a 1-D result
+        return ShapedArray((_dims.prod_dims(a.shape),), a.dtype)
+    return ShapedArray(a.shape, a.dtype)  # shape-preserving for an int axis
 
 
 def abstract_reduce(
@@ -920,6 +922,10 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_select: ops.select_abstract_rule,
             ops.d_gradient: ops.gradient_abstract_rule,
             ops.d_append: ops.append_abstract_rule,
+            ops.d_flipud: ops._flip_abstract,
+            ops.d_fliplr: ops._flip_abstract,
+            ops.d_rot90: ops.rot90_abstract_rule,
+            ops.d_trace: ops.trace_abstract_rule,
             ops.d_ravel: ops._reshape_lowering_abstract(ops.ravel_shape),
             ops.d_squeeze: ops._reshape_lowering_abstract(ops.squeeze_shape),
             ops.d_atleast_1d: ops._reshape_lowering_abstract(ops.atleast_1d_shape),
