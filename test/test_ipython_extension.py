@@ -216,6 +216,45 @@ def test_params_brace_block_in_cell():
     )
 
 
+def test_params_brace_block_honors_dtype_context():
+    # A ``params{...}`` block creates its Params (trainable + frozen) at block-execution time,
+    # so the ambient working dtype set by ``pg.dtype(...)`` is applied -- both when the block is
+    # nested in the ``with`` body and when ``pg.dtype(...)`` is combined with ``params{...} as
+    # weights:`` in one multi-context ``with``. Outside any context the default is float64.
+    _run_probe(
+        """
+        ip.run_cell("import numpy as np; import pycograd as pg")
+
+        # 1. nested: with pg.dtype(...): model = params{...}
+        cell1 = ("with pg.dtype('float32'):\\n"
+                 "    model = params{\\n      w = np.zeros(3)\\n      b = frozen[np.ones(2)]\\n    }\\n")
+        r1 = ip.run_cell(cell1)
+        assert r1.error_in_exec is None, r1.error_in_exec
+        m = ip.user_ns["model"]
+        assert str(m["w"].value.dtype) == "float32", m["w"].value.dtype
+        assert str(m["b"].value.dtype) == "float32", m["b"].value.dtype  # frozen too
+
+        # 2. multi-context: with pg.dtype(...), params{...} as weights:
+        cell2 = ("info = {}\\n"
+                 "with pg.dtype('float32'), params{\\n"
+                 "  w = np.zeros(3)\\n"
+                 "  b = frozen[np.ones(2)]\\n"
+                 "} as weights:\\n"
+                 "    info['w'] = str(weights['w'].value.dtype)\\n"
+                 "    info['b'] = str(weights['b'].value.dtype)\\n")
+        r2 = ip.run_cell(cell2)
+        assert r2.error_in_exec is None, r2.error_in_exec
+        assert ip.user_ns["info"] == {"w": "float32", "b": "float32"}, ip.user_ns["info"]
+
+        # 3. control: outside any dtype context the default working dtype (float64) applies
+        r3 = ip.run_cell("ctrl = params{\\n  w = np.zeros(3)\\n}")
+        assert r3.error_in_exec is None, r3.error_in_exec
+        assert str(ip.user_ns["ctrl"]["w"].value.dtype) == "float64"
+        print("OK")
+        """
+    )
+
+
 def test_autodiff_pipe_in_cell():
     _run_probe(
         """
