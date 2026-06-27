@@ -97,6 +97,86 @@ def test_reduction_scales_with_input_not_output():
     assert node_flops(node, by_id, CostModel()) == 90 * 16  # swept the input
 
 
+def test_prod_scales_with_input_like_sum():
+    from pycograd.ops import d_prod
+
+    g, node = _one_op(d_prod, [(90, 16)], (16,), params={"axis": 0})
+    by_id = {nd.id: nd for nd in g.nodes}
+    assert (
+        node_flops(node, by_id, CostModel()) == 90 * 16
+    )  # a reduction, not output-sized
+
+
+def test_more_transcendentals_cost_eight():
+    # The libm-backed survivors (tan, the logaddexp pair, ...) must not fall to the
+    # cheap fallback; each is the transcendental weight per element.
+    from pycograd.ops import d_logaddexp, d_tan
+
+    gt, nt = _one_op(d_tan, [(100,)], (100,))
+    gl, nl = _one_op(d_logaddexp, [(100,), (100,)], (100,))
+    assert node_flops(nt, {nd.id: nd for nd in gt.nodes}, CostModel()) == 100 * 8
+    assert node_flops(nl, {nd.id: nd for nd in gl.nodes}, CostModel()) == 100 * 8
+
+
+def test_fused_reductions_cost_transcendental_over_input():
+    # softmax/logsumexp sweep the input applying a transcendental per element, so
+    # they cost input_size * transcendental_weight -- far above the cheap fallback.
+    from pycograd.ops import d_logsumexp, d_softmax
+
+    gs, ns = _one_op(d_softmax, [(90, 16)], (90, 16), params={"axis": -1})
+    gl, nl = _one_op(d_logsumexp, [(90, 16)], (16,), params={"axis": 0})
+    assert node_flops(ns, {nd.id: nd for nd in gs.nodes}, CostModel()) == 90 * 16 * 8
+    assert node_flops(nl, {nd.id: nd for nd in gl.nodes}, CostModel()) == 90 * 16 * 8
+
+
+def test_sort_is_superlinear_partition_is_linear():
+    import math
+
+    from pycograd.ops import d_partition, d_sort
+
+    gs, ns = _one_op(d_sort, [(100,)], (100,))
+    gp, npart = _one_op(d_partition, [(100,)], (100,))
+    fs = node_flops(ns, {nd.id: nd for nd in gs.nodes}, CostModel())
+    fp = node_flops(npart, {nd.id: nd for nd in gp.nodes}, CostModel())
+    assert fs == int(100 * math.log2(100))
+    assert fs > 100  # strictly more than a cheap pass
+    assert fp == 100  # partition is ~linear
+
+
+def test_movement_survivors_are_free():
+    # pad/repeat/tile/roll/astype copy data but do no arithmetic.
+    from pycograd.ops import d_astype, d_pad, d_repeat, d_roll, d_tile
+
+    cases = (
+        (d_pad, (104,)),
+        (d_repeat, (300,)),
+        (d_tile, (300,)),
+        (d_roll, (100,)),
+        (d_astype, (100,)),
+    )
+    for prim, out in cases:
+        g, node = _one_op(prim, [(100,)], out)
+        by_id = {nd.id: nd for nd in g.nodes}
+        assert node_flops(node, by_id, CostModel()) == 0, prim.__name__
+
+
+def test_every_survivable_primitive_is_classified():
+    # The guard: every primitive that can survive capture (has a shape rule and is
+    # not lowered away) must be explicitly classified, so a new op can't quietly
+    # regress to the silent cheap fallback. Tighten the tables if this fails.
+    from pycograd import cost, ops, shapes
+
+    survivable = set(shapes._ABS_FOR) - set(ops._LOWERING_RULES)
+    sentinels = {"_INPUT", "_CONST", "_WEIGHT"}
+    unclassified = sorted(
+        nm
+        for p in survivable
+        if (nm := getattr(p, "__name__", str(p))) not in sentinels
+        and nm not in cost._CLASSIFIED_NAMES
+    )
+    assert not unclassified, f"unclassified survivable primitives: {unclassified}"
+
+
 def test_symbolic_dim_substituted():
     from pycograd._dims import symbol
     from pycograd.ops import d_exp

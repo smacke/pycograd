@@ -24,6 +24,7 @@ fully overridable). :func:`calibrate` micro-benchmarks the host to fill them in.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
@@ -90,6 +91,19 @@ _TRANSCENDENTAL = {  # ~one libm call per element
     "d_log1p",
     "d_expm1",
     "d_sigmoid",
+    # further libm-backed unaries that survive capture (no lowering of their own)
+    "d_exp2",
+    "d_log2",
+    "d_log10",
+    "d_tan",
+    "d_arcsin",
+    "d_arccos",
+    "d_arcsinh",
+    "d_arccosh",
+    "d_arctanh",
+    "d_logaddexp",  # log(exp(a)+exp(b)): a libm exp/log pair
+    "d_logaddexp2",
+    "d_angle",  # arctan2(imag, real)
 }
 _POW = {"d_pow"}  # x**y via exp/log -> transcendental-class
 _CHEAP_ELEMENTWISE = {  # one or two arithmetic ops per element
@@ -111,12 +125,32 @@ _CHEAP_ELEMENTWISE = {  # one or two arithmetic ops per element
     "d_ne",
     "d_where",
     "d_clip",
+    # genuinely-cheap survivors: a branch/round/select or a no-op view-with-copy
+    "d_mod",
+    "d_fmax",
+    "d_fmin",
+    "d_sign",
+    "d_ceil",
+    "d_floor",
+    "d_deg2rad",  # multiply by pi/180
+    "d_rad2deg",
+    "d_conj",  # negate the imaginary lane
+    "d_real",
+    "d_imag",
+    "d_real_if_close",
+    "d_nan_to_num",
 }
 _GATED = {"d_gated_act"}  # fused tanh(f)*sigmoid(s): two transcendentals + a mul
 
 # Reductions: flops = input_size * weight (one pass; var/std take ~two).
-_REDUCE = {"d_sum", "d_mean", "d_max", "d_min", "d_cumsum"}
+_REDUCE = {"d_sum", "d_mean", "d_max", "d_min", "d_cumsum", "d_prod"}
 _REDUCE_HEAVY = {"d_var", "d_std"}
+# Fused reductions that sweep the input applying a transcendental per element
+# (softmax: exp + normalize; logsumexp: exp + log + reduce).
+_FUSED_REDUCE = {"d_softmax", "d_logsumexp"}
+
+# Comparison-sort family: ~n log n comparisons (partition is ~n).
+_SORT = {"d_sort", "d_partition"}
 
 # Pure data movement / views: no arithmetic, only the memory traffic of the copy.
 _MOVEMENT = {
@@ -131,12 +165,39 @@ _MOVEMENT = {
     "d_hstack",
     "d_column_stack",
     "d_dstack",
+    # further movement survivors: gather/scatter, replication, shifts, dtype views
+    "d_pad",
+    "d_repeat",
+    "d_tile",
+    "d_roll",
+    "d_astype",
+    "_scatter",  # scatter-add adjoint of gather; the add is dominated by the copy
+    "_spill",  # identity marker; the disk I/O is modelled in the scheduler
+    "_recompute",
 }
 
 _W_TRANSCENDENTAL = 8.0
 _W_CHEAP = 1.0
 _W_GATED = 18.0
 _W_REDUCE_HEAVY = 2.0
+
+# The set of primitive names ``node_flops`` classifies explicitly (everything but
+# the silent cheap fallback). ``_matmul``/``d_einsum`` are special-cased in
+# ``node_flops``; the input/const/weight sentinels return 0 by identity. The
+# guard test asserts every primitive that can survive capture is in here, so a
+# new op can't quietly regress to the fallback.
+_CLASSIFIED_NAMES = (
+    _TRANSCENDENTAL
+    | _POW
+    | _CHEAP_ELEMENTWISE
+    | _GATED
+    | _REDUCE
+    | _REDUCE_HEAVY
+    | _FUSED_REDUCE
+    | _SORT
+    | _MOVEMENT
+    | {"_matmul", "d_einsum", "_INPUT", "_CONST", "_WEIGHT"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +300,21 @@ def node_flops(node: Node, by_id: "dict[int, Node]", model: CostModel) -> int:
         return int(out * _W_TRANSCENDENTAL)
     if name in _GATED:
         return int(out * _W_GATED)
-    if name in _REDUCE or name in _REDUCE_HEAVY:
+    if name in _REDUCE or name in _REDUCE_HEAVY or name in _FUSED_REDUCE:
         # cost scales with the (larger) input swept, not the reduced output
         in_size = max((_int_size(a, sym) for a in operands), default=out)
-        w = _W_REDUCE_HEAVY if name in _REDUCE_HEAVY else 1.0
+        if name in _FUSED_REDUCE:  # a transcendental per swept element
+            w = _W_TRANSCENDENTAL
+        elif name in _REDUCE_HEAVY:
+            w = _W_REDUCE_HEAVY
+        else:
+            w = 1.0
         return int(in_size * w)
+    if name in _SORT:
+        # a comparison sort is ~n log n; partition is ~linear
+        if name == "d_partition":
+            return out
+        return int(out * math.log2(max(out, 2)))
     # default: a cheap elementwise op (also the conservative fallback for any
     # primitive not yet classified above).
     return int(out * _W_CHEAP)
