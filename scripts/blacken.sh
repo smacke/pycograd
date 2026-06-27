@@ -4,4 +4,6 @@
 set -euxo pipefail
 
 DIRS="./pycograd ./test"
-black $DIRS $@
+# Honor a BLACK override (e.g. the Makefile pointing at .venv/bin/black); fall
+# back to a bare `black` on PATH.
+"${BLACK:-black}" $DIRS $@

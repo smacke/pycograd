@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
 .PHONY: clean build bump deploy_only deploy black blackcheck imports lint typecheck check_no_typing check test tests coverage xmlcov check_ci devdeps
 
+# Prefer the project virtualenv's tools (mypy, ruff, isort, pytest, ...) when a
+# .venv is present, so `make` targets work without activating it. CI installs
+# into the host Python and has no .venv, so VBIN is empty there and the bare tool
+# names resolve via PATH as before. (A path prefix rather than an exported PATH
+# because GNU Make 3.81 — macOS's default — execs single-word recipes directly
+# using its startup PATH and ignores `export PATH`.)
+VBIN := $(if $(wildcard .venv/bin),.venv/bin/,)
+
 clean:
 	rm -rf __pycache__ build/ dist/ *.egg-info/ .coverage htmlcov
 
 build: clean
-	python -m build
+	$(VBIN)python -m build
 
 bump:
 	./scripts/bump-version.py
@@ -16,27 +24,27 @@ deploy_only:
 deploy: build deploy_only
 
 black:
-	isort .
-	./scripts/blacken.sh
+	$(VBIN)isort .
+	BLACK=$(VBIN)black ./scripts/blacken.sh
 
 blackcheck:
-	isort . --check-only
-	./scripts/blacken.sh --check
+	$(VBIN)isort . --check-only
+	BLACK=$(VBIN)black ./scripts/blacken.sh --check
 
 imports:
-	pycln .
-	isort .
+	$(VBIN)pycln .
+	$(VBIN)isort .
 
 lint:
-	ruff check
+	$(VBIN)ruff check
 
 typecheck:
-	mypy pycograd
+	$(VBIN)mypy pycograd
 
 check_no_typing:
 	rm -f .coverage
 	rm -rf htmlcov
-	pytest --cov-config=pyproject.toml --cov=pycograd
+	$(VBIN)pytest --cov-config=pyproject.toml --cov=pycograd
 
 check: blackcheck lint typecheck check_no_typing
 
@@ -44,12 +52,12 @@ test: check
 tests: check
 
 coverage: check_no_typing
-	coverage html
+	$(VBIN)coverage html
 
 xmlcov: check_no_typing
-	coverage xml
+	$(VBIN)coverage xml
 
 check_ci: typecheck xmlcov
 
 devdeps:
-	pip install -e .[dev]
+	$(VBIN)pip install -e .[dev]
