@@ -7,6 +7,7 @@ import operator as op
 import numpy as onp
 import numpy as np
 import numpy.random as npr
+import pytest
 
 from ._test_util import combo_check
 from .numpy_utils import (
@@ -655,10 +656,17 @@ def test_stack_1d():
     combo_check(np.stack, [0])([(R(2),), (R(2), R(2))], axis=[0, 1])
 
 
+# np.row_stack was removed in NumPy 2.0 (it was a deprecated alias for vstack).
+@pytest.mark.skipif(
+    not hasattr(np, "row_stack"), reason="np.row_stack removed in NumPy 2.0"
+)
 def test_row_stack_1d():
     combo_check(np.row_stack, [0])([R(2), (R(2), R(2))])
 
 
+@pytest.mark.skipif(
+    not hasattr(np, "row_stack"), reason="np.row_stack removed in NumPy 2.0"
+)
 def test_row_stack_2d():
     combo_check(np.row_stack, [0])([R(2, 3), (R(2, 4), R(1, 4))])
 

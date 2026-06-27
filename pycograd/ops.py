@@ -2773,7 +2773,7 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),
     d_stack: (np.stack,),
-    d_vstack: (np.vstack, np.row_stack),
+    d_vstack: (np.vstack,),
     d_hstack: (np.hstack,),
     d_column_stack: (np.column_stack,),
     d_dstack: (np.dstack,),

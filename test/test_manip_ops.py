@@ -252,14 +252,16 @@ def test_stack_1d_edges():
     a1, b1 = _rng.standard_normal(3), _rng.standard_normal(3)
     ga, gb = grad(f_column_stack, [0, 1])(a1, b1)
     assert np.allclose(np.asarray(ga), 2 * a1) and np.allclose(np.asarray(gb), 2 * b1)
-    # row_stack forwards a dtype kwarg to vstack; it must be swallowed
-    A, B = _rng.standard_normal((2, 3)), _rng.standard_normal((1, 3))
-    assert eval_shape(lambda x, y: np.row_stack((x, y)), A, B).shape == (3, 3)
-    assert np.allclose(
-        np.asarray(grad(f_row_stack)(A, B)[0]),
-        _fd(lambda x: f_row_stack(x, B), A),
-        atol=1e-5,
-    )
+    # row_stack forwards a dtype kwarg to vstack; it must be swallowed.
+    # (np.row_stack was removed in NumPy 2.0; only exercise it where it exists.)
+    if hasattr(np, "row_stack"):
+        A, B = _rng.standard_normal((2, 3)), _rng.standard_normal((1, 3))
+        assert eval_shape(lambda x, y: np.row_stack((x, y)), A, B).shape == (3, 3)
+        assert np.allclose(
+            np.asarray(grad(f_row_stack)(A, B)[0]),
+            _fd(lambda x: f_row_stack(x, B), A),
+            atol=1e-5,
+        )
 
 
 def f_append_list(a):
