@@ -2773,7 +2773,14 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_expand_dims: (np.expand_dims,),
     d_concatenate: (np.concatenate,),
     d_stack: (np.stack,),
-    d_vstack: (np.vstack,),
+    # np.row_stack was removed in NumPy 2.0; intercept it only where it still
+    # exists (older numpy) so instrumented calls to it don't leak a raw Var.
+    # getattr keeps mypy off the removed-from-stubs attribute.
+    d_vstack: (
+        (np.vstack, getattr(np, "row_stack"))
+        if hasattr(np, "row_stack")
+        else (np.vstack,)
+    ),
     d_hstack: (np.hstack,),
     d_column_stack: (np.column_stack,),
     d_dstack: (np.dstack,),
