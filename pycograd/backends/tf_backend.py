@@ -305,10 +305,10 @@ class TFBackend(Backend):
             return tf.nn.softmax(t, axis=axis)
 
         self._intercept[d_softmax] = _tf_softmax
-        self._intercept[d_logsumexp] = (
-            lambda x, axis=None, keepdims=False: tf.reduce_logsumexp(
-                _as_tf(tf, x), axis=axis, keepdims=keepdims
-            )
+        self._intercept[
+            d_logsumexp
+        ] = lambda x, axis=None, keepdims=False: tf.reduce_logsumexp(
+            _as_tf(tf, x), axis=axis, keepdims=keepdims
         )
         # Lower the composed im2col ``conv2d`` to tf's native conv (as torch/jax do), so
         # the compiled net runs a cuDNN/oneDNN convolution and the tape supplies the

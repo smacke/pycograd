@@ -160,15 +160,24 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, L
 # necessarily overlap; ``Graph`` first gives the correct runtime dispatch (a captured
 # graph -> a graph; any other callable -> a wrapper).
 @overload
-def value_and_grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
+def value_and_grad(f: Graph) -> Graph:
+    ...  # type: ignore[overload-overlap]
+
+
 @overload
 def value_and_grad(
     f: Callable[..., PyTree], argnum: int
-) -> Callable[..., tuple[Array, PyTree]]: ...
+) -> Callable[..., tuple[Array, PyTree]]:
+    ...
+
+
 @overload
 def value_and_grad(
     f: Callable[..., PyTree], argnum: None | Sequence[int] = ...
-) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]: ...
+) -> Callable[..., tuple[Array, tuple[PyTree, ...]]]:
+    ...
+
+
 def value_and_grad(
     f: Callable[..., PyTree] | Graph,
     argnum: int | Sequence[int] | None = None,
@@ -327,13 +336,22 @@ def _match_arg(orig: Leaf, grad: Array) -> Operand:
 # routes a captured graph -> a graph and any other callable -> a wrapper (see
 # ``value_and_grad`` above).
 @overload
-def grad(f: Graph) -> Graph: ...  # type: ignore[overload-overlap]
+def grad(f: Graph) -> Graph:
+    ...  # type: ignore[overload-overlap]
+
+
 @overload
-def grad(f: Callable[..., PyTree], argnum: int) -> Callable[..., PyTree]: ...
+def grad(f: Callable[..., PyTree], argnum: int) -> Callable[..., PyTree]:
+    ...
+
+
 @overload
 def grad(
     f: Callable[..., PyTree], argnum: None | Sequence[int] = ...
-) -> Callable[..., tuple[PyTree, ...]]: ...
+) -> Callable[..., tuple[PyTree, ...]]:
+    ...
+
+
 def grad(
     f: Callable[..., PyTree] | Graph,
     argnum: int | Sequence[int] | None = None,

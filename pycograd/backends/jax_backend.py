@@ -105,10 +105,10 @@ class JaxBackend(Backend):
         import jax.scipy.special as _jsp
 
         self._intercept[d_softmax] = lambda x, axis=-1: jax.nn.softmax(x, axis=axis)
-        self._intercept[d_logsumexp] = (
-            lambda x, axis=None, keepdims=False: _jsp.logsumexp(
-                x, axis=axis, keepdims=keepdims
-            )
+        self._intercept[
+            d_logsumexp
+        ] = lambda x, axis=None, keepdims=False: _jsp.logsumexp(
+            x, axis=axis, keepdims=keepdims
         )
         # Lower the composed im2col ``conv2d`` to XLA's native conv via
         # ``lax.conv_general_dilated`` (NCHW input / OIHW kernel, matching pycograd's

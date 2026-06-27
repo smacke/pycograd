@@ -146,7 +146,6 @@ def test_abstract_boolean_mask_is_symbolic():
 
 
 def test_abstract_boolean_mask_keeps_trailing_axes():
-
     out = eval_shape(lambda x: x[x[:, 0] > 0], SDS((10, 3)))
     assert isinstance(out.shape[0], Dim) and out.shape[1:] == (3,)
 
@@ -199,7 +198,6 @@ def test_abstract_advanced_non_contiguous_goes_to_front():
 
 
 def test_abstract_symbolic_dim_flows_through_reshape():
-
     out = eval_shape(lambda x: x[x > 0].reshape(-1, 1), SDS((12,)))
     assert isinstance(out.shape[0], Dim) and out.shape[1] == 1
 

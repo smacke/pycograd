@@ -453,12 +453,12 @@ def reorder_matmul_chain(graph: Graph) -> Graph:
     matmuls = [nd for nd in graph.nodes if nd.prim is matmul]
     mm_operand_ids = {r for m in matmuls for op in m.args for r in _spec_refs(op)}
 
-    block_at: dict[int, list[Node]] = (
-        {}
-    )  # tail id -> reordered chain nodes (topo order)
-    removed: set[int] = (
-        set()
-    )  # all chain matmul ids (tail + internal) of reordered chains
+    block_at: dict[
+        int, list[Node]
+    ] = {}  # tail id -> reordered chain nodes (topo order)
+    removed: set[
+        int
+    ] = set()  # all chain matmul ids (tail + internal) of reordered chains
     for tail in matmuls:
         # process each chain once, from its tail (a matmul not absorbed into a parent matmul)
         if uses.get(tail.id) == 1 and tail.id in mm_operand_ids:

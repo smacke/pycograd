@@ -205,7 +205,9 @@ def test_per_example_grad_matches_loop():
 
 
 def pow_sq(x):
-    return x**2  # a *constant* exponent -- must stay on the safe power path under vmap
+    return (
+        x**2
+    )  # a *constant* exponent -- must stay on the safe power path under vmap
 
 
 def pow_sum(x):
