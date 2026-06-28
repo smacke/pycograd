@@ -160,8 +160,8 @@ def _wrap_leaf(leaf: Leaf, tie_vars: dict[Hashable, Var]) -> tuple[Var | None, L
 # necessarily overlap; ``Graph`` first gives the correct runtime dispatch (a captured
 # graph -> a graph; any other callable -> a wrapper).
 @overload
-def value_and_grad(f: Graph) -> Graph:
-    ...  # type: ignore[overload-overlap]
+def value_and_grad(f: Graph) -> Graph:  # type: ignore[overload-overlap]
+    ...
 
 
 @overload
@@ -336,8 +336,8 @@ def _match_arg(orig: Leaf, grad: Array) -> Operand:
 # routes a captured graph -> a graph and any other callable -> a wrapper (see
 # ``value_and_grad`` above).
 @overload
-def grad(f: Graph) -> Graph:
-    ...  # type: ignore[overload-overlap]
+def grad(f: Graph) -> Graph:  # type: ignore[overload-overlap]
+    ...
 
 
 @overload
