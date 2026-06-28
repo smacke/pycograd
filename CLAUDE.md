@@ -65,6 +65,31 @@ for a framework object — never a bare `object`/`Any`.
 - `mypy` and `ruff` are configured; run `make check` (blackcheck + lint +
   typecheck) before declaring done.
 
+## New ops & integrations: exercise every transform surface
+
+A new op, primitive, or third-party bridge (e.g. the einops backend in
+`pycograd/einops_backend.py`) is not "done" when `grad` works — it must compose
+with *all* the trace/graph surfaces, because each is a separate interpreter:
+
+- **`grad` / `value_and_grad`** — eager reverse mode (the base tape).
+- **`vmap`** (batching) and **`jvp`** (forward mode) — these run with a transform
+  level live, so the value is a `BatchTracer`/`JVPTracer`, *not* a `Var`. Code that
+  calls eager `d_*` ops directly (which build a `Var`) breaks here; route through
+  `bind` when `num_transform_levels() > 0`, mirroring `tracer.resolve_call`.
+- **Graph mode** — `capture(f, *args)` → `Graph`, then `eval_graph` and
+  `value_and_grad(capture(...))` (graph-grad lowering). Confirm the op lowers to
+  primitives the graph understands.
+- **Shape inference / aval** — `eval_shape(f, *args)` runs an abstract `ShapedArray`
+  trace (a `Tracer` subclass). Any `isinstance` type-gate must admit `Tracer`, not
+  just `Var`.
+- **Cost modeling** — `cost_report(graph)` / `graph.cost()` over a captured graph;
+  the op's lowered primitives should show up as `NodeCost` entries.
+
+Add regression tests for each surface (see `test/test_einops.py`: grad-vs-FD, jvp,
+vmap, `vmap(grad)`, capture+`eval_graph`, `value_and_grad(capture)`, `eval_shape`,
+and `cost_report`). If a pass skipped any of these surfaces, treat it as a gap to
+close, not an optional extra.
+
 ## Notebooks / demos: use pipescript syntax
 
 Write the examples in the `notebooks/` demos using the pipescript ambient DSL

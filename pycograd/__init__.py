@@ -23,6 +23,8 @@ from pycograd.cost import (
 )
 from pycograd.data import DataLoader, batches
 from pycograd.dtypes import current_dtype, dtype, resolve_dtype
+from pycograd.einops_backend import install as _install_einops_backend
+from pycograd.einops_backend import register_einops_backend
 from pycograd.export import export_onnx, export_torchscript, to_torch_module
 from pycograd.extension import load_ipython_extension, unload_ipython_extension
 from pycograd.functional import (
@@ -206,6 +208,10 @@ einsum = d_einsum
 cumsum = d_cumsum
 gated_act = d_gated_act  # tanh(f) * sigmoid(s), the WaveNet / GLU gate
 
+# Make ``einops`` operations work on ``Var`` once einops is imported (in either order);
+# a no-op unless/until einops is present, and it never imports einops itself.
+_install_einops_backend()
+
 # Compute the version live from git via versioneer (like ../pyccolo) rather than
 # reading frozen installed metadata -- so ``scripts/bump-version.py`` always bumps
 # relative to the actual latest tag.
@@ -285,6 +291,8 @@ __all__ = [
     # device / array backend seam (numpy default, cupy for GPU)
     "device",
     "activate",
+    # einops interop (registers a Var backend once einops is imported)
+    "register_einops_backend",
     # working-dtype seam (float64 default; float32 / float16 / bfloat16)
     "dtype",
     "current_dtype",
