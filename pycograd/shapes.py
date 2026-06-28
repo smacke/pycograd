@@ -770,6 +770,17 @@ def abstract_getitem(x: AbstractVal, key: Index) -> ShapedArray:
     return _advanced_getitem(a, _expand_ellipsis(keys, a.ndim))
 
 
+def abstract_embedding(
+    table: AbstractVal, *, indices: Index, padding_idx: int | None = None
+) -> ShapedArray:
+    """Shape of an embedding gather: the index array's shape followed by the table's
+    trailing feature dims -- ``(*indices.shape, *table.shape[1:])`` (``padding_idx`` is
+    reverse-only and does not affect the output shape)."""
+    a = _aval(table)
+    idx = np.asarray(indices)
+    return ShapedArray((*idx.shape, *a.shape[1:]), a.dtype)
+
+
 def _is_advanced(k: Index) -> bool:
     """An array-valued key (boolean mask or integer index array / list)."""
     return isinstance(k, (ShapedArray, np.ndarray, list))
@@ -939,6 +950,7 @@ def _build_abstract_table() -> "tuple[dict[Prim, Prim], dict[Prim, Prim]]":
             ops.d_eq: _abstract_compare_for("eq"),
             ops.d_ne: _abstract_compare_for("ne"),
             ops.d_getitem: abstract_getitem,
+            ops.d_embedding: abstract_embedding,
             ops.d_maximum: abstract_binary,
             ops.d_minimum: abstract_binary,
             ops.d_fmax: abstract_binary,

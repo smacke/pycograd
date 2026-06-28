@@ -271,6 +271,44 @@ def test_autodiff_pipe_in_cell():
     )
 
 
+def test_embedding_primitive_in_a_pipe_with_ambient_weights():
+    # ``$ |> embedding(table, $)`` as a pipe stage: the piped token ids are the index hole
+    # and ``table`` is an ambient ``Weight``. The forward must match a direct call and the
+    # table gradient must scatter-add into the looked-up rows -- i.e. the new
+    # ``ops.d_embedding`` primitive composes with pipescript + ``weights.grad``.
+    _run_probe(
+        """
+        import numpy as np
+        ip.run_cell("import numpy as np")
+        ip.run_cell("from pycograd import params, embedding")
+        ip.run_cell("rng = np.random.default_rng(0)")
+        ip.run_cell("ids = np.array([1, 3, 3, 7, 2])")
+        ip.run_cell("Yt = np.eye(3)[[0, 1, 2, 0, 1]]")
+        ip.run_cell(
+            "def softmax_ce(logits, onehot):\\n"
+            " z = logits - np.max(logits, axis=1, keepdims=True)\\n"
+            " logp = z - np.log(np.sum(np.exp(z), axis=1, keepdims=True))\\n"
+            " return -np.mean(np.sum(onehot * logp, axis=1))"
+        )
+        src = (
+            "with params{\\n"
+            "    table = rng.standard_normal((16, 8))\\n"
+            "    w = 0.3 * rng.standard_normal((8, 3))\\n"
+            "    b = np.zeros(3)\\n"
+            "} as weights:\\n"
+            "    forward = $ |> embedding(table, $) |> $ @ w + b\\n"
+            "    v, grads = weights.grad(|> ids |> forward |> softmax_ce($, Yt))\\n"
+            "    rows = set(np.unique(np.nonzero(np.asarray(grads['table']))[0]).tolist())\\n"
+        )
+        r = ip.run_cell(src)
+        assert r.error_in_exec is None, r.error_in_exec
+        # rows 1, 2, 3, 7 are looked up (3 twice); only those get a table gradient.
+        assert ip.user_ns["rows"] == {1, 2, 3, 7}, ip.user_ns["rows"]
+        print("OK")
+        """
+    )
+
+
 def test_autodiff_pointfree_power_in_bare_pipe_lambda():
     # A *bare top-level pipe lambda* using a point-free binop: ``np.tanh ** 2`` means the
     # stage ``x -> np.tanh(x) ** 2``. The lambda runs un-instrumented by default, so this

@@ -159,6 +159,7 @@ _MOVEMENT = {
     "d_expand_dims",
     "d_broadcast_to",
     "d_getitem",
+    "d_embedding",  # a row gather; only the looked-up rows' memory traffic
     "d_concatenate",
     "d_stack",
     "d_vstack",

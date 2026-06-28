@@ -342,6 +342,26 @@ class TFBackend(Backend):
             return out if b is None else out + tf.reshape(_as_tf(tf, b), (1, -1, 1, 1))
 
         self._intercept[_conv2d] = _tf_conv2d
+        # Lower the ``embedding`` row-gather to ``tf.gather``, instead of fancy-indexing a
+        # ``Var``. For ``padding_idx`` we replace that row of the table with a
+        # stop-gradient copy of itself before the gather, so its value is unchanged but it
+        # receives no gradient -- matching the primitive's "pad row held fixed" semantics.
+        # Keyed by ``functional.embedding``; the numpy path keeps ``ops.d_embedding``.
+        from pycograd.functional import embedding as _embedding
+
+        def _tf_embedding(
+            table: BackendArray,
+            indices: BackendArray,
+            padding_idx: "int | None" = None,
+        ) -> BackendArray:
+            t = _as_tf(tf, table)
+            idx = tf.cast(_as_tf(tf, indices), tf.int32)
+            if padding_idx is not None:
+                row = tf.stop_gradient(t[padding_idx])
+                t = tf.tensor_scatter_nd_update(t, [[padding_idx]], row[tf.newaxis])
+            return tf.gather(t, idx, axis=0)
+
+        self._intercept[_embedding] = _tf_embedding
 
     def _is_tensor(self, x: object) -> bool:
         tf = self._tf

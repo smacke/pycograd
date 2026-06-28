@@ -1913,6 +1913,41 @@ def d_partition(x: Operand, kth: Any, axis: int = -1) -> Var:
     return _take_along_var(x, perm, axis)
 
 
+# ---------------------------------------------------------------------------
+# Embedding: a row gather of a parameter ``table`` at integer ``indices``. A
+# first-class primitive (rather than a bare ``table[idx]``) so the compile
+# backends can lower it to a native op (``F.embedding`` / ``take`` / ``gather``)
+# instead of fancy indexing, and so capture sees one semantic node. ``indices``
+# and ``padding_idx`` are non-differentiable static params -- only ``table``
+# carries a cotangent. The reverse pass scatter-adds the cotangent back into the
+# looked-up rows, reusing the internal ``_scatter`` primitive; ``padding_idx``
+# zeroes *only that row's gradient* (PyTorch semantics -- the pad row is held
+# fixed), while the forward stays a plain gather.
+# ---------------------------------------------------------------------------
+def d_embedding(
+    table: Operand, *, indices: Array, padding_idx: int | None = None
+) -> Var:
+    """Gather rows of ``table`` (``(num_embeddings, *feat)``) at integer
+    ``indices``, returning ``(*indices.shape, *feat)``. The forward is a plain
+    gather; ``padding_idx`` (if given) zeroes only that row's gradient."""
+    table, xp = _lift(table), _xp()
+    idx = xp.asarray(indices)
+    out = Var(table.value[idx], _parents=(table,))
+
+    def _backward() -> None:
+        gt = xp.zeros_like(table.value)
+        current_backend().scatter_add(gt, idx, out.grad)
+        if padding_idx is not None:
+            gt[padding_idx] = 0  # the pad row is never updated
+        table.grad = _accumulate(table.grad, gt)
+
+    out._backward = _backward
+    _record_vjp(
+        out, d_embedding, (table,), {"indices": idx, "padding_idx": padding_idx}
+    )
+    return out
+
+
 def _sort_like_abstract(x: Boxed, *args: Any, **kwargs: Any) -> Boxed:
     from pycograd.shapes import abstract_unary  # sort/partition preserve shape
 
@@ -2661,6 +2696,10 @@ _RULES: dict[Prim, tuple[Prim, ...]] = {
     d_eq: (),
     d_ne: (),
     d_getitem: (),
+    # embedding: a tape-only row gather; no numpy callable maps to it (the public
+    # ``functional.embedding`` is what the compile backends intercept), but it is
+    # listed so every rule table can register a matching rule.
+    d_embedding: (),
     # broadcast_to: an internal primitive used by the differentiable reverse pass
     # (``d_sum``'s VJP / a differentiable ``_unbroadcast``). No numpy callable swaps to
     # it, so its tuple is empty -- it adds no ``_INTERCEPT`` key (coverage parity holds)
@@ -3296,6 +3335,28 @@ def _vjp_scatter(
     return [_b(d_getitem, g, params["key"])]
 
 
+def _vjp_embedding(
+    primals: tuple[Var, ...],
+    operands: tuple[Boxed, ...],
+    params: dict[str, Any],
+    g: Boxed,
+) -> list[Boxed]:
+    # The reverse VJP of a row gather is a scatter-add back into a zero ``table``;
+    # ``_scatter`` is linear in ``g`` and rides ``bind`` (so a second-order pass
+    # differentiates it too -- its own VJP is another gather). ``padding_idx``
+    # zeroes that row's gradient via a constant multiplicative mask, which also
+    # rides ``bind`` and stops gradient by construction.
+    (table,) = primals
+    idx, pad = params["indices"], params["padding_idx"]
+    shape, dtype = _pshape(table), _pdtype(table)
+    gt = _b(_scatter, g, idx, shape, dtype)
+    if pad is not None:
+        mask = np.ones(shape[0], dtype=dtype)
+        mask[pad] = 0
+        gt = _b(d_mul, gt, mask.reshape((shape[0],) + (1,) * (len(shape) - 1)))
+    return [gt]
+
+
 def _expand_dims_multi(g: Boxed, axis: int | tuple[int, ...]) -> Boxed:
     axes = axis if isinstance(axis, tuple) else (axis,)
     for ax in sorted(axes):
@@ -3573,6 +3634,7 @@ def _build_vjp_for() -> dict[Prim, Callable[..., list[Boxed]]]:
             d_einsum: _vjp_einsum,
             d_cumsum: _vjp_cumsum,
             d_getitem: _vjp_getitem,
+            d_embedding: _vjp_embedding,
             _scatter: _vjp_scatter,
             d_sum: _vjp_sum,
             d_prod: _vjp_prod,

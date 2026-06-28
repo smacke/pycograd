@@ -139,6 +139,25 @@ class JaxBackend(Backend):
             return out if b is None else out + jnp.reshape(b, (1, -1, 1, 1))
 
         self._intercept[_conv2d] = _jax_conv2d
+        # Lower the ``embedding`` row-gather to ``jnp.take`` (XLA gather), instead of
+        # fancy-indexing a ``Var``. For ``padding_idx`` we stop-gradient that row of the
+        # table before the gather, so its value is unchanged but no gradient flows back to
+        # it -- matching the primitive's "pad row held fixed" semantics. Keyed by
+        # ``functional.embedding``; the numpy path keeps ``ops.d_embedding``.
+        from pycograd.functional import embedding as _jax_embedding_sym
+
+        def _jax_embedding(
+            table: BackendArray,
+            indices: BackendArray,
+            padding_idx: Optional[int] = None,
+        ) -> BackendArray:
+            t = _as_jnp(jnp, table)
+            idx = jnp.asarray(np.asarray(indices))
+            if padding_idx is not None:
+                t = t.at[padding_idx].set(jax.lax.stop_gradient(t[padding_idx]))
+            return jnp.take(t, idx, axis=0)
+
+        self._intercept[_jax_embedding_sym] = _jax_embedding
 
     def _is_tensor(self, x: object) -> bool:
         return isinstance(x, (self._jax.Array, self._jax.core.Tracer))

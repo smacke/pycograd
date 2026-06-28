@@ -342,6 +342,30 @@ class TorchBackend(Backend):
             return torch.nn.functional.conv2d(x, w, b, stride, pad, dilation, groups)
 
         self._intercept[_conv2d] = _torch_conv2d
+        # Lower the ``embedding`` row-gather to torch's native ``F.embedding`` (which
+        # honors ``padding_idx`` by zeroing that row's gradient -- exactly our primitive's
+        # semantics), instead of fancy-indexing a ``Var``. Keyed by ``functional.embedding``
+        # so the call site swaps; the numpy path keeps ``ops.d_embedding`` and its
+        # scatter-add VJP. A table with more than one feature dim is flattened to 2-D for
+        # ``F.embedding`` (which wants a 2-D weight) and the result is restored.
+        from pycograd.functional import embedding as _embedding
+
+        def _torch_embedding(
+            table: BackendArray,
+            indices: BackendArray,
+            padding_idx: Optional[int] = None,
+        ) -> BackendArray:
+            t = self._operand(table)
+            # Gather on the *table's* device (it may be a CPU-resident offload leaf while
+            # compute is on the GPU): align the index to ``t`` rather than pulling the
+            # whole table to the compute device, mirroring ``align_key``.
+            idx = self._operand(indices).long().to(t.device)
+            feat = tuple(t.shape[1:])
+            flat = t.reshape(t.shape[0], -1)
+            out = torch.nn.functional.embedding(idx, flat, padding_idx=padding_idx)
+            return out.reshape(*tuple(idx.shape), *feat)
+
+        self._intercept[_embedding] = _torch_embedding
 
     def _working_np_dtype(self) -> np.dtype:
         """The numpy dtype tensors are created in -- the active working dtype by default.

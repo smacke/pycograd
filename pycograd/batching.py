@@ -601,6 +601,38 @@ def _batched_gather(
     return cast(BatchTracer, out)
 
 
+def _embedding_rule(
+    trace: BatchTrace,
+    table: Boxed,
+    *,
+    indices: Index,
+    padding_idx: int | None = None,
+) -> BatchTracer:
+    # Only ``table`` can be batched here: ``indices`` is a static param (a batched index
+    # *set* is expressed by the index shape, not by vmap, so it never reaches this rule as
+    # a tracer). Unbatched table -> a plain embedding at bdim=None. Batched table -> move
+    # its batch axis to the front and gather rows along the now-axis-1 embedding axis via
+    # ``d_getitem`` (which carries the scatter-add backward, so grad composes).
+    tx = trace._raise(table)
+    if tx.bdim is None:
+        return _result(
+            trace,
+            bind(ops.d_embedding, tx.value, indices=indices, padding_idx=padding_idx),
+            None,
+        )
+    if padding_idx is not None:
+        # The getitem path can't see ``padding_idx``, so its gradient would leak into the
+        # pad row. Fail loudly rather than silently mis-differentiate (this combination --
+        # vmap over a *batched* table *and* a padding row -- is exceedingly rare).
+        raise NotImplementedError(
+            "vmap over a batched embedding table with padding_idx is not supported; "
+            "vmap with a shared table, or drop padding_idx"
+        )
+    v = _move_bdim_to_front(tx)  # (B, num_embeddings, *feat)
+    idx = np.asarray(indices)
+    return _result(trace, bind(ops.d_getitem, v, (slice(None), idx)), 0)
+
+
 # -- concatenate / stack ----------------------------------------------------
 def _unwrap(s: Boxed) -> Boxed:
     return s.value if isinstance(s, BatchTracer) else s
@@ -701,6 +733,7 @@ def _build_rule_for() -> dict[Prim, Rule]:
             ops.d_eq: _elementwise_for(ops.d_eq),
             ops.d_ne: _elementwise_for(ops.d_ne),
             ops.d_getitem: _getitem_rule,
+            ops.d_embedding: _embedding_rule,
             ops.d_conj: _elementwise_for(ops.d_conj),
             ops.d_real: _elementwise_for(ops.d_real),
             ops.d_real_if_close: _elementwise_for(ops.d_real_if_close),

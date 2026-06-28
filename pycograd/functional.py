@@ -27,7 +27,7 @@ import numpy as np
 from pycograd import ops, random
 from pycograd._typing import Axis, Operand, Tensor
 from pycograd.dtypes import current_dtype
-from pycograd.tensor import Var, _value
+from pycograd.tensor import Var, _value, grad_is_recording
 
 
 def _array_out(x: Tensor, y: Tensor) -> Tensor:
@@ -758,15 +758,33 @@ def multi_head_attention(
     return np.reshape(merged, lead + (seq, d_model))
 
 
-def embedding(table: Tensor, indices: "np.ndarray") -> Tensor:
-    """Look up rows of ``table`` (``(num_embeddings, dim)``) by integer
-    ``indices``, returning ``(*indices.shape, dim)``. A plain gather, so the
-    gradient scatter-adds back into the looked-up rows (``d_getitem``'s backward).
+def embedding(
+    table: Tensor, indices: "np.ndarray", *, padding_idx: Optional[int] = None
+) -> Tensor:
+    """Look up rows of ``table`` (``(num_embeddings, *feat)``) by integer
+    ``indices``, returning ``(*indices.shape, *feat)``.
 
-    Note: for the compile backends (torch / jax / tf), the equivalent
-    ``one_hot(indices, num_embeddings) @ table`` avoids fancy indexing, which does
-    not bridge cleanly."""
-    return table[np.asarray(indices)]
+    A first-class primitive (``ops.d_embedding``): the forward is a plain gather, so
+    the gradient scatter-adds back into the looked-up rows. ``padding_idx`` (if given)
+    holds that row fixed by zeroing only its gradient (PyTorch semantics). The compile
+    backends (torch / jax / tf) intercept this symbol and lower it to their native
+    gather (``F.embedding`` / ``take`` / ``gather``)."""
+    from pycograd.trace import Tracer, bind
+
+    out = bind(
+        ops.d_embedding, table, indices=np.asarray(indices), padding_idx=padding_idx
+    )
+    # The primitive always lifts ``table`` to a ``Var``; keep that boxed result only when
+    # there is gradient/transform context to preserve (a live transform level, a boxed
+    # ``table``, or an ambient grad pass holding a ``Weight``). Otherwise -- a plain
+    # untraced gather -- hand back a bare array, matching the other functional ops.
+    if (
+        isinstance(out, Tracer)
+        or isinstance(table, (Var, Tracer))
+        or grad_is_recording()
+    ):
+        return cast(Tensor, out)
+    return cast(Tensor, _value(cast(Operand, out)))
 
 
 # ---------------------------------------------------------------------------

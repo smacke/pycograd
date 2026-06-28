@@ -532,6 +532,22 @@ def _getitem_rule(trace: JVPTrace, x: Boxed, key: Index) -> JVPTracer:
     return _result(trace, primal_out, tangent_out)
 
 
+def _embedding_rule(
+    trace: JVPTrace, table: Boxed, *, indices: Index, padding_idx: int | None = None
+) -> JVPTracer:
+    # Embedding is linear in ``table``, so the tangent gathers the same rows.
+    # ``padding_idx`` is reverse-only (it masks the gradient, not the value), so the
+    # forward and tangent ignore it.
+    tt = trace._raise(table)
+    primal_out = bind(
+        ops.d_embedding, tt.primal, indices=indices, padding_idx=padding_idx
+    )
+    tangent_out = bind(
+        ops.d_embedding, tt.tangent, indices=indices, padding_idx=padding_idx
+    )
+    return _result(trace, primal_out, tangent_out)
+
+
 def _unwrap_key(key: Index) -> Index:
     """Strip any JVPTracer wrapper off an index, using its primal (an index is not
     differentiated)."""
@@ -842,6 +858,7 @@ def _build_jvp_for() -> dict[Prim, Rule]:
             ops.d_ne: _compare_for(ops.d_ne),
             # gather.
             ops.d_getitem: _getitem_rule,
+            ops.d_embedding: _embedding_rule,
             # selection.
             ops.d_maximum: _select_for(ops.d_maximum),
             ops.d_minimum: _select_for(ops.d_minimum),
