@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Parse the package version (set from git tags by setuptools-git-versioning) into
+"""Parse the package version (computed live from git tags by versioneer) into
 a ``(major, minor, patch)`` tuple -- used by ``scripts/bump-version.py``.
 """
 from __future__ import annotations

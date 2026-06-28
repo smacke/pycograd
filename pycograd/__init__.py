@@ -6,9 +6,7 @@ Write ordinary numeric Python -- including ``numpy`` calls like ``np.exp``,
 ``Var`` is the reverse-mode tape node; ``value_and_grad`` / ``grad`` wrap a
 function to return gradients with the same pytree structure as its arguments.
 """
-from importlib.metadata import PackageNotFoundError, version
-
-from pycograd import random
+from pycograd import _version, random
 from pycograd._typing import Operand, Tensor
 from pycograd.ad_graph import jit
 from pycograd.backends import activate, device, get_backend
@@ -208,10 +206,10 @@ einsum = d_einsum
 cumsum = d_cumsum
 gated_act = d_gated_act  # tanh(f) * sigmoid(s), the WaveNet / GLU gate
 
-try:
-    __version__ = version("pycograd")
-except PackageNotFoundError:  # not installed (e.g. running from a source checkout)
-    __version__ = "0.0.0+unknown"
+# Compute the version live from git via versioneer (like ../pyccolo) rather than
+# reading frozen installed metadata -- so ``scripts/bump-version.py`` always bumps
+# relative to the actual latest tag.
+__version__ = _version.get_versions()["version"]
 
 __all__ = [
     "__version__",
